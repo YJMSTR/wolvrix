@@ -23,9 +23,20 @@ std::vector<int> SuperNodePartitioner::computeOptimalCuts() {
 
     for (int i = 1; i <= n; i++) {
         dp[i].cost = std::numeric_limits<int>::max();
-        int maxStart = std::max(0, i - static_cast<int>(maxSuperNodeSize_));
 
-        for (int j = maxStart; j < i; j++) {
+        // Try all valid starting positions
+        for (int j = 0; j < i; j++) {
+            // Check if interval [j, i) respects size constraint
+            size_t totalMembers = 0;
+            for (int k = j; k < i; k++) {
+                totalMembers += sg_.getNode(sorted[k]).memberCount();
+            }
+
+            // Skip if interval exceeds max size
+            if (totalMembers > maxSuperNodeSize_) {
+                continue;
+            }
+
             int cutCost = computeCutCost(j, i);
             int totalCost = dp[j].cost + cutCost;
 
