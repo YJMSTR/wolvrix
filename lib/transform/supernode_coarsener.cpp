@@ -25,18 +25,61 @@ void SuperNodeCoarsener::coarsen() {
 
 bool SuperNodeCoarsener::mergeResetAll() {
     bool changed = false;
-    // Group nodes by reset signal - use timing domain as proxy
+
+    // Extract reset signatures from register/memory write ports
+    // Reset signature = (eventEdge, eventSignals, updateCond structure)
     std::unordered_map<std::string, std::vector<SuperNodeId>> resetGroups;
 
     for (const auto& snId : sg_.validNodeIds()) {
         const auto& node = sg_.getNode(snId);
-        if (!node.timingDomain.empty()) {
-            resetGroups[node.timingDomain].push_back(snId);
+
+        // Check if this supernode contains sequential operations
+        bool hasSeqOps = false;
+        std::string resetSig;
+
+        for (const auto& opId : node.members) {
+            auto op = graph_.getOperation(opId);
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
+                op.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort) {
+                hasSeqOps = true;
+
+                // Extract reset signature from eventEdge and event signals
+                auto eventEdgeAttr = op.attr("eventEdge");
+                if (eventEdgeAttr) {
+                    if (const auto* edges = std::get_if<std::vector<std::string>>(&*eventEdgeAttr)) {
+                        // Build signature from event edges
+                        std::string sig;
+                        for (const auto& edge : *edges) {
+                            sig += edge + ";";
+                        }
+
+                        // Add event signal operands to signature
+                        auto operands = op.operands();
+                        size_t eventStart = (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort) ? 4 : 3;
+                        for (size_t i = eventStart; i < operands.size(); ++i) {
+                            auto value = graph_.getValue(operands[i]);
+                            auto defOp = value.definingOp();
+                            if (defOp.valid()) {
+                                sig += std::to_string(defOp.index) + ",";
+                            }
+                        }
+
+                        if (!sig.empty()) {
+                            resetSig = sig;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (hasSeqOps && !resetSig.empty()) {
+            resetGroups[resetSig].push_back(snId);
         }
     }
 
-    // Merge nodes within each reset group
-    for (const auto& [reset, nodes] : resetGroups) {
+    // Merge nodes with identical reset signatures
+    for (const auto& [sig, nodes] : resetGroups) {
         if (nodes.size() > 1) {
             SuperNodeId target = nodes[0];
             for (size_t i = 1; i < nodes.size(); i++) {
@@ -52,16 +95,40 @@ bool SuperNodeCoarsener::mergeResetAll() {
 
 bool SuperNodeCoarsener::mergeWhenNodes() {
     bool changed = false;
-    // Group nodes by their predecessor pattern
-    std::unordered_map<uint64_t, std::vector<SuperNodeId>> condGroups;
+
+    // Group nodes by their kMux condition operands
+    // Key = condition operand's defining operation ID
+    std::unordered_map<std::string, std::vector<SuperNodeId>> condGroups;
 
     for (const auto& snId : sg_.validNodeIds()) {
-        uint64_t hash = computeHash(snId);
-        condGroups[hash].push_back(snId);
+        const auto& node = sg_.getNode(snId);
+
+        // Check if this supernode contains kMux operations
+        std::string condSig;
+        for (const auto& opId : node.members) {
+            auto op = graph_.getOperation(opId);
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kMux) {
+                // kMux operands: [condition, trueValue, falseValue]
+                auto operands = op.operands();
+                if (operands.size() >= 3) {
+                    auto condValue = graph_.getValue(operands[0]);
+                    auto condDefOp = condValue.definingOp();
+                    if (condDefOp.valid()) {
+                        // Use condition's defining operation as signature
+                        condSig = std::to_string(condDefOp.index);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!condSig.empty()) {
+            condGroups[condSig].push_back(snId);
+        }
     }
 
-    // Merge nodes with identical predecessor patterns
-    for (const auto& [hash, nodes] : condGroups) {
+    // Merge nodes with identical kMux conditions
+    for (const auto& [sig, nodes] : condGroups) {
         if (nodes.size() > 1) {
             SuperNodeId target = nodes[0];
             for (size_t i = 1; i < nodes.size(); i++) {
