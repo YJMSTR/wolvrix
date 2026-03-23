@@ -9,33 +9,29 @@ SuperNodeCoarsener::SuperNodeCoarsener(SuperNodeGraph& sg, const grh::Graph& gra
     : sg_(sg), graph_(graph) {}
 
 void SuperNodeCoarsener::coarsen() {
-    mergeResetAll();
-    mergeWhenNodes();
-    resort();
-
     bool changed = true;
     while (changed) {
-        size_t beforeCount = sg_.nodeCount();
-        mergeOut1();
-        mergeIn1();
-        mergeSublings();
-        size_t afterCount = sg_.nodeCount();
-        changed = (afterCount < beforeCount);
+        changed = false;
+        changed |= mergeResetAll();
+        changed |= mergeWhenNodes();
+        if (changed) {
+            resort();
+        }
+        changed |= mergeOut1();
+        changed |= mergeIn1();
+        changed |= mergeSublings();
     }
 }
 
-void SuperNodeCoarsener::mergeResetAll() {
-    // Group nodes by reset signal
+bool SuperNodeCoarsener::mergeResetAll() {
+    bool changed = false;
+    // Group nodes by reset signal - use timing domain as proxy
     std::unordered_map<std::string, std::vector<SuperNodeId>> resetGroups;
 
-    for (size_t i = 0; i < sg_.nodeCount(); i++) {
-        if (!sg_.isValid(i)) continue;
-
-        const auto& node = sg_.getNode(i);
-        // Use timing domain as a proxy for reset grouping
-        // In a full implementation, this would analyze actual reset signals
+    for (const auto& snId : sg_.validNodeIds()) {
+        const auto& node = sg_.getNode(snId);
         if (!node.timingDomain.empty()) {
-            resetGroups[node.timingDomain].push_back(i);
+            resetGroups[node.timingDomain].push_back(snId);
         }
     }
 
@@ -46,22 +42,22 @@ void SuperNodeCoarsener::mergeResetAll() {
             for (size_t i = 1; i < nodes.size(); i++) {
                 if (canMerge(target, nodes[i])) {
                     doMerge(target, nodes[i]);
+                    changed = true;
                 }
             }
         }
     }
+    return changed;
 }
 
-void SuperNodeCoarsener::mergeWhenNodes() {
-    // Group nodes by their predecessor pattern (shared conditions)
+bool SuperNodeCoarsener::mergeWhenNodes() {
+    bool changed = false;
+    // Group nodes by their predecessor pattern
     std::unordered_map<uint64_t, std::vector<SuperNodeId>> condGroups;
 
-    for (size_t i = 0; i < sg_.nodeCount(); i++) {
-        if (!sg_.isValid(i)) continue;
-
-        // Compute hash based on predecessors (shared conditions)
-        uint64_t hash = computeHash(i);
-        condGroups[hash].push_back(i);
+    for (const auto& snId : sg_.validNodeIds()) {
+        uint64_t hash = computeHash(snId);
+        condGroups[hash].push_back(snId);
     }
 
     // Merge nodes with identical predecessor patterns
@@ -69,63 +65,81 @@ void SuperNodeCoarsener::mergeWhenNodes() {
         if (nodes.size() > 1) {
             SuperNodeId target = nodes[0];
             for (size_t i = 1; i < nodes.size(); i++) {
-                if (canMerge(target, nodes[i])) {
+                if (canMerge(target, nodes[i]) && haveSamePredecessors(target, nodes[i])) {
                     doMerge(target, nodes[i]);
+                    changed = true;
                 }
             }
         }
     }
+    return changed;
 }
 
-void SuperNodeCoarsener::mergeOut1() {
+bool SuperNodeCoarsener::mergeOut1() {
+    bool changed = false;
     std::vector<SuperNodeId> toMerge;
-    for (size_t i = 0; i < sg_.nodeCount(); i++) {
-        if (sg_.isValid(i) && sg_.successors(i).size() == 1) {
-            auto succId = *sg_.successors(i).begin();
-            if (canMerge(i, succId)) {
-                toMerge.push_back(i);
+    for (const auto& snId : sg_.validNodeIds()) {
+        if (sg_.successors(snId).size() == 1) {
+            auto succId = *sg_.successors(snId).begin();
+            if (canMerge(snId, succId)) {
+                toMerge.push_back(snId);
             }
         }
     }
     for (auto id : toMerge) {
-        auto succId = *sg_.successors(id).begin();
-        doMerge(succId, id);
+        if (sg_.isValid(id) && sg_.successors(id).size() == 1) {
+            auto succId = *sg_.successors(id).begin();
+            if (sg_.isValid(succId)) {
+                doMerge(succId, id);
+                changed = true;
+            }
+        }
     }
+    return changed;
 }
 
-void SuperNodeCoarsener::mergeIn1() {
+bool SuperNodeCoarsener::mergeIn1() {
+    bool changed = false;
     std::vector<SuperNodeId> toMerge;
-    for (size_t i = 0; i < sg_.nodeCount(); i++) {
-        if (sg_.isValid(i) && sg_.predecessors(i).size() == 1) {
-            auto predId = *sg_.predecessors(i).begin();
-            if (canMerge(predId, i)) {
-                toMerge.push_back(i);
+    for (const auto& snId : sg_.validNodeIds()) {
+        if (sg_.predecessors(snId).size() == 1) {
+            auto predId = *sg_.predecessors(snId).begin();
+            if (canMerge(predId, snId)) {
+                toMerge.push_back(snId);
             }
         }
     }
     for (auto id : toMerge) {
-        auto predId = *sg_.predecessors(id).begin();
-        doMerge(predId, id);
+        if (sg_.isValid(id) && sg_.predecessors(id).size() == 1) {
+            auto predId = *sg_.predecessors(id).begin();
+            if (sg_.isValid(predId)) {
+                doMerge(predId, id);
+                changed = true;
+            }
+        }
     }
+    return changed;
 }
 
-void SuperNodeCoarsener::mergeSublings() {
+bool SuperNodeCoarsener::mergeSublings() {
+    bool changed = false;
     std::unordered_map<uint64_t, std::vector<SuperNodeId>> groups;
-    for (size_t i = 0; i < sg_.nodeCount(); i++) {
-        if (sg_.isValid(i)) {
-            uint64_t hash = computeHash(i);
-            groups[hash].push_back(i);
-        }
+    for (const auto& snId : sg_.validNodeIds()) {
+        uint64_t hash = computeDeterministicHash(snId);
+        groups[hash].push_back(snId);
     }
     for (const auto& [hash, nodes] : groups) {
         if (nodes.size() > 1) {
             for (size_t i = 1; i < nodes.size(); i++) {
-                if (canMerge(nodes[0], nodes[i])) {
+                if (sg_.isValid(nodes[0]) && sg_.isValid(nodes[i]) &&
+                    canMerge(nodes[0], nodes[i]) && haveSamePredecessors(nodes[0], nodes[i])) {
                     doMerge(nodes[0], nodes[i]);
+                    changed = true;
                 }
             }
         }
     }
+    return changed;
 }
 
 void SuperNodeCoarsener::resort() {
@@ -161,6 +175,24 @@ uint64_t SuperNodeCoarsener::computeHash(SuperNodeId snId) const {
         hash ^= predId + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
     }
     return hash;
+}
+
+uint64_t SuperNodeCoarsener::computeDeterministicHash(SuperNodeId snId) const {
+    // Sort predecessors for deterministic hashing
+    std::vector<SuperNodeId> sortedPreds(sg_.predecessors(snId).begin(), sg_.predecessors(snId).end());
+    std::sort(sortedPreds.begin(), sortedPreds.end());
+
+    uint64_t hash = 0;
+    for (auto predId : sortedPreds) {
+        hash ^= predId + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+    }
+    return hash;
+}
+
+bool SuperNodeCoarsener::haveSamePredecessors(SuperNodeId snId1, SuperNodeId snId2) const {
+    const auto& preds1 = sg_.predecessors(snId1);
+    const auto& preds2 = sg_.predecessors(snId2);
+    return preds1 == preds2;
 }
 
 } // namespace wolvrix::lib::transform

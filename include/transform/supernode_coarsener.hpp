@@ -16,16 +16,18 @@ public:
     void setMaxSuperNodeSize(size_t size) { maxSuperNodeSize_ = size; }
 
 private:
-    void mergeResetAll();
-    void mergeWhenNodes();
-    void mergeOut1();
-    void mergeIn1();
-    void mergeSublings();
+    bool mergeResetAll();
+    bool mergeWhenNodes();
+    bool mergeOut1();
+    bool mergeIn1();
+    bool mergeSublings();
     void resort();
 
     bool canMerge(SuperNodeId snId1, SuperNodeId snId2) const;
     void doMerge(SuperNodeId targetId, SuperNodeId sourceId);
     uint64_t computeHash(SuperNodeId snId) const;
+    uint64_t computeDeterministicHash(SuperNodeId snId) const;
+    bool haveSamePredecessors(SuperNodeId snId1, SuperNodeId snId2) const;
 
     SuperNodeGraph& sg_;
     const grh::Graph& graph_;
