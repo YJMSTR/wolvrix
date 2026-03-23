@@ -16,6 +16,7 @@
 #include "transform/simplify.hpp"
 #include "transform/xmr_resolve.hpp"
 #include "transform/strip_debug.hpp"
+#include "transform/supernode_partition_pass.hpp"
 
 #include <chrono>
 #include <exception>
@@ -420,6 +421,7 @@ namespace wolvrix::lib::transform
             "strip-debug",
             "hrbcut",
             "repcut",
+            "supernode-partition",
         };
     }
 
@@ -1256,6 +1258,15 @@ namespace wolvrix::lib::transform
                 }
             }
             return std::make_unique<RepcutPass>(options);
+        }
+        if (normalized == "supernode-partition")
+        {
+            if (!args.empty())
+            {
+                error = "supernode-partition does not accept arguments";
+                return nullptr;
+            }
+            return std::make_unique<SuperNodePartitionPass>();
         }
 
         error = "unknown pass: " + normalized;
