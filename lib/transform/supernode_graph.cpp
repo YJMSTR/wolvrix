@@ -44,14 +44,14 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         return;
     }
 
-    // Check for cycle: merging is valid if we're contracting an edge (source -> target or target -> source)
-    // but invalid if it would create a cycle in the quotient graph.
-    // We allow direct edges between source and target (these get removed as self-loops),
-    // but reject if there's a path from target to source that doesn't go through the direct edge.
+    // Check for cycle: merging is valid if we're contracting a direct edge between the two nodes
+    // (either source -> target or target -> source), but invalid if it would create a cycle.
+    // We need to check if there's a path from target to source that doesn't use the direct edge.
 
-    bool hasDirectEdge = nodes_[sourceId].successors.count(targetId) > 0;
+    bool hasDirectEdgeSourceToTarget = nodes_[sourceId].successors.count(targetId) > 0;
+    bool hasDirectEdgeTargetToSource = nodes_[targetId].successors.count(sourceId) > 0;
 
-    // BFS from target, excluding the direct edge back to source
+    // BFS from target to check if source is reachable without using the direct edge
     std::unordered_set<SuperNodeId> visited;
     std::queue<SuperNodeId> queue;
     queue.push(targetId);
@@ -62,8 +62,8 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         queue.pop();
 
         for (auto succId : nodes_[current].successors) {
-            // Skip the direct edge from source to target when checking reachability
-            if (current == targetId && succId == sourceId && hasDirectEdge) {
+            // Skip the direct edge from target to source when checking reachability
+            if (current == targetId && succId == sourceId && hasDirectEdgeTargetToSource) {
                 continue;
             }
 
@@ -105,9 +105,11 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         }
     }
 
-    // Remove self-loops
+    // Remove self-loops and any remaining references to sourceId
     target.predecessors.erase(targetId);
     target.successors.erase(targetId);
+    target.predecessors.erase(sourceId);
+    target.successors.erase(sourceId);
 
     // Clear source and add to free list
     source.members.clear();
@@ -217,14 +219,19 @@ std::vector<SuperNodeId> SuperNodeGraph::topologicalSort() const {
 }
 
 bool SuperNodeGraph::hasCircularDependency() const {
-    auto sorted = topologicalSort();
-    size_t validNodeCount = 0;
-    for (const auto& node : nodes_) {
-        if (node.valid()) {
-            validNodeCount++;
+    try {
+        auto sorted = topologicalSort();
+        size_t validNodeCount = 0;
+        for (const auto& node : nodes_) {
+            if (node.valid()) {
+                validNodeCount++;
+            }
         }
+        return sorted.size() != validNodeCount;
+    } catch (const std::runtime_error&) {
+        // topologicalSort() throws when there's a cycle
+        return true;
     }
-    return sorted.size() != validNodeCount;
 }
 
 size_t SuperNodeGraph::nodeCount() const {
