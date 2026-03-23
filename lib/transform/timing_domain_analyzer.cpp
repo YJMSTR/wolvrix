@@ -106,10 +106,13 @@ TimingDomainAnalyzer::assignTimingDomains() {
     }
 
     // Second pass: propagate domains through combinational logic
-    // Use BFS to propagate from sequential roots
-    std::unordered_set<grh::OperationId, grh::OperationIdHash> visited;
+    // Track which ops are reachable from each domain to detect sharing
+    std::unordered_map<grh::OperationId, std::vector<std::string>, grh::OperationIdHash> opDomainCandidates;
+
     for (const auto& [opId, domain] : seqDomains) {
         std::queue<grh::OperationId> queue;
+        std::unordered_set<grh::OperationId, grh::OperationIdHash> visited;
+
         queue.push(opId);
         visited.insert(opId);
 
@@ -128,7 +131,7 @@ TimingDomainAnalyzer::assignTimingDomains() {
                     if (defOp.kind() != grh::OperationKind::kRegisterWritePort &&
                         defOp.kind() != grh::OperationKind::kLatchWritePort &&
                         defOp.kind() != grh::OperationKind::kMemoryWritePort) {
-                        result[defOpId] = domain;
+                        opDomainCandidates[defOpId].push_back(domain);
                         visited.insert(defOpId);
                         queue.push(defOpId);
                     }
@@ -137,10 +140,13 @@ TimingDomainAnalyzer::assignTimingDomains() {
         }
     }
 
-    // Third pass: assign remaining operations to "comb" domain
-    for (const auto& opId : graph_.operations()) {
-        if (result.find(opId) == result.end()) {
-            result[opId] = "comb";
+    // Assign domains: single-domain ops get their domain, multi-domain ops are cross-domain
+    for (const auto& [opId, domains] : opDomainCandidates) {
+        if (domains.size() == 1) {
+            result[opId] = domains[0];
+        } else {
+            // Shared combinational logic - mark as cross-domain
+            result[opId] = "cross_domain";
         }
     }
 
