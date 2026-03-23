@@ -54,6 +54,12 @@ public:
     // Validation
     bool isValid(SuperNodeId id) const;
 
+    // Stable traversal
+    std::vector<SuperNodeId> validNodeIds() const;
+
+    // Iteration support
+    const std::vector<SuperNode>& nodes() const { return nodes_; }
+
 private:
     std::vector<SuperNode> nodes_;
     std::unordered_map<grh::OperationId, SuperNodeId, grh::OperationIdHash> op2super_;

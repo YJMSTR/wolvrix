@@ -44,13 +44,31 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         return;
     }
 
-    // Check for cycle: if source is a predecessor of target, merging would create a cycle
+    // Check for cycle: use BFS to detect if target is reachable from source
+    // If target is reachable from source, merging would create a cycle
+    std::unordered_set<SuperNodeId> visited;
+    std::queue<SuperNodeId> queue;
+    queue.push(sourceId);
+    visited.insert(sourceId);
+
+    while (!queue.empty()) {
+        SuperNodeId current = queue.front();
+        queue.pop();
+
+        if (current == targetId) {
+            throw std::invalid_argument("Merge would create a circular dependency");
+        }
+
+        for (auto succId : nodes_[current].successors) {
+            if (visited.find(succId) == visited.end()) {
+                visited.insert(succId);
+                queue.push(succId);
+            }
+        }
+    }
+
     auto& target = nodes_[targetId];
     auto& source = nodes_[sourceId];
-
-    if (target.predecessors.count(sourceId) > 0 && source.successors.count(targetId) > 0) {
-        throw std::invalid_argument("Merge would create a circular dependency");
-    }
 
     // Move members
     for (auto opId : source.members) {
@@ -154,8 +172,10 @@ std::vector<SuperNodeId> SuperNodeGraph::topologicalSort() const {
     std::queue<SuperNodeId> queue;
 
     // Calculate in-degrees
+    size_t validCount = 0;
     for (const auto& node : nodes_) {
         if (node.valid()) {
+            validCount++;
             inDegree[node.id] = node.predecessors.size();
             if (inDegree[node.id] == 0) {
                 queue.push(node.id);
@@ -175,6 +195,11 @@ std::vector<SuperNodeId> SuperNodeGraph::topologicalSort() const {
                 queue.push(succId);
             }
         }
+    }
+
+    // Fail loudly on cyclic input
+    if (result.size() != validCount) {
+        throw std::runtime_error("Topological sort failed: graph contains cycles");
     }
 
     return result;
@@ -227,6 +252,16 @@ size_t SuperNodeGraph::crossDomainEdgeCount() const {
 
 bool SuperNodeGraph::isValid(SuperNodeId id) const {
     return id >= 0 && id < static_cast<SuperNodeId>(nodes_.size()) && nodes_[id].valid();
+}
+
+std::vector<SuperNodeId> SuperNodeGraph::validNodeIds() const {
+    std::vector<SuperNodeId> result;
+    for (const auto& node : nodes_) {
+        if (node.valid()) {
+            result.push_back(node.id);
+        }
+    }
+    return result;
 }
 
 } // namespace wolvrix::lib::transform
