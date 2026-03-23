@@ -1,5 +1,6 @@
 #include "transform/timing_domain_analyzer.hpp"
 #include <sstream>
+#include <queue>
 
 namespace wolvrix::lib::transform
 {
@@ -26,15 +27,35 @@ TimingDomainAnalyzer::TimingDomainAnalyzer(const grh::Graph& graph)
 std::unordered_map<EventKey, std::string, EventKeyHash> TimingDomainAnalyzer::analyzeTimingDomains() {
     std::unordered_map<EventKey, std::string, EventKeyHash> domains;
     int domainIndex = 0;
+    int latchDomainIndex = 0;
 
     for (const auto& opId : graph_.operations()) {
         auto op = graph_.getOperation(opId);
+
+        // Handle register and memory write ports (event-key roots)
         if (op.kind() == grh::OperationKind::kRegisterWritePort ||
-            op.kind() == grh::OperationKind::kLatchWritePort ||
             op.kind() == grh::OperationKind::kMemoryWritePort) {
             EventKey key = extractEventKey(op);
+
+            // Reject malformed sequential roots (register/memory MUST have eventEdge)
+            if (key.eventEdge.empty()) {
+                malformedOps_.insert(op.id());
+                continue;
+            }
+
             if (domains.find(key) == domains.end()) {
                 domains[key] = generateDomainName(key, domainIndex++);
+            }
+        }
+        // Handle latch write ports separately (non-event domain class)
+        else if (op.kind() == grh::OperationKind::kLatchWritePort) {
+            // Latches don't have eventEdge - create separate domain per latch symbol
+            auto latchSymbolAttr = op.attr("latchSymbol");
+            if (latchSymbolAttr) {
+                if (const auto* latchSymbol = std::get_if<std::string>(&*latchSymbolAttr)) {
+                    std::string latchDomain = "latch_" + *latchSymbol;
+                    latchDomains_[op.id()] = latchDomain;
+                }
             }
         }
     }
@@ -55,21 +76,27 @@ TimingDomainAnalyzer::assignTimingDomains() {
     // First pass: assign domains to sequential operations
     for (const auto& opId : graph_.operations()) {
         auto op = graph_.getOperation(opId);
+
+        // Handle malformed operations
+        if (malformedOps_.count(op.id()) > 0) {
+            result[op.id()] = "malformed";
+            continue;
+        }
+
+        // Handle latch write ports (non-event domain)
+        if (op.kind() == grh::OperationKind::kLatchWritePort) {
+            auto it = latchDomains_.find(op.id());
+            if (it != latchDomains_.end()) {
+                result[op.id()] = it->second;
+                seqDomains[op.id()] = it->second;
+            }
+            continue;
+        }
+
+        // Handle register and memory write ports (event-key roots)
         if (op.kind() == grh::OperationKind::kRegisterWritePort ||
-            op.kind() == grh::OperationKind::kLatchWritePort ||
             op.kind() == grh::OperationKind::kMemoryWritePort) {
             EventKey key = extractEventKey(op);
-
-            // Check for malformed write port (missing event data)
-            if (key.eventEdge.empty() && key.eventSignals.empty()) {
-                auto eventEdgeAttr = op.attr("eventEdge");
-                if (eventEdgeAttr && !std::get_if<std::vector<std::string>>(&*eventEdgeAttr)->empty()) {
-                    // Has eventEdge attribute but failed to extract - malformed
-                    result[op.id()] = "malformed";
-                    continue;
-                }
-            }
-
             auto it = domainMap_.find(key);
             if (it != domainMap_.end()) {
                 result[op.id()] = it->second;
