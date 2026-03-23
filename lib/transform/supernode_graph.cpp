@@ -44,22 +44,33 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         return;
     }
 
-    // Check for cycle: use BFS to detect if target is reachable from source
-    // If target is reachable from source, merging would create a cycle
+    // Check for cycle: merging is valid if we're contracting an edge (source -> target or target -> source)
+    // but invalid if it would create a cycle in the quotient graph.
+    // We allow direct edges between source and target (these get removed as self-loops),
+    // but reject if there's a path from target to source that doesn't go through the direct edge.
+
+    bool hasDirectEdge = nodes_[sourceId].successors.count(targetId) > 0;
+
+    // BFS from target, excluding the direct edge back to source
     std::unordered_set<SuperNodeId> visited;
     std::queue<SuperNodeId> queue;
-    queue.push(sourceId);
-    visited.insert(sourceId);
+    queue.push(targetId);
+    visited.insert(targetId);
 
     while (!queue.empty()) {
         SuperNodeId current = queue.front();
         queue.pop();
 
-        if (current == targetId) {
-            throw std::invalid_argument("Merge would create a circular dependency");
-        }
-
         for (auto succId : nodes_[current].successors) {
+            // Skip the direct edge from source to target when checking reachability
+            if (current == targetId && succId == sourceId && hasDirectEdge) {
+                continue;
+            }
+
+            if (succId == sourceId) {
+                throw std::invalid_argument("Merge would create a cycle");
+            }
+
             if (visited.find(succId) == visited.end()) {
                 visited.insert(succId);
                 queue.push(succId);

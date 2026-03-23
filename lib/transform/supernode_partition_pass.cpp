@@ -70,7 +70,8 @@ PassResult SuperNodePartitionPass::run() {
         // Calculate size statistics
         size_t totalMembers = 0;
         size_t maxSize = 0;
-        for (const auto& [snId, node] : sg.nodes()) {
+        for (const auto& snId : sg.validNodeIds()) {
+            const auto& node = sg.getNode(snId);
             size_t memberCount = node.members.size();
             totalMembers += memberCount;
             maxSize = std::max(maxSize, memberCount);
@@ -81,7 +82,8 @@ PassResult SuperNodePartitionPass::run() {
 
         // Count cross-domain edges
         size_t crossDomainEdges = 0;
-        for (const auto& [snId, node] : sg.nodes()) {
+        for (const auto& snId : sg.validNodeIds()) {
+            const auto& node = sg.getNode(snId);
             for (const auto& succId : node.successors) {
                 const auto& succNode = sg.getNode(succId);
                 if (node.timingDomain != succNode.timingDomain) {
@@ -93,7 +95,8 @@ PassResult SuperNodePartitionPass::run() {
 
         // Count cut edges (edges between different supernodes)
         size_t cutEdges = 0;
-        for (const auto& [snId, node] : sg.nodes()) {
+        for (const auto& snId : sg.validNodeIds()) {
+            const auto& node = sg.getNode(snId);
             cutEdges += node.successors.size();
         }
         setScratchpad("supernode.cut_edges", cutEdges);
