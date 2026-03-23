@@ -16,92 +16,144 @@ PassResult SuperNodePartitionPass::run() {
 
     for (auto& entry : design().graphs()) {
         auto& graph = *entry.second;
+        auto graphSymbol = entry.first;
+
+        // Check preconditions: design must be flattened (no kInstance ops)
+        for (const auto& opId : graph.operations()) {
+            auto op = graph.getOperation(opId);
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kInstance) {
+                diags().error("supernode-partition",
+                    "Design contains kInstance operations - must flatten before partitioning",
+                    "Graph: " + graphSymbol.text());
+                result.failed = true;
+                return result;
+            }
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kBlackbox) {
+                diags().error("supernode-partition",
+                    "Design contains kBlackbox operations - not supported",
+                    "Graph: " + graphSymbol.text());
+                result.failed = true;
+                return result;
+            }
+        }
 
         // Analyze timing domains
         TimingDomainAnalyzer analyzer(graph);
         auto opToDomain = analyzer.assignTimingDomains();
 
-        // Initialize supernode graph
-        SuperNodeGraph sg;
-        for (const auto& opId : graph.operations()) {
-            auto op = graph.getOperation(opId);
-            SuperNodeId snId = sg.createSuperNode();
-            sg.addMember(snId, op.id());
-            auto it = opToDomain.find(op.id());
-            if (it != opToDomain.end()) {
-                sg.getNode(snId).timingDomain = it->second;
-            }
+        // Group operations by timing domain
+        std::unordered_map<std::string, std::vector<wolvrix::lib::grh::OperationId>> domainOps;
+        for (const auto& [opId, domain] : opToDomain) {
+            domainOps[domain].push_back(opId);
         }
 
-        // Build edges
-        for (const auto& opId : graph.operations()) {
-            auto op = graph.getOperation(opId);
-            auto srcSnId = sg.getSuperNodeForOp(op.id());
-            if (!srcSnId) continue;
+        // Process each timing domain separately
+        for (const auto& [domain, ops] : domainOps) {
+            // Initialize supernode graph for this domain
+            SuperNodeGraph sg;
 
-            for (const auto& operand : op.operands()) {
-                auto value = graph.getValue(operand);
-                auto defOpId = value.definingOp();
-                if (defOpId.valid()) {
-                    auto dstSnId = sg.getSuperNodeForOp(defOpId);
-                    if (dstSnId && *srcSnId != *dstSnId) {
-                        sg.getNode(*dstSnId).successors.insert(*srcSnId);
-                        sg.getNode(*srcSnId).predecessors.insert(*dstSnId);
+            // Create supernodes for operations in this domain
+            for (const auto& opId : ops) {
+                auto op = graph.getOperation(opId);
+                SuperNodeId snId = sg.createSuperNode();
+                sg.addMember(snId, op.id());
+                sg.getNode(snId).timingDomain = domain;
+            }
+
+            // Build edges within this domain
+            for (const auto& opId : ops) {
+                auto op = graph.getOperation(opId);
+                auto srcSnId = sg.getSuperNodeForOp(op.id());
+                if (!srcSnId) continue;
+
+                for (const auto& operand : op.operands()) {
+                    auto value = graph.getValue(operand);
+                    auto defOpId = value.definingOp();
+                    if (defOpId.valid()) {
+                        auto dstSnId = sg.getSuperNodeForOp(defOpId);
+                        if (dstSnId && *srcSnId != *dstSnId) {
+                            sg.getNode(*dstSnId).successors.insert(*srcSnId);
+                            sg.getNode(*srcSnId).predecessors.insert(*dstSnId);
+                        }
                     }
                 }
             }
-        }
 
-        // Coarsen
-        SuperNodeCoarsener coarsener(sg, graph);
-        coarsener.setMaxSuperNodeSize(maxSuperNodeSize_);
-        coarsener.coarsen();
+            // Coarsen
+            SuperNodeCoarsener coarsener(sg, graph);
+            coarsener.setMaxSuperNodeSize(maxSuperNodeSize_);
+            coarsener.coarsen();
 
-        // Partition
-        SuperNodePartitioner partitioner(sg);
-        partitioner.setMaxSuperNodeSize(maxSuperNodeSize_);
-        partitioner.partition();
+            // Partition
+            SuperNodePartitioner partitioner(sg);
+            partitioner.setMaxSuperNodeSize(maxSuperNodeSize_);
+            partitioner.partition();
 
-        // Write comprehensive scratchpad metadata
-        // Basic statistics
-        setScratchpad("supernode.count", sg.nodeCount());
-        setScratchpad("supernode.edge_count", sg.edgeCount());
+            // Write scratchpad metadata with graph and domain namespace
+            std::string prefix = "supernode." + graphSymbol.text() + "." + domain + ".";
 
-        // Calculate size statistics
-        size_t totalMembers = 0;
-        size_t maxSize = 0;
-        for (const auto& snId : sg.validNodeIds()) {
-            const auto& node = sg.getNode(snId);
-            size_t memberCount = node.members.size();
-            totalMembers += memberCount;
-            maxSize = std::max(maxSize, memberCount);
-        }
-        double avgSize = sg.nodeCount() > 0 ? static_cast<double>(totalMembers) / sg.nodeCount() : 0.0;
-        setScratchpad("supernode.avg_size", avgSize);
-        setScratchpad("supernode.max_size", maxSize);
+            // Basic statistics
+            setScratchpad(prefix + "count", sg.nodeCount());
+            setScratchpad(prefix + "edge_count", sg.edgeCount());
 
-        // Count cross-domain edges
-        size_t crossDomainEdges = 0;
-        for (const auto& snId : sg.validNodeIds()) {
-            const auto& node = sg.getNode(snId);
-            for (const auto& succId : node.successors) {
-                const auto& succNode = sg.getNode(succId);
-                if (node.timingDomain != succNode.timingDomain) {
-                    crossDomainEdges++;
+            // Calculate size statistics
+            size_t totalMembers = 0;
+            size_t maxSize = 0;
+            for (const auto& snId : sg.validNodeIds()) {
+                const auto& node = sg.getNode(snId);
+                size_t memberCount = node.members.size();
+                totalMembers += memberCount;
+                maxSize = std::max(maxSize, memberCount);
+            }
+            double avgSize = sg.nodeCount() > 0 ? static_cast<double>(totalMembers) / sg.nodeCount() : 0.0;
+            setScratchpad(prefix + "avg_size", avgSize);
+            setScratchpad(prefix + "max_size", maxSize);
+
+            // Build op_to_sn and sn_to_ops mappings
+            std::unordered_map<wolvrix::lib::grh::OperationId, SuperNodeId, wolvrix::lib::grh::OperationIdHash> opToSn;
+            std::unordered_map<SuperNodeId, std::vector<wolvrix::lib::grh::OperationId>> snToOps;
+            for (const auto& snId : sg.validNodeIds()) {
+                const auto& node = sg.getNode(snId);
+                snToOps[snId] = node.members;
+                for (const auto& opId : node.members) {
+                    opToSn[opId] = snId;
                 }
             }
-        }
-        setScratchpad("supernode.cross_domain_edges", crossDomainEdges);
+            setScratchpad(prefix + "op_to_sn", opToSn);
+            setScratchpad(prefix + "sn_to_ops", snToOps);
 
-        // Count cut edges (edges between different supernodes)
-        size_t cutEdges = 0;
-        for (const auto& snId : sg.validNodeIds()) {
-            const auto& node = sg.getNode(snId);
-            cutEdges += node.successors.size();
-        }
-        setScratchpad("supernode.cut_edges", cutEdges);
+            // Build predecessors and successors maps
+            std::unordered_map<SuperNodeId, std::vector<SuperNodeId>> predecessors;
+            std::unordered_map<SuperNodeId, std::vector<SuperNodeId>> successors;
+            for (const auto& snId : sg.validNodeIds()) {
+                const auto& node = sg.getNode(snId);
+                predecessors[snId] = std::vector<SuperNodeId>(node.predecessors.begin(), node.predecessors.end());
+                successors[snId] = std::vector<SuperNodeId>(node.successors.begin(), node.successors.end());
+            }
+            setScratchpad(prefix + "predecessors", predecessors);
+            setScratchpad(prefix + "successors", successors);
 
-        result.changed = true;
+            // Topological order
+            auto topoOrder = sg.topologicalSort();
+            setScratchpad(prefix + "topo_order", topoOrder);
+
+            // Timing domain
+            setScratchpad(prefix + "timing_domain", domain);
+
+            // Cross-domain edges (empty for per-domain graphs)
+            std::vector<std::pair<SuperNodeId, SuperNodeId>> crossDomainEdges;
+            setScratchpad(prefix + "cross_domain_edges", crossDomainEdges);
+
+            // Count cut edges
+            size_t cutEdges = 0;
+            for (const auto& snId : sg.validNodeIds()) {
+                const auto& node = sg.getNode(snId);
+                cutEdges += node.successors.size();
+            }
+            setScratchpad(prefix + "cut_edges", cutEdges);
+
+            result.changed = true;
+        }
     }
 
     return result;
