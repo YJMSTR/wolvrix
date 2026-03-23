@@ -23,24 +23,27 @@ PassResult SuperNodePartitionPass::run() {
 
         // Initialize supernode graph
         SuperNodeGraph sg;
-        for (const auto& op : graph.operations()) {
+        for (const auto& opId : graph.operations()) {
+            auto op = graph.getOperation(opId);
             SuperNodeId snId = sg.createSuperNode();
-            sg.addMember(snId, op.id);
-            auto it = opToDomain.find(op.id);
+            sg.addMember(snId, op.id());
+            auto it = opToDomain.find(op.id());
             if (it != opToDomain.end()) {
                 sg.getNode(snId).timingDomain = it->second;
             }
         }
 
         // Build edges
-        for (const auto& op : graph.operations()) {
-            auto srcSnId = sg.getSuperNodeForOp(op.id);
+        for (const auto& opId : graph.operations()) {
+            auto op = graph.getOperation(opId);
+            auto srcSnId = sg.getSuperNodeForOp(op.id());
             if (!srcSnId) continue;
 
-            for (const auto& operand : op.operands) {
-                auto defOp = graph.definingOp(operand);
-                if (defOp.valid()) {
-                    auto dstSnId = sg.getSuperNodeForOp(defOp);
+            for (const auto& operand : op.operands()) {
+                auto value = graph.getValue(operand);
+                auto defOpId = value.definingOp();
+                if (defOpId.valid()) {
+                    auto dstSnId = sg.getSuperNodeForOp(defOpId);
                     if (dstSnId && *srcSnId != *dstSnId) {
                         sg.getNode(*dstSnId).successors.insert(*srcSnId);
                         sg.getNode(*srcSnId).predecessors.insert(*dstSnId);
