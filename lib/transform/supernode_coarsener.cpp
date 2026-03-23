@@ -15,19 +15,66 @@ void SuperNodeCoarsener::coarsen() {
 
     bool changed = true;
     while (changed) {
-        changed = false;
+        size_t beforeCount = sg_.nodeCount();
         mergeOut1();
         mergeIn1();
         mergeSublings();
+        size_t afterCount = sg_.nodeCount();
+        changed = (afterCount < beforeCount);
     }
 }
 
 void SuperNodeCoarsener::mergeResetAll() {
-    // Simplified implementation - merge reset-related nodes
+    // Group nodes by reset signal
+    std::unordered_map<std::string, std::vector<SuperNodeId>> resetGroups;
+
+    for (size_t i = 0; i < sg_.nodeCount(); i++) {
+        if (!sg_.isValid(i)) continue;
+
+        const auto& node = sg_.getNode(i);
+        // Use timing domain as a proxy for reset grouping
+        // In a full implementation, this would analyze actual reset signals
+        if (!node.timingDomain.empty()) {
+            resetGroups[node.timingDomain].push_back(i);
+        }
+    }
+
+    // Merge nodes within each reset group
+    for (const auto& [reset, nodes] : resetGroups) {
+        if (nodes.size() > 1) {
+            SuperNodeId target = nodes[0];
+            for (size_t i = 1; i < nodes.size(); i++) {
+                if (canMerge(target, nodes[i])) {
+                    doMerge(target, nodes[i]);
+                }
+            }
+        }
+    }
 }
 
 void SuperNodeCoarsener::mergeWhenNodes() {
-    // Simplified implementation - merge nodes with shared conditions
+    // Group nodes by their predecessor pattern (shared conditions)
+    std::unordered_map<uint64_t, std::vector<SuperNodeId>> condGroups;
+
+    for (size_t i = 0; i < sg_.nodeCount(); i++) {
+        if (!sg_.isValid(i)) continue;
+
+        // Compute hash based on predecessors (shared conditions)
+        uint64_t hash = computeHash(i);
+        condGroups[hash].push_back(i);
+    }
+
+    // Merge nodes with identical predecessor patterns
+    for (const auto& [hash, nodes] : condGroups) {
+        if (nodes.size() > 1) {
+            SuperNodeId target = nodes[0];
+            for (size_t i = 1; i < nodes.size(); i++) {
+                if (canMerge(target, nodes[i])) {
+                    doMerge(target, nodes[i]);
+                }
+            }
+        }
+    }
 }
 
 void SuperNodeCoarsener::mergeOut1() {
