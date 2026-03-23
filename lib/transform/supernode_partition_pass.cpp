@@ -41,14 +41,32 @@ PassResult SuperNodePartitionPass::run() {
         TimingDomainAnalyzer analyzer(graph);
         auto opToDomain = analyzer.assignTimingDomains();
 
-        // Group operations by timing domain
+        // Group operations by timing domain, rejecting malformed/cross-domain ops
         std::unordered_map<std::string, std::vector<wolvrix::lib::grh::OperationId>> domainOps;
         for (const auto& [opId, domain] : opToDomain) {
+            if (domain == "malformed") {
+                diags().error("supernode-partition",
+                    "Design contains malformed sequential operations",
+                    "Graph: " + graphSymbol.text() + ", Op: " + std::to_string(opId.index));
+                result.failed = true;
+                return result;
+            }
+            if (domain == "cross_domain") {
+                diags().error("supernode-partition",
+                    "Design contains shared combinational logic across timing domains",
+                    "Graph: " + graphSymbol.text() + ", Op: " + std::to_string(opId.index));
+                result.failed = true;
+                return result;
+            }
             domainOps[domain].push_back(opId);
         }
 
+        // Track emitted namespaces for discovery
+        std::vector<std::string> emittedDomains;
+
         // Process each timing domain separately
         for (const auto& [domain, ops] : domainOps) {
+            emittedDomains.push_back(domain);
             // Initialize supernode graph for this domain
             SuperNodeGraph sg;
 
@@ -154,6 +172,10 @@ PassResult SuperNodePartitionPass::run() {
 
             result.changed = true;
         }
+
+        // Write discovery key listing all emitted domains for this graph
+        std::string discoveryKey = "supernode." + graphSymbol.text() + ".domains";
+        setScratchpad(discoveryKey, emittedDomains);
     }
 
     return result;
