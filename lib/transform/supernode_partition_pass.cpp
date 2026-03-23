@@ -62,10 +62,41 @@ PassResult SuperNodePartitionPass::run() {
         partitioner.setMaxSuperNodeSize(maxSuperNodeSize_);
         partitioner.partition();
 
-        // Write to scratchpad
+        // Write comprehensive scratchpad metadata
+        // Basic statistics
         setScratchpad("supernode.count", sg.nodeCount());
         setScratchpad("supernode.edge_count", sg.edgeCount());
-        setScratchpad("supernode.cross_domain_edges", sg.crossDomainEdgeCount());
+
+        // Calculate size statistics
+        size_t totalMembers = 0;
+        size_t maxSize = 0;
+        for (const auto& [snId, node] : sg.nodes()) {
+            size_t memberCount = node.members.size();
+            totalMembers += memberCount;
+            maxSize = std::max(maxSize, memberCount);
+        }
+        double avgSize = sg.nodeCount() > 0 ? static_cast<double>(totalMembers) / sg.nodeCount() : 0.0;
+        setScratchpad("supernode.avg_size", avgSize);
+        setScratchpad("supernode.max_size", maxSize);
+
+        // Count cross-domain edges
+        size_t crossDomainEdges = 0;
+        for (const auto& [snId, node] : sg.nodes()) {
+            for (const auto& succId : node.successors) {
+                const auto& succNode = sg.getNode(succId);
+                if (node.timingDomain != succNode.timingDomain) {
+                    crossDomainEdges++;
+                }
+            }
+        }
+        setScratchpad("supernode.cross_domain_edges", crossDomainEdges);
+
+        // Count cut edges (edges between different supernodes)
+        size_t cutEdges = 0;
+        for (const auto& [snId, node] : sg.nodes()) {
+            cutEdges += node.successors.size();
+        }
+        setScratchpad("supernode.cut_edges", cutEdges);
 
         result.changed = true;
     }
