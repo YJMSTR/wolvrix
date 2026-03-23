@@ -105,6 +105,11 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/strip_debug.cpp
     lib/transform/hrbcut.cpp
     lib/transform/repcut.cpp
+    lib/transform/supernode_graph.cpp
+    lib/transform/timing_domain_analyzer.cpp
+    lib/transform/supernode_coarsener.cpp
+    lib/transform/supernode_partitioner.cpp
+    lib/transform/supernode_partition_pass.cpp
 )
 
 add_library(wolvrix-lib SHARED ${WOLVRIX_LIB_SOURCES})
