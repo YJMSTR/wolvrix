@@ -517,6 +517,18 @@ target_link_libraries(transform-repcut-partition-set
 
 register_test_exe(transform-repcut-partition-set)
 
+# transform: supernode
+add_executable(transform-supernode
+    tests/transform/test_supernode.cpp
+)
+
+target_link_libraries(transform-supernode
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-supernode)
+
 add_executable(transform-repcut-partition-count
     tests/transform/test_repcut_partition_count.cpp
 )
