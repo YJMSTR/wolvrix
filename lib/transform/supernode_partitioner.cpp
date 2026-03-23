@@ -1,6 +1,7 @@
 #include "transform/supernode_partitioner.hpp"
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 
 namespace wolvrix::lib::transform
 {
@@ -11,8 +12,7 @@ SuperNodePartitioner::SuperNodePartitioner(SuperNodeGraph& sg)
 void SuperNodePartitioner::partition() {
     // Validate input: check for cycles
     if (sg_.hasCircularDependency()) {
-        // Cannot partition a graph with cycles
-        return;
+        throw std::runtime_error("Cannot partition graph with circular dependencies");
     }
 
     // Validate input: check for empty graph
