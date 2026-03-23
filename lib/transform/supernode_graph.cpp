@@ -44,8 +44,13 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         return;
     }
 
+    // Check for cycle: if source is a predecessor of target, merging would create a cycle
     auto& target = nodes_[targetId];
     auto& source = nodes_[sourceId];
+
+    if (target.predecessors.count(sourceId) > 0 && source.successors.count(targetId) > 0) {
+        throw std::invalid_argument("Merge would create a circular dependency");
+    }
 
     // Move members
     for (auto opId : source.members) {
