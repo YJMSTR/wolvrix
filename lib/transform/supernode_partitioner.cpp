@@ -9,12 +9,39 @@ SuperNodePartitioner::SuperNodePartitioner(SuperNodeGraph& sg)
     : sg_(sg) {}
 
 void SuperNodePartitioner::partition() {
+    // Validate input: check for cycles
+    if (sg_.hasCircularDependency()) {
+        // Cannot partition a graph with cycles
+        return;
+    }
+
+    // Validate input: check for empty graph
+    if (sg_.nodeCount() == 0) {
+        return;
+    }
+
+    // Cache topological order for efficiency
+    cachedTopoOrder_ = sg_.topologicalSort();
+
     auto cuts = computeOptimalCuts();
+
+    // Validate cut sequence is strictly increasing
+    for (size_t i = 1; i < cuts.size(); ++i) {
+        if (cuts[i] <= cuts[i-1]) {
+            // Invalid cut sequence, abort
+            return;
+        }
+    }
+
     mergeByIntervals(cuts);
+
+    // Recompute metadata after interval merging
+    cachedTopoOrder_ = sg_.topologicalSort();
 }
 
 std::vector<int> SuperNodePartitioner::computeOptimalCuts() {
-    auto sorted = sg_.topologicalSort();
+    // Use cached topological order
+    const auto& sorted = cachedTopoOrder_;
     int n = sorted.size();
 
     std::vector<DPState> dp(n + 1);
@@ -59,7 +86,8 @@ std::vector<int> SuperNodePartitioner::computeOptimalCuts() {
 }
 
 int SuperNodePartitioner::computeCutCost(int start, int end) const {
-    auto sorted = sg_.topologicalSort();
+    // Use cached topological order
+    const auto& sorted = cachedTopoOrder_;
     int cost = 0;
 
     for (int i = start; i < end; i++) {
@@ -81,7 +109,8 @@ int SuperNodePartitioner::computeCutCost(int start, int end) const {
 }
 
 void SuperNodePartitioner::mergeByIntervals(const std::vector<int>& cuts) {
-    auto sorted = sg_.topologicalSort();
+    // Use cached topological order
+    const auto& sorted = cachedTopoOrder_;
     int start = 0;
 
     for (int cut : cuts) {

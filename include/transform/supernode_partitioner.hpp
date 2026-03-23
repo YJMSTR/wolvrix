@@ -30,6 +30,7 @@ private:
 
     SuperNodeGraph& sg_;
     size_t maxSuperNodeSize_ = 35;
+    std::vector<SuperNodeId> cachedTopoOrder_;
 };
 
 } // namespace wolvrix::lib::transform
