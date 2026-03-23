@@ -10,7 +10,7 @@ namespace wolvrix::lib::transform
 {
 
 struct EventKey {
-    std::vector<grh::EdgeType> eventEdge;
+    std::vector<std::string> eventEdge;  // Edge polarity: "posedge", "negedge", etc.
     std::vector<grh::ValueId> eventSignals;
 
     bool operator==(const EventKey& other) const;
