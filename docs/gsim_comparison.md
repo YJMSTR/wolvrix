@@ -73,15 +73,16 @@ This matches the expected GSim-style outcome for a simple linear DAG under the
 same interval-size limit.
 
 On the repository's branched 6-node DAG fixture (`0/1 -> 2 -> 3/4 -> 5`),
-Wolvrix also reduces both node count and cut-edge count under the same size
-limit while preserving acyclicity. This is still smaller than a full GSim
-benchmark, but it is closer to the fanout/fanin shapes that motivate
-hypergraph-style clustering.
+Wolvrix reduces the graph from 6 supernodes / 6 edges to 3 supernodes / 2 edges
+under the same size limit while preserving acyclicity. This is still smaller
+than a full GSim benchmark, but it is closer to the fanout/fanin shapes that
+motivate hypergraph-style clustering.
 
 ## Remaining Gaps
 
-- Cross-domain metadata and policy need broader integration coverage beyond the
-  current targeted tests.
+- Cross-domain metadata is currently validated through the conservative failure
+  path; successful non-empty `cross_domain_edges` emission is not expected in
+  the currently supported GRH partition flow.
 - The repository still needs broader full-tree verification and more explicit
   design-level evidence for node-count / cut-edge outcomes.
 - Documentation and tests should continue converging on the namespaced

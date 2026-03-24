@@ -186,13 +186,23 @@ public:
             throw std::runtime_error("missing extended scratchpad contract keys");
         }
 
-        if (*seqCount != 1 || *seqEdgeCount != 0 || *seqCutEdges != 0 || *seqMaxSize == 0)
+        if (*combCount != 1 || *combEdgeCount != 0 || *combCutEdges != 0 ||
+            *combMaxSize != 1 || *combAvgSize != 1.0)
+        {
+            throw std::runtime_error(
+                "unexpected combinational-domain statistics for minimal mixed graph: count=" +
+                std::to_string(*combCount) + " edge_count=" + std::to_string(*combEdgeCount) +
+                " cut_edges=" + std::to_string(*combCutEdges) + " max_size=" +
+                std::to_string(*combMaxSize) + " avg_size=" + std::to_string(*combAvgSize));
+        }
+        if (*seqCount != 1 || *seqEdgeCount != 0 || *seqCutEdges != 0 ||
+            *seqMaxSize != 3 || *seqAvgSize != 3.0)
         {
             throw std::runtime_error(
                 "unexpected sequential-domain statistics for minimal mixed graph: count=" +
                 std::to_string(*seqCount) + " edge_count=" + std::to_string(*seqEdgeCount) +
                 " cut_edges=" + std::to_string(*seqCutEdges) + " max_size=" +
-                std::to_string(*seqMaxSize));
+                std::to_string(*seqMaxSize) + " avg_size=" + std::to_string(*seqAvgSize));
         }
         if (*combCount != combMembers->size() || *seqCount != seqMembers->size())
         {
@@ -237,21 +247,9 @@ public:
         {
             throw std::runtime_error("unexpected timing-domain or average-size metadata");
         }
-        if (*combAvgSize <= 0.0 || *seqAvgSize <= 0.0 || *combMaxSize == 0)
-        {
-            throw std::runtime_error(
-                "unexpected average/max size metadata: comb_avg=" +
-                std::to_string(*combAvgSize) + " seq_avg=" + std::to_string(*seqAvgSize) +
-                " comb_max=" + std::to_string(*combMaxSize) + " seq_max=" +
-                std::to_string(*seqMaxSize));
-        }
         if (!crossDomainEdges->empty())
         {
             throw std::runtime_error("unexpected cross-domain edges in single-domain sequential fixture");
-        }
-        if (*combCount != 1 || *seqCount != 1)
-        {
-            throw std::runtime_error("expected one supernode per domain in the minimal mixed fixture");
         }
 
         std::set<uint32_t> combinationalMembers;
@@ -842,8 +840,8 @@ void testPartitionerReducesEdgesOnBranchedDagFixture()
     expect(beforeNodes == 6 && beforeEdges == 6,
            "expected known branched-DAG baseline before partitioning");
     expect(!sg.hasCircularDependency(), "partitioned branched fixture must remain acyclic");
-    expect(sg.nodeCount() < beforeNodes, "partition should reduce node count on branched DAG fixture");
-    expect(sg.edgeCount() < beforeEdges, "partition should reduce edge count on branched DAG fixture");
+    expect(sg.nodeCount() == 3, "branched DAG fixture should collapse to exactly three supernodes");
+    expect(sg.edgeCount() == 2, "branched DAG fixture should collapse to exactly two remaining cut edges");
 }
 
 void testPartitionPassBuildsTotalGraphScratchpadCoverage()

@@ -30,6 +30,9 @@ Scratchpad keys are graph/domain namespaced.
   - concrete cross-domain operation edges between distinct timing domains
   - edges involving the `combinational`, `cross_domain`, or `malformed` buckets
     are not emitted here
+  - in the current GRH flow, supported graphs are expected to emit an empty
+    vector; shared cross-domain combinational logic follows the conservative
+    diagnostic failure path instead of reaching successful metadata emission
 
 ### Per-domain keys
 
@@ -127,12 +130,14 @@ The repository currently contains targeted regressions for:
 - Branched 6-node combinational DAG (`0/1 -> 2 -> 3/4 -> 5`) with
   `maxSuperNodeSize = 2`
   - before partition: 6 supernodes, 6 edges
-  - after partition: fewer supernodes and fewer cut edges than the baseline
+  - after partition: 3 supernodes, 2 edges
   - invariant check: graph remains acyclic after partitioning
 - Mixed sequential/combinational scratchpad fixture
-  - proves namespaced discovery keys
-  - proves total graph coverage via `op_to_sn`
-  - proves graph-level `cross_domain_edges` stays empty in the single-domain case
+  - proves exact namespaced discovery keys and exact domain statistics
+  - proves exact total graph coverage via `op_to_sn` and `sn_to_ops`
+  - proves exact topology/isolation metadata for the supported single-domain case
+  - proves graph-level `cross_domain_edges` stays empty in the supported
+    single-domain case
 - Shared cross-domain combinational logic fixture
   - proves the current conservative failure path raises diagnostics instead of
     silently partitioning unsupported multi-domain sharing
