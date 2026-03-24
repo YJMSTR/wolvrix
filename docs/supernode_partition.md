@@ -124,6 +124,11 @@ The repository currently contains targeted regressions for:
   - before partition: 4 supernodes, 3 edges
   - after partition: 2 supernodes, 1 edge
   - stable layout: two 2-op intervals on repeated runs
+- Branched 6-node combinational DAG (`0/1 -> 2 -> 3/4 -> 5`) with
+  `maxSuperNodeSize = 2`
+  - before partition: 6 supernodes, 6 edges
+  - after partition: fewer supernodes and fewer cut edges than the baseline
+  - invariant check: graph remains acyclic after partitioning
 - Mixed sequential/combinational scratchpad fixture
   - proves namespaced discovery keys
   - proves total graph coverage via `op_to_sn`

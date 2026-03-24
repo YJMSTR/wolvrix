@@ -108,11 +108,11 @@ std::vector<std::vector<uint32_t>> partitionLayout(const SuperNodeGraph &sg)
 class PartitionScratchpadChecker : public Pass
 {
 public:
-    PartitionScratchpadChecker(grh::OperationId expectedCombinationalOp,
-                               grh::OperationId expectedSequentialOp)
+    PartitionScratchpadChecker(std::set<uint32_t> expectedCombinationalOps,
+                               std::set<uint32_t> expectedSequentialOps)
         : Pass("partition-scratchpad-checker", "partition-scratchpad-checker"),
-          expectedCombinationalOp_(expectedCombinationalOp),
-          expectedSequentialOp_(expectedSequentialOp)
+          expectedCombinationalOps_(std::move(expectedCombinationalOps)),
+          expectedSequentialOps_(std::move(expectedSequentialOps))
     {
     }
 
@@ -150,14 +150,6 @@ public:
         if (combinationalMap == nullptr || sequentialMap == nullptr)
         {
             throw std::runtime_error("missing expected op_to_sn scratchpad keys");
-        }
-        if (combinationalMap->find(expectedCombinationalOp_) == combinationalMap->end())
-        {
-            throw std::runtime_error("unrelated combinational op was not assigned to any supernode");
-        }
-        if (sequentialMap->find(expectedSequentialOp_) == sequentialMap->end())
-        {
-            throw std::runtime_error("sequential op was not assigned to its timing-domain supernode");
         }
 
         const auto *combCount = getScratchpad<size_t>("supernode.top.combinational.count");
@@ -206,6 +198,32 @@ public:
         {
             throw std::runtime_error("count metadata does not match sn_to_ops cardinality");
         }
+        std::set<uint32_t> combinationalCovered;
+        std::set<uint32_t> sequentialCovered;
+        for (const auto &[opId, snId] : *combinationalMap)
+        {
+            combinationalCovered.insert(opId.index);
+            if (combMembers->find(snId) == combMembers->end())
+            {
+                throw std::runtime_error("combinational op_to_sn references missing supernode");
+            }
+        }
+        for (const auto &[opId, snId] : *sequentialMap)
+        {
+            sequentialCovered.insert(opId.index);
+            if (seqMembers->find(snId) == seqMembers->end())
+            {
+                throw std::runtime_error("sequential op_to_sn references missing supernode");
+            }
+        }
+        if (combinationalCovered != expectedCombinationalOps_)
+        {
+            throw std::runtime_error("combinational op_to_sn coverage does not match fixture operations");
+        }
+        if (sequentialCovered != expectedSequentialOps_)
+        {
+            throw std::runtime_error("sequential op_to_sn coverage does not match fixture operations");
+        }
         if (combTopo->size() != *combCount || seqTopo->size() != *seqCount)
         {
             throw std::runtime_error("topological order size does not match domain node count");
@@ -231,12 +249,54 @@ public:
         {
             throw std::runtime_error("unexpected cross-domain edges in single-domain sequential fixture");
         }
+        if (*combCount != 1 || *seqCount != 1)
+        {
+            throw std::runtime_error("expected one supernode per domain in the minimal mixed fixture");
+        }
+
+        std::set<uint32_t> combinationalMembers;
+        for (const auto &[snId, members] : *combMembers)
+        {
+            if (snId != (*combTopo)[0])
+            {
+                throw std::runtime_error("combinational topo_order should enumerate the emitted supernode id");
+            }
+            if (!combPreds->at(snId).empty() || !combSuccs->at(snId).empty())
+            {
+                throw std::runtime_error("combinational supernode should be isolated in the minimal mixed fixture");
+            }
+            for (const auto opId : members)
+            {
+                combinationalMembers.insert(opId.index);
+            }
+        }
+        std::set<uint32_t> sequentialMembers;
+        for (const auto &[snId, members] : *seqMembers)
+        {
+            if (snId != (*seqTopo)[0])
+            {
+                throw std::runtime_error("sequential topo_order should enumerate the emitted supernode id");
+            }
+            if (!seqPreds->at(snId).empty() || !seqSuccs->at(snId).empty())
+            {
+                throw std::runtime_error("sequential supernode should be isolated in the minimal mixed fixture");
+            }
+            for (const auto opId : members)
+            {
+                sequentialMembers.insert(opId.index);
+            }
+        }
+        if (combinationalMembers != expectedCombinationalOps_ ||
+            sequentialMembers != expectedSequentialOps_)
+        {
+            throw std::runtime_error("sn_to_ops membership does not exactly match the fixture contract");
+        }
         return {};
     }
 
 private:
-    grh::OperationId expectedCombinationalOp_;
-    grh::OperationId expectedSequentialOp_;
+    std::set<uint32_t> expectedCombinationalOps_;
+    std::set<uint32_t> expectedSequentialOps_;
 };
 
 void testSuperNodeGraphBasics()
@@ -494,6 +554,44 @@ void testCoarsenerMergesIdenticalResetTrees()
            "write ports with the same reset tree should merge");
 }
 
+void testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto lhs = graph.createValue(graph.internSymbol("lhs"), 8, false);
+    const auto rhs = graph.createValue(graph.internSymbol("rhs"), 8, false);
+    const auto addOut = graph.createValue(graph.internSymbol("add_out"), 8, false);
+    const auto add = graph.createOperation(grh::OperationKind::kAdd, graph.internSymbol("fanin_add"));
+    graph.addOperand(add, lhs);
+    graph.addOperand(add, rhs);
+    graph.addResult(add, addOut);
+
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto next = makeMux(graph, "next", "next_mux", rst, zero, addOut, 8);
+    const auto write = makeRegisterWrite(graph, "reg_write", one, next, mask, clk, "reg_a");
+
+    SuperNodeGraph sg;
+    const auto snComb = sg.createSuperNode();
+    const auto snWrite = sg.createSuperNode();
+    sg.addMember(snComb, add);
+    sg.addMember(snWrite, write);
+    sg.getNode(snComb).timingDomain = "domain_0";
+    sg.getNode(snWrite).timingDomain = "domain_0";
+    sg.getNode(snComb).successors.insert(snWrite);
+    sg.getNode(snWrite).predecessors.insert(snComb);
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 1,
+           "coarsener should still merge control-sensitive sequential nodes with combinational fan-in");
+}
+
 void testPartitionerDoesNotMergeDifferentResetSemantics()
 {
     grh::Design design;
@@ -707,6 +805,47 @@ void testPartitionerProducesStableLayoutAcrossRuns()
            "repeated runs on equivalent graphs should produce the same partition layout");
 }
 
+void testPartitionerReducesEdgesOnBranchedDagFixture()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    SuperNodeGraph sg;
+    std::vector<SuperNodeId> nodeIds;
+    for (int i = 0; i < 6; ++i)
+    {
+        const auto op = makeCombOp(graph, "branch_op" + std::to_string(i));
+        const auto sn = sg.createSuperNode();
+        sg.addMember(sn, op);
+        sg.getNode(sn).timingDomain = "combinational";
+        nodeIds.push_back(sn);
+    }
+
+    auto connect = [&](size_t from, size_t to) {
+        sg.getNode(nodeIds[from]).successors.insert(nodeIds[to]);
+        sg.getNode(nodeIds[to]).predecessors.insert(nodeIds[from]);
+    };
+    connect(0, 2);
+    connect(1, 2);
+    connect(2, 3);
+    connect(2, 4);
+    connect(3, 5);
+    connect(4, 5);
+
+    const auto beforeNodes = sg.nodeCount();
+    const auto beforeEdges = sg.edgeCount();
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(2);
+    partitioner.partition();
+
+    expect(beforeNodes == 6 && beforeEdges == 6,
+           "expected known branched-DAG baseline before partitioning");
+    expect(!sg.hasCircularDependency(), "partitioned branched fixture must remain acyclic");
+    expect(sg.nodeCount() < beforeNodes, "partition should reduce node count on branched DAG fixture");
+    expect(sg.edgeCount() < beforeEdges, "partition should reduce edge count on branched DAG fixture");
+}
+
 void testPartitionPassBuildsTotalGraphScratchpadCoverage()
 {
     grh::Design design;
@@ -727,9 +866,14 @@ void testPartitionPassBuildsTotalGraphScratchpadCoverage()
     const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
     const auto write = makeRegisterWrite(graph, "reg_write", one, data, mask, clk, "reg_a");
 
+    const auto oneOp = graph.getValue(one).definingOp();
+    const auto maskOp = graph.getValue(mask).definingOp();
+
     PassManager manager;
     manager.addPass(std::make_unique<SuperNodePartitionPass>());
-    manager.addPass(std::make_unique<PartitionScratchpadChecker>(add, write));
+    manager.addPass(std::make_unique<PartitionScratchpadChecker>(
+        std::set<uint32_t>{add.index},
+        std::set<uint32_t>{oneOp.index, maskOp.index, write.index}));
 
     PassDiagnostics diags;
     const auto result = manager.run(design, diags);
@@ -764,6 +908,18 @@ void testPartitionPassRejectsSharedCrossDomainLogic()
     const auto result = manager.run(design, diags);
     expect(!result.success, "shared combinational logic across timing domains should follow the conservative failure path");
     expect(diags.hasError(), "expected diagnostics for shared cross-domain logic");
+    expect(!diags.messages().empty(), "expected recorded diagnostics for shared cross-domain logic");
+    bool sawExpectedDiagnostic = false;
+    for (const auto &diag : diags.messages())
+    {
+        if (diag.passName == "supernode-partition" &&
+            diag.message == "Design contains shared combinational logic across timing domains")
+        {
+            sawExpectedDiagnostic = true;
+            break;
+        }
+    }
+    expect(sawExpectedDiagnostic, "expected exact supernode-partition cross-domain diagnostic");
 }
 
 } // namespace
@@ -783,12 +939,14 @@ int main()
         testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic();
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
+        testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn();
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();
         testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn();
         testPartitionerFindsStableTwoWayCut();
         testPartitionerRejectsImpossibleSizeConstraint();
         testPartitionerProducesStableLayoutAcrossRuns();
+        testPartitionerReducesEdgesOnBranchedDagFixture();
         testPartitionPassBuildsTotalGraphScratchpadCoverage();
         testPartitionPassRejectsSharedCrossDomainLogic();
     }
