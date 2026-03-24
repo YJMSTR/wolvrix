@@ -8,6 +8,8 @@
 namespace wolvrix::lib::transform
 {
 
+class SuperNodeCoarsenerTestPeer;
+
 class SuperNodeCoarsener {
 public:
     SuperNodeCoarsener(SuperNodeGraph& sg, const grh::Graph& graph);
@@ -16,6 +18,8 @@ public:
     void setMaxSuperNodeSize(size_t size) { maxSuperNodeSize_ = size; }
 
 private:
+    friend class SuperNodeCoarsenerTestPeer;
+
     bool mergeResetAll();
     bool mergeWhenNodes();
     bool mergeOut1();

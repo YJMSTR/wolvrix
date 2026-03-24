@@ -15,6 +15,40 @@
 using namespace wolvrix::lib;
 using namespace wolvrix::lib::transform;
 
+namespace wolvrix::lib::transform
+{
+
+class SuperNodeCoarsenerTestPeer
+{
+public:
+    static bool mergeWhenNodes(SuperNodeCoarsener &coarsener)
+    {
+        return coarsener.mergeWhenNodes();
+    }
+};
+
+class SuperNodePartitionerTestPeer
+{
+public:
+    static void setTopoOrder(SuperNodePartitioner &partitioner,
+                             std::vector<SuperNodeId> topoOrder)
+    {
+        partitioner.cachedTopoOrder_ = std::move(topoOrder);
+    }
+
+    static int computeCutCost(const SuperNodePartitioner &partitioner, int start, int end)
+    {
+        return partitioner.computeCutCost(start, end);
+    }
+
+    static std::vector<int> computeOptimalCuts(SuperNodePartitioner &partitioner)
+    {
+        return partitioner.computeOptimalCuts();
+    }
+};
+
+} // namespace wolvrix::lib::transform
+
 namespace
 {
 
@@ -600,7 +634,7 @@ void testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn()
            "coarsener should still merge control-sensitive sequential nodes with combinational fan-in");
 }
 
-void testCoarsenerMergeWhenNodesPath()
+void testMergeWhenNodesDirectPath()
 {
     grh::Design design;
     grh::Graph &graph = design.createGraph("top");
@@ -666,8 +700,9 @@ void testCoarsenerMergeWhenNodesPath()
     connect(snMuxB, snSucc2);
 
     SuperNodeCoarsener coarsener(sg, graph);
-    coarsener.coarsen();
+    const auto changed = SuperNodeCoarsenerTestPeer::mergeWhenNodes(coarsener);
 
+    expect(changed, "mergeWhenNodes peer should report a successful merge");
     expect(sg.nodeCount() == 5, "mergeWhenNodes fixture should merge only the mux pair");
     const auto mergedMux = sg.getSuperNodeForOp(muxA);
     expect(mergedMux.has_value(), "mux_a should remain mapped after mergeWhenNodes");
@@ -933,6 +968,70 @@ void testPartitionerFindsStableTwoWayCut()
            "expected stable two-by-two partition layout");
 }
 
+void testPartitionerPeerReportsExactCutCosts()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    SuperNodeGraph sg;
+    std::vector<SuperNodeId> nodeIds;
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto op = makeCombOp(graph, "cost_op" + std::to_string(i));
+        const auto sn = sg.createSuperNode();
+        sg.addMember(sn, op);
+        sg.getNode(sn).timingDomain = "combinational";
+        nodeIds.push_back(sn);
+    }
+
+    for (size_t i = 0; i + 1 < nodeIds.size(); ++i)
+    {
+        sg.getNode(nodeIds[i]).successors.insert(nodeIds[i + 1]);
+        sg.getNode(nodeIds[i + 1]).predecessors.insert(nodeIds[i]);
+    }
+
+    SuperNodePartitioner partitioner(sg, graph);
+    SuperNodePartitionerTestPeer::setTopoOrder(partitioner, nodeIds);
+
+    expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 0, 1) == 1,
+           "single-node prefix should have one outgoing cut edge");
+    expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 0, 2) == 1,
+           "two-node prefix should have one outgoing cut edge");
+    expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 0, 4) == 0,
+           "full interval should have zero outgoing cut edges");
+}
+
+void testPartitionerPeerReportsExactBacktrackedCuts()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    SuperNodeGraph sg;
+    std::vector<SuperNodeId> nodeIds;
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto op = makeCombOp(graph, "cuts_op" + std::to_string(i));
+        const auto sn = sg.createSuperNode();
+        sg.addMember(sn, op);
+        sg.getNode(sn).timingDomain = "combinational";
+        nodeIds.push_back(sn);
+    }
+
+    for (size_t i = 0; i + 1 < nodeIds.size(); ++i)
+    {
+        sg.getNode(nodeIds[i]).successors.insert(nodeIds[i + 1]);
+        sg.getNode(nodeIds[i + 1]).predecessors.insert(nodeIds[i]);
+    }
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(2);
+    SuperNodePartitionerTestPeer::setTopoOrder(partitioner, nodeIds);
+
+    const auto cuts = SuperNodePartitionerTestPeer::computeOptimalCuts(partitioner);
+    expect(cuts == std::vector<int>({2, 4}),
+           "expected exact backtracked cuts [2, 4] on the 4-node chain fixture");
+}
+
 void testPartitionerRejectsImpossibleSizeConstraint()
 {
     grh::Design design;
@@ -1134,12 +1233,14 @@ int main()
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
         testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn();
-        testCoarsenerMergeWhenNodesPath();
+        testMergeWhenNodesDirectPath();
         testCoarsenerMergeIn1Path();
         testCoarsenerMergeSiblingsPath();
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();
         testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn();
+        testPartitionerPeerReportsExactCutCosts();
+        testPartitionerPeerReportsExactBacktrackedCuts();
         testPartitionerFindsStableTwoWayCut();
         testPartitionerRejectsImpossibleSizeConstraint();
         testPartitionerProducesStableLayoutAcrossRuns();

@@ -9,6 +9,8 @@
 namespace wolvrix::lib::transform
 {
 
+class SuperNodePartitionerTestPeer;
+
 class SuperNodePartitioner {
 public:
     SuperNodePartitioner(SuperNodeGraph& sg, const grh::Graph& graph);
@@ -17,6 +19,8 @@ public:
     void setMaxSuperNodeSize(size_t size) { maxSuperNodeSize_ = size; }
 
 private:
+    friend class SuperNodePartitionerTestPeer;
+
     struct DPState {
         int cost = 0;
         int backtrack = -1;
