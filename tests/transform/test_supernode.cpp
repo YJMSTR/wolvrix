@@ -105,6 +105,16 @@ std::vector<std::vector<uint32_t>> partitionLayout(const SuperNodeGraph &sg)
     return layout;
 }
 
+std::set<uint32_t> nodeMembers(const SuperNodeGraph &sg, SuperNodeId snId)
+{
+    std::set<uint32_t> members;
+    for (const auto opId : sg.getNode(snId).members)
+    {
+        members.insert(opId.index);
+    }
+    return members;
+}
+
 class PartitionScratchpadChecker : public Pass
 {
 public:
@@ -590,6 +600,192 @@ void testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn()
            "coarsener should still merge control-sensitive sequential nodes with combinational fan-in");
 }
 
+void testCoarsenerMergeWhenNodesPath()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto cond = graph.createValue(graph.internSymbol("cond"), 1, false);
+    const auto a = graph.createValue(graph.internSymbol("a"), 8, false);
+    const auto b = graph.createValue(graph.internSymbol("b"), 8, false);
+    const auto c = graph.createValue(graph.internSymbol("c"), 8, false);
+    const auto d = graph.createValue(graph.internSymbol("d"), 8, false);
+
+    const auto muxOutA = graph.createValue(graph.internSymbol("mux_out_a"), 8, false);
+    const auto muxA = graph.createOperation(grh::OperationKind::kMux, graph.internSymbol("mux_a"));
+    graph.addOperand(muxA, cond);
+    graph.addOperand(muxA, a);
+    graph.addOperand(muxA, b);
+    graph.addResult(muxA, muxOutA);
+
+    const auto muxOutB = graph.createValue(graph.internSymbol("mux_out_b"), 8, false);
+    const auto muxB = graph.createOperation(grh::OperationKind::kMux, graph.internSymbol("mux_b"));
+    graph.addOperand(muxB, cond);
+    graph.addOperand(muxB, c);
+    graph.addOperand(muxB, d);
+    graph.addResult(muxB, muxOutB);
+
+    const auto pred1 = makeCombOp(graph, "pred1");
+    const auto pred2 = makeCombOp(graph, "pred2");
+    const auto succ1 = makeCombOp(graph, "succ1");
+    const auto succ2 = makeCombOp(graph, "succ2");
+
+    SuperNodeGraph sg;
+    const auto snPred1 = sg.createSuperNode();
+    const auto snPred2 = sg.createSuperNode();
+    const auto snMuxA = sg.createSuperNode();
+    const auto snMuxB = sg.createSuperNode();
+    const auto snSucc1 = sg.createSuperNode();
+    const auto snSucc2 = sg.createSuperNode();
+
+    sg.addMember(snPred1, pred1);
+    sg.addMember(snPred2, pred2);
+    sg.addMember(snMuxA, muxA);
+    sg.addMember(snMuxB, muxB);
+    sg.addMember(snSucc1, succ1);
+    sg.addMember(snSucc2, succ2);
+
+    sg.getNode(snPred1).timingDomain = "pred1_domain";
+    sg.getNode(snPred2).timingDomain = "pred2_domain";
+    sg.getNode(snMuxA).timingDomain = "mux_domain";
+    sg.getNode(snMuxB).timingDomain = "mux_domain";
+    sg.getNode(snSucc1).timingDomain = "succ1_domain";
+    sg.getNode(snSucc2).timingDomain = "succ2_domain";
+
+    auto connect = [&](SuperNodeId from, SuperNodeId to) {
+        sg.getNode(from).successors.insert(to);
+        sg.getNode(to).predecessors.insert(from);
+    };
+    connect(snPred1, snMuxA);
+    connect(snPred1, snMuxB);
+    connect(snPred2, snMuxA);
+    connect(snPred2, snMuxB);
+    connect(snMuxA, snSucc1);
+    connect(snMuxA, snSucc2);
+    connect(snMuxB, snSucc1);
+    connect(snMuxB, snSucc2);
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 5, "mergeWhenNodes fixture should merge only the mux pair");
+    const auto mergedMux = sg.getSuperNodeForOp(muxA);
+    expect(mergedMux.has_value(), "mux_a should remain mapped after mergeWhenNodes");
+    expect(sg.getSuperNodeForOp(muxB) == mergedMux, "mux_a and mux_b should be merged by mergeWhenNodes");
+    expect(nodeMembers(sg, *mergedMux) == std::set<uint32_t>{muxA.index, muxB.index},
+           "mergeWhenNodes should merge exactly the two mux members");
+    expect(sg.getNode(*mergedMux).predecessors == std::unordered_set<SuperNodeId>{snPred1, snPred2},
+           "merged mux should preserve both predecessors");
+    expect(sg.getNode(*mergedMux).successors == std::unordered_set<SuperNodeId>{snSucc1, snSucc2},
+           "merged mux should preserve both successors");
+    expect(!sg.hasCircularDependency(), "mergeWhenNodes fixture must remain acyclic");
+}
+
+void testCoarsenerMergeIn1Path()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto pred = makeCombOp(graph, "pred");
+    const auto mergeTarget = makeCombOp(graph, "merge_target");
+    const auto side = makeCombOp(graph, "side");
+
+    SuperNodeGraph sg;
+    const auto snPred = sg.createSuperNode();
+    const auto snTarget = sg.createSuperNode();
+    const auto snSide = sg.createSuperNode();
+
+    sg.addMember(snPred, pred);
+    sg.addMember(snTarget, mergeTarget);
+    sg.addMember(snSide, side);
+
+    sg.getNode(snPred).timingDomain = "domain_0";
+    sg.getNode(snTarget).timingDomain = "domain_0";
+    sg.getNode(snSide).timingDomain = "side_domain";
+
+    sg.getNode(snPred).successors.insert(snTarget);
+    sg.getNode(snPred).successors.insert(snSide);
+    sg.getNode(snTarget).predecessors.insert(snPred);
+    sg.getNode(snSide).predecessors.insert(snPred);
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 2, "mergeIn1 fixture should merge only the single-predecessor node");
+    const auto merged = sg.getSuperNodeForOp(pred);
+    expect(merged.has_value(), "predecessor should remain after mergeIn1");
+    expect(sg.getSuperNodeForOp(mergeTarget) == merged,
+           "merge_target should merge into its unique predecessor");
+    expect(sg.getSuperNodeForOp(side) != merged,
+           "side successor should stay separate in mergeIn1 fixture");
+    expect(nodeMembers(sg, *merged) == std::set<uint32_t>{pred.index, mergeTarget.index},
+           "mergeIn1 should merge exactly the predecessor pair");
+    expect(!sg.hasCircularDependency(), "mergeIn1 fixture must remain acyclic");
+}
+
+void testCoarsenerMergeSiblingsPath()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto pred1 = makeCombOp(graph, "pred1");
+    const auto pred2 = makeCombOp(graph, "pred2");
+    const auto sib1 = makeCombOp(graph, "sib1");
+    const auto sib2 = makeCombOp(graph, "sib2");
+    const auto succ1 = makeCombOp(graph, "succ1");
+    const auto succ2 = makeCombOp(graph, "succ2");
+
+    SuperNodeGraph sg;
+    const auto snPred1 = sg.createSuperNode();
+    const auto snPred2 = sg.createSuperNode();
+    const auto snSib1 = sg.createSuperNode();
+    const auto snSib2 = sg.createSuperNode();
+    const auto snSucc1 = sg.createSuperNode();
+    const auto snSucc2 = sg.createSuperNode();
+
+    sg.addMember(snPred1, pred1);
+    sg.addMember(snPred2, pred2);
+    sg.addMember(snSib1, sib1);
+    sg.addMember(snSib2, sib2);
+    sg.addMember(snSucc1, succ1);
+    sg.addMember(snSucc2, succ2);
+
+    sg.getNode(snPred1).timingDomain = "pred1_domain";
+    sg.getNode(snPred2).timingDomain = "pred2_domain";
+    sg.getNode(snSib1).timingDomain = "sib_domain";
+    sg.getNode(snSib2).timingDomain = "sib_domain";
+    sg.getNode(snSucc1).timingDomain = "succ1_domain";
+    sg.getNode(snSucc2).timingDomain = "succ2_domain";
+
+    auto connect = [&](SuperNodeId from, SuperNodeId to) {
+        sg.getNode(from).successors.insert(to);
+        sg.getNode(to).predecessors.insert(from);
+    };
+    connect(snPred1, snSib1);
+    connect(snPred1, snSib2);
+    connect(snPred2, snSib1);
+    connect(snPred2, snSib2);
+    connect(snSib1, snSucc1);
+    connect(snSib1, snSucc2);
+    connect(snSib2, snSucc1);
+    connect(snSib2, snSucc2);
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 5, "mergeSublings fixture should merge only the sibling pair");
+    const auto merged = sg.getSuperNodeForOp(sib1);
+    expect(merged.has_value(), "first sibling should remain mapped after mergeSublings");
+    expect(sg.getSuperNodeForOp(sib2) == merged, "siblings should merge under mergeSublings");
+    expect(nodeMembers(sg, *merged) == std::set<uint32_t>{sib1.index, sib2.index},
+           "mergeSublings should merge exactly the sibling pair");
+    expect(sg.getNode(*merged).predecessors == std::unordered_set<SuperNodeId>{snPred1, snPred2},
+           "merged siblings should preserve predecessor set");
+    expect(sg.getNode(*merged).successors == std::unordered_set<SuperNodeId>{snSucc1, snSucc2},
+           "merged siblings should preserve successor set");
+    expect(!sg.hasCircularDependency(), "mergeSublings fixture must remain acyclic");
+}
+
 void testPartitionerDoesNotMergeDifferentResetSemantics()
 {
     grh::Design design;
@@ -938,6 +1134,9 @@ int main()
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
         testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn();
+        testCoarsenerMergeWhenNodesPath();
+        testCoarsenerMergeIn1Path();
+        testCoarsenerMergeSiblingsPath();
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();
         testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn();
