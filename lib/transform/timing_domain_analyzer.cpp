@@ -241,8 +241,10 @@ EventKey TimingDomainAnalyzer::extractEventKey(const grh::Operation& op) const {
         return key;
     }
 
-    for (size_t i = eventSignalStart; i < operands.size() && i - eventSignalStart < key.eventEdge.size(); ++i) {
-        key.eventSignals.push_back(operands[i]);
+    if (!key.eventEdge.empty()) {
+        // Timing domains are keyed by the primary scheduling event (typically the clock).
+        key.eventSignals.push_back(operands[eventSignalStart]);
+        key.eventEdge.resize(1);
     }
 
     return key;

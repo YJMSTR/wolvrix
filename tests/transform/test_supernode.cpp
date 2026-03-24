@@ -554,6 +554,54 @@ void testTimingDomainAnalyzerRejectsMissingEventOperands()
            "write ports with fewer event operands than eventEdge entries must be classified as malformed");
 }
 
+void testTimingDomainAnalyzerGroupsSameClockDifferentResetIntoOneDomain()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rstA = graph.createValue(graph.internSymbol("rst_a"), 1, false);
+    const auto rstB = graph.createValue(graph.internSymbol("rst_b"), 1, false);
+    const auto dataA = graph.createValue(graph.internSymbol("data_a"), 8, false);
+    const auto dataB = graph.createValue(graph.internSymbol("data_b"), 8, false);
+    const auto mask = graph.createValue(graph.internSymbol("mask"), 8, false);
+
+    const auto sharedValue = graph.createValue(graph.internSymbol("shared"), 8, false);
+    const auto sharedAdd = graph.createOperation(grh::OperationKind::kAdd,
+                                                 graph.internSymbol("shared_add_async"));
+    graph.addOperand(sharedAdd, dataA);
+    graph.addOperand(sharedAdd, dataB);
+    graph.addResult(sharedAdd, sharedValue);
+
+    const auto regWriteA = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+                                                 graph.internSymbol("reg_write_a_async"));
+    graph.addOperand(regWriteA, rstA);
+    graph.addOperand(regWriteA, sharedValue);
+    graph.addOperand(regWriteA, mask);
+    graph.addOperand(regWriteA, clk);
+    graph.addOperand(regWriteA, rstA);
+    graph.setAttr(regWriteA, "regSymbol", std::string("reg_a_async"));
+    graph.setAttr(regWriteA, "eventEdge", std::vector<std::string>{"posedge", "negedge"});
+
+    const auto regWriteB = graph.createOperation(grh::OperationKind::kRegisterWritePort,
+                                                 graph.internSymbol("reg_write_b_async"));
+    graph.addOperand(regWriteB, rstB);
+    graph.addOperand(regWriteB, sharedValue);
+    graph.addOperand(regWriteB, mask);
+    graph.addOperand(regWriteB, clk);
+    graph.addOperand(regWriteB, rstB);
+    graph.setAttr(regWriteB, "regSymbol", std::string("reg_b_async"));
+    graph.setAttr(regWriteB, "eventEdge", std::vector<std::string>{"posedge", "negedge"});
+
+    TimingDomainAnalyzer analyzer(graph);
+    const auto opToDomain = analyzer.assignTimingDomains();
+
+    expect(opToDomain.at(regWriteA) == opToDomain.at(regWriteB),
+           "write ports that share the same primary clock must stay in one timing domain even if reset events differ");
+    expect(opToDomain.at(sharedAdd) != "cross_domain",
+           "shared fan-in on the same primary clock must not be marked cross_domain");
+}
+
 void testCoarsenerDoesNotMergeDifferentResetSemantics()
 {
     grh::Design design;
@@ -816,6 +864,51 @@ void testCoarsenerRevalidatesQueuedDegreeOneMerges()
     expect(sg.nodeCount() == 3,
            "queued degree-one contractions must be revalidated after earlier merges change eligibility");
     expect(!sg.hasCircularDependency(), "revalidation fixture must remain acyclic");
+}
+
+void testCoarsenerSkipsCycleCreatingResetGroupMerge()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto zero = makeConstant(graph, "zero", "zero_const_rg", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const_rg", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const_rg", 8, "8'hff");
+    const auto dataA = graph.createValue(graph.internSymbol("data_a"), 8, false);
+    const auto dataB = graph.createValue(graph.internSymbol("data_b"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a_rg", "next_mux_a_rg", rst, zero, dataA, 8);
+    const auto nextB = makeMux(graph, "next_b_rg", "next_mux_b_rg", rst, zero, dataB, 8);
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a_rg", one, nextA, mask, clk, "reg_a_rg");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b_rg", one, nextB, mask, clk, "reg_b_rg");
+    const auto mid = makeCombOp(graph, "mid_rg");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snMid = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snMid, mid);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snMid).timingDomain = "other_domain";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    sg.getNode(snA).successors.insert(snMid);
+    sg.getNode(snMid).predecessors.insert(snA);
+    sg.getNode(snMid).successors.insert(snB);
+    sg.getNode(snB).predecessors.insert(snMid);
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 3,
+           "reset-group merges that would create a cycle must be skipped instead of throwing");
+    expect(sg.getSuperNodeForOp(writeA) != sg.getSuperNodeForOp(writeB),
+           "path-connected reset-compatible writes must remain separate");
+    expect(!sg.hasCircularDependency(), "reset-group skip fixture must remain acyclic");
 }
 
 void testCoarsenerMergeSiblingsPath()
@@ -1295,12 +1388,14 @@ int main()
         testTopologicalSortUsesStableCanonicalOrder();
         testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic();
         testTimingDomainAnalyzerRejectsMissingEventOperands();
+        testTimingDomainAnalyzerGroupsSameClockDifferentResetIntoOneDomain();
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
         testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn();
         testMergeWhenNodesDirectPath();
         testCoarsenerMergeIn1Path();
         testCoarsenerRevalidatesQueuedDegreeOneMerges();
+        testCoarsenerSkipsCycleCreatingResetGroupMerge();
         testCoarsenerMergeSiblingsPath();
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();

@@ -45,6 +45,7 @@ public:
     // Topological sort
     std::vector<SuperNodeId> topologicalSort() const;
     bool hasCircularDependency() const;
+    bool canContract(SuperNodeId targetId, SuperNodeId sourceId) const;
 
     // Statistics
     size_t nodeCount() const;

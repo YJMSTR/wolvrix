@@ -203,6 +203,9 @@ bool SuperNodeCoarsener::canMerge(SuperNodeId snId1, SuperNodeId snId2) const {
     if (!haveCompatibleSequentialControl(graph_, node1, node2)) {
         return false;
     }
+    if (!sg_.canContract(snId1, snId2) && !sg_.canContract(snId2, snId1)) {
+        return false;
+    }
     return true;
 }
 

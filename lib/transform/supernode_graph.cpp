@@ -91,15 +91,7 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         return;
     }
 
-    const bool hasDirectEdgeTargetToSource = nodes_[targetId].successors.count(sourceId) > 0;
-    const bool hasDirectEdgeSourceToTarget = nodes_[sourceId].successors.count(targetId) > 0;
-
-    if (reachesExcludingDirectEdge(nodes_, targetId, sourceId, targetId,
-                                   hasDirectEdgeTargetToSource ? sourceId : std::numeric_limits<SuperNodeId>::min())) {
-        throw std::invalid_argument("Merge would create a cycle");
-    }
-    if (reachesExcludingDirectEdge(nodes_, sourceId, targetId, sourceId,
-                                   hasDirectEdgeSourceToTarget ? targetId : std::numeric_limits<SuperNodeId>::min())) {
+    if (!canContract(targetId, sourceId)) {
         throw std::invalid_argument("Merge would create a cycle");
     }
 
@@ -260,6 +252,28 @@ bool SuperNodeGraph::hasCircularDependency() const {
         // topologicalSort() throws when there's a cycle
         return true;
     }
+}
+
+bool SuperNodeGraph::canContract(SuperNodeId targetId, SuperNodeId sourceId) const {
+    if (!isValid(targetId) || !isValid(sourceId)) {
+        return false;
+    }
+    if (targetId == sourceId) {
+        return true;
+    }
+
+    const bool hasDirectEdgeTargetToSource = nodes_[targetId].successors.count(sourceId) > 0;
+    const bool hasDirectEdgeSourceToTarget = nodes_[sourceId].successors.count(targetId) > 0;
+
+    if (reachesExcludingDirectEdge(nodes_, targetId, sourceId, targetId,
+                                   hasDirectEdgeTargetToSource ? sourceId : std::numeric_limits<SuperNodeId>::min())) {
+        return false;
+    }
+    if (reachesExcludingDirectEdge(nodes_, sourceId, targetId, sourceId,
+                                   hasDirectEdgeSourceToTarget ? targetId : std::numeric_limits<SuperNodeId>::min())) {
+        return false;
+    }
+    return true;
 }
 
 size_t SuperNodeGraph::nodeCount() const {
