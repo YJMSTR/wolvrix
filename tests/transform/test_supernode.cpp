@@ -997,6 +997,10 @@ void testPartitionerPeerReportsExactCutCosts()
            "single-node prefix should have one outgoing cut edge");
     expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 0, 2) == 1,
            "two-node prefix should have one outgoing cut edge");
+    expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 1, 3) == 1,
+           "middle interval [1,3) should have one outgoing cut edge");
+    expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 2, 4) == 0,
+           "suffix interval [2,4) should have zero outgoing cut edges");
     expect(SuperNodePartitionerTestPeer::computeCutCost(partitioner, 0, 4) == 0,
            "full interval should have zero outgoing cut edges");
 }
