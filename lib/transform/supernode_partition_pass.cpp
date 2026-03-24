@@ -24,14 +24,14 @@ PassResult SuperNodePartitionPass::run() {
             if (op.kind() == wolvrix::lib::grh::OperationKind::kInstance) {
                 diags().error("supernode-partition",
                     "Design contains kInstance operations - must flatten before partitioning",
-                    "Graph: " + graphSymbol.text());
+                    "Graph: " + graphSymbol);
                 result.failed = true;
                 return result;
             }
             if (op.kind() == wolvrix::lib::grh::OperationKind::kBlackbox) {
                 diags().error("supernode-partition",
                     "Design contains kBlackbox operations - not supported",
-                    "Graph: " + graphSymbol.text());
+                    "Graph: " + graphSymbol);
                 result.failed = true;
                 return result;
             }
@@ -47,14 +47,14 @@ PassResult SuperNodePartitionPass::run() {
             if (domain == "malformed") {
                 diags().error("supernode-partition",
                     "Design contains malformed sequential operations",
-                    "Graph: " + graphSymbol.text() + ", Op: " + std::to_string(opId.index));
+                    "Graph: " + graphSymbol + ", Op: " + std::to_string(opId.index));
                 result.failed = true;
                 return result;
             }
             if (domain == "cross_domain") {
                 diags().error("supernode-partition",
                     "Design contains shared combinational logic across timing domains",
-                    "Graph: " + graphSymbol.text() + ", Op: " + std::to_string(opId.index));
+                    "Graph: " + graphSymbol + ", Op: " + std::to_string(opId.index));
                 result.failed = true;
                 return result;
             }
@@ -108,7 +108,7 @@ PassResult SuperNodePartitionPass::run() {
             partitioner.partition();
 
             // Write scratchpad metadata with graph and domain namespace
-            std::string prefix = "supernode." + graphSymbol.text() + "." + domain + ".";
+            std::string prefix = "supernode." + graphSymbol + "." + domain + ".";
 
             // Basic statistics
             setScratchpad(prefix + "count", sg.nodeCount());
@@ -174,7 +174,7 @@ PassResult SuperNodePartitionPass::run() {
         }
 
         // Write discovery key listing all emitted domains for this graph
-        std::string discoveryKey = "supernode." + graphSymbol.text() + ".domains";
+        std::string discoveryKey = "supernode." + graphSymbol + ".domains";
         setScratchpad(discoveryKey, emittedDomains);
     }
 
