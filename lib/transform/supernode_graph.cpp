@@ -1,10 +1,57 @@
 #include "transform/supernode_graph.hpp"
 #include <algorithm>
+#include <functional>
+#include <limits>
 #include <queue>
 #include <stdexcept>
 
 namespace wolvrix::lib::transform
 {
+
+namespace
+{
+
+bool reachesExcludingDirectEdge(const std::vector<SuperNode> &nodes,
+                                SuperNodeId startId,
+                                SuperNodeId goalId,
+                                SuperNodeId blockedFrom,
+                                SuperNodeId blockedTo)
+{
+    std::unordered_set<SuperNodeId> visited;
+    std::queue<SuperNodeId> queue;
+    queue.push(startId);
+    visited.insert(startId);
+
+    while (!queue.empty())
+    {
+        const SuperNodeId current = queue.front();
+        queue.pop();
+
+        std::vector<SuperNodeId> successors(nodes[current].successors.begin(),
+                                            nodes[current].successors.end());
+        std::sort(successors.begin(), successors.end());
+
+        for (const SuperNodeId succId : successors)
+        {
+            if (current == blockedFrom && succId == blockedTo)
+            {
+                continue;
+            }
+            if (succId == goalId)
+            {
+                return true;
+            }
+            if (visited.insert(succId).second)
+            {
+                queue.push(succId);
+            }
+        }
+    }
+
+    return false;
+}
+
+} // namespace
 
 SuperNodeId SuperNodeGraph::createSuperNode() {
     SuperNodeId id;
@@ -44,38 +91,16 @@ void SuperNodeGraph::merge(SuperNodeId targetId, SuperNodeId sourceId) {
         return;
     }
 
-    // Check for cycle: merging is valid if we're contracting a direct edge between the two nodes
-    // (either source -> target or target -> source), but invalid if it would create a cycle.
-    // We need to check if there's a path from target to source that doesn't use the direct edge.
+    const bool hasDirectEdgeTargetToSource = nodes_[targetId].successors.count(sourceId) > 0;
+    const bool hasDirectEdgeSourceToTarget = nodes_[sourceId].successors.count(targetId) > 0;
 
-    bool hasDirectEdgeSourceToTarget = nodes_[sourceId].successors.count(targetId) > 0;
-    bool hasDirectEdgeTargetToSource = nodes_[targetId].successors.count(sourceId) > 0;
-
-    // BFS from target to check if source is reachable without using the direct edge
-    std::unordered_set<SuperNodeId> visited;
-    std::queue<SuperNodeId> queue;
-    queue.push(targetId);
-    visited.insert(targetId);
-
-    while (!queue.empty()) {
-        SuperNodeId current = queue.front();
-        queue.pop();
-
-        for (auto succId : nodes_[current].successors) {
-            // Skip the direct edge from target to source when checking reachability
-            if (current == targetId && succId == sourceId && hasDirectEdgeTargetToSource) {
-                continue;
-            }
-
-            if (succId == sourceId) {
-                throw std::invalid_argument("Merge would create a cycle");
-            }
-
-            if (visited.find(succId) == visited.end()) {
-                visited.insert(succId);
-                queue.push(succId);
-            }
-        }
+    if (reachesExcludingDirectEdge(nodes_, targetId, sourceId, targetId,
+                                   hasDirectEdgeTargetToSource ? sourceId : std::numeric_limits<SuperNodeId>::min())) {
+        throw std::invalid_argument("Merge would create a cycle");
+    }
+    if (reachesExcludingDirectEdge(nodes_, sourceId, targetId, sourceId,
+                                   hasDirectEdgeSourceToTarget ? targetId : std::numeric_limits<SuperNodeId>::min())) {
+        throw std::invalid_argument("Merge would create a cycle");
     }
 
     auto& target = nodes_[targetId];
@@ -182,7 +207,7 @@ const std::unordered_set<SuperNodeId>& SuperNodeGraph::successors(SuperNodeId id
 std::vector<SuperNodeId> SuperNodeGraph::topologicalSort() const {
     std::vector<SuperNodeId> result;
     std::unordered_map<SuperNodeId, int> inDegree;
-    std::queue<SuperNodeId> queue;
+    std::priority_queue<SuperNodeId, std::vector<SuperNodeId>, std::greater<SuperNodeId>> ready;
 
     // Calculate in-degrees
     size_t validCount = 0;
@@ -191,21 +216,24 @@ std::vector<SuperNodeId> SuperNodeGraph::topologicalSort() const {
             validCount++;
             inDegree[node.id] = node.predecessors.size();
             if (inDegree[node.id] == 0) {
-                queue.push(node.id);
+                ready.push(node.id);
             }
         }
     }
 
     // Kahn's algorithm
-    while (!queue.empty()) {
-        SuperNodeId current = queue.front();
-        queue.pop();
+    while (!ready.empty()) {
+        const SuperNodeId current = ready.top();
+        ready.pop();
         result.push_back(current);
 
-        for (auto succId : nodes_[current].successors) {
+        std::vector<SuperNodeId> successors(nodes_[current].successors.begin(),
+                                            nodes_[current].successors.end());
+        std::sort(successors.begin(), successors.end());
+        for (const auto succId : successors) {
             inDegree[succId]--;
             if (inDegree[succId] == 0) {
-                queue.push(succId);
+                ready.push(succId);
             }
         }
     }
@@ -283,4 +311,3 @@ std::vector<SuperNodeId> SuperNodeGraph::validNodeIds() const {
 }
 
 } // namespace wolvrix::lib::transform
-

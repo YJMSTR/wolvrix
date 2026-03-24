@@ -1,9 +1,210 @@
 #include "transform/supernode_coarsener.hpp"
 #include <algorithm>
+#include <sstream>
 #include <unordered_map>
 
 namespace wolvrix::lib::transform
 {
+
+namespace
+{
+
+std::string attributeString(const grh::Operation &op, std::string_view key)
+{
+    const auto attr = op.attr(key);
+    if (!attr)
+    {
+        return {};
+    }
+    if (const auto *text = std::get_if<std::string>(&*attr))
+    {
+        return *text;
+    }
+    return {};
+}
+
+std::string constantLiteral(const grh::Operation &op)
+{
+    const auto attr = op.attr("constValue");
+    if (!attr)
+    {
+        return {};
+    }
+    if (const auto *literal = std::get_if<std::string>(&*attr))
+    {
+        return *literal;
+    }
+    return {};
+}
+
+std::string valueSignature(const grh::Graph &graph, grh::ValueId valueId, size_t depth = 0)
+{
+    if (!valueId.valid())
+    {
+        return "invalid";
+    }
+    if (depth > 8)
+    {
+        return "depth_limit";
+    }
+
+    const auto value = graph.getValue(valueId);
+    const auto defOpId = value.definingOp();
+    if (!defOpId.valid())
+    {
+        return "value:" + std::string(value.symbolText());
+    }
+
+    const auto defOp = graph.getOperation(defOpId);
+    std::ostringstream oss;
+    oss << "op:" << grh::toString(defOp.kind());
+
+    if (defOp.kind() == grh::OperationKind::kConstant)
+    {
+        oss << "[" << constantLiteral(defOp) << "]";
+    }
+    else if (defOp.kind() == grh::OperationKind::kRegisterReadPort)
+    {
+        oss << "[" << attributeString(defOp, "regSymbol") << "]";
+    }
+    else if (defOp.kind() == grh::OperationKind::kLatchReadPort)
+    {
+        oss << "[" << attributeString(defOp, "latchSymbol") << "]";
+    }
+
+    oss << "(";
+    bool first = true;
+    for (const auto operand : defOp.operands())
+    {
+        if (!first)
+        {
+            oss << ",";
+        }
+        first = false;
+        oss << valueSignature(graph, operand, depth + 1);
+    }
+    oss << ")";
+    return oss.str();
+}
+
+bool isConstOne(const grh::Graph &graph, grh::ValueId valueId)
+{
+    if (!valueId.valid())
+    {
+        return false;
+    }
+    const auto value = graph.getValue(valueId);
+    const auto defOpId = value.definingOp();
+    if (!defOpId.valid())
+    {
+        return false;
+    }
+    const auto defOp = graph.getOperation(defOpId);
+    if (defOp.kind() != grh::OperationKind::kConstant)
+    {
+        return false;
+    }
+
+    const auto literal = constantLiteral(defOp);
+    return literal == "1'b1" || literal == "1'h1" || literal == "1";
+}
+
+bool hasResetLikeControl(const grh::Graph &graph, const grh::Operation &op)
+{
+    const auto eventEdgeAttr = op.attr("eventEdge");
+    if (eventEdgeAttr)
+    {
+        if (const auto *edges = std::get_if<std::vector<std::string>>(&*eventEdgeAttr))
+        {
+            if (edges->size() > 1)
+            {
+                return true;
+            }
+        }
+    }
+
+    const auto operands = op.operands();
+    if (operands.size() >= 2)
+    {
+        if (!isConstOne(graph, operands[0]))
+        {
+            return true;
+        }
+        const auto nextValue = graph.getValue(operands[1]);
+        const auto defOpId = nextValue.definingOp();
+        if (defOpId.valid() && graph.getOperation(defOpId).kind() == grh::OperationKind::kMux)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::string sequentialControlSignature(const grh::Graph &graph, const grh::Operation &op);
+
+std::vector<std::string> nodeControlSignatures(const grh::Graph &graph, const SuperNode &node)
+{
+    std::vector<std::string> signatures;
+    for (const auto opId : node.members)
+    {
+        const auto op = graph.getOperation(opId);
+        if (op.kind() == grh::OperationKind::kRegisterWritePort ||
+            op.kind() == grh::OperationKind::kMemoryWritePort ||
+            op.kind() == grh::OperationKind::kLatchWritePort)
+        {
+            if (hasResetLikeControl(graph, op))
+            {
+                signatures.push_back(sequentialControlSignature(graph, op));
+            }
+        }
+    }
+    std::sort(signatures.begin(), signatures.end());
+    return signatures;
+}
+
+std::string sequentialControlSignature(const grh::Graph &graph, const grh::Operation &op)
+{
+    std::ostringstream oss;
+    oss << grh::toString(op.kind()) << "|";
+
+    const auto eventEdgeAttr = op.attr("eventEdge");
+    if (eventEdgeAttr)
+    {
+        if (const auto *edges = std::get_if<std::vector<std::string>>(&*eventEdgeAttr))
+        {
+            oss << "edges:";
+            for (const auto &edge : *edges)
+            {
+                oss << edge << ",";
+            }
+        }
+    }
+
+    const auto operands = op.operands();
+    const size_t eventStart = op.kind() == grh::OperationKind::kMemoryWritePort ? 4 : 3;
+    oss << "|ctrl:";
+    for (size_t index = 0; index < std::min(eventStart, operands.size()); ++index)
+    {
+        if (index != 0)
+        {
+            oss << ";";
+        }
+        oss << valueSignature(graph, operands[index]);
+    }
+    oss << "|events:";
+    for (size_t index = eventStart; index < operands.size(); ++index)
+    {
+        if (index != eventStart)
+        {
+            oss << ";";
+        }
+        oss << valueSignature(graph, operands[index]);
+    }
+    return oss.str();
+}
+
+} // namespace
 
 SuperNodeCoarsener::SuperNodeCoarsener(SuperNodeGraph& sg, const grh::Graph& graph)
     : sg_(sg), graph_(graph) {}
@@ -26,59 +227,36 @@ void SuperNodeCoarsener::coarsen() {
 bool SuperNodeCoarsener::mergeResetAll() {
     bool changed = false;
 
-    // Extract reset signatures from register/memory write ports
-    // Reset signature = (eventEdge, eventSignals, updateCond structure)
     std::unordered_map<std::string, std::vector<SuperNodeId>> resetGroups;
 
     for (const auto& snId : sg_.validNodeIds()) {
         const auto& node = sg_.getNode(snId);
-
-        // Check if this supernode contains sequential operations
-        bool hasSeqOps = false;
-        std::string resetSig;
+        std::vector<std::string> signatures;
 
         for (const auto& opId : node.members) {
             auto op = graph_.getOperation(opId);
             if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort ||
-                op.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort) {
-                hasSeqOps = true;
-
-                // Extract reset signature from eventEdge and event signals
-                auto eventEdgeAttr = op.attr("eventEdge");
-                if (eventEdgeAttr) {
-                    if (const auto* edges = std::get_if<std::vector<std::string>>(&*eventEdgeAttr)) {
-                        // Build signature from event edges
-                        std::string sig;
-                        for (const auto& edge : *edges) {
-                            sig += edge + ";";
-                        }
-
-                        // Add event signal operands to signature
-                        auto operands = op.operands();
-                        size_t eventStart = (op.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort) ? 4 : 3;
-                        for (size_t i = eventStart; i < operands.size(); ++i) {
-                            auto value = graph_.getValue(operands[i]);
-                            auto defOp = value.definingOp();
-                            if (defOp.valid()) {
-                                sig += std::to_string(defOp.index) + ",";
-                            }
-                        }
-
-                        if (!sig.empty()) {
-                            resetSig = sig;
-                            break;
-                        }
-                    }
+                op.kind() == wolvrix::lib::grh::OperationKind::kMemoryWritePort ||
+                op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort) {
+                if (hasResetLikeControl(graph_, op)) {
+                    signatures.push_back(sequentialControlSignature(graph_, op));
                 }
             }
         }
 
-        if (hasSeqOps && !resetSig.empty()) {
-            resetGroups[resetSig].push_back(snId);
+        if (!signatures.empty()) {
+            std::sort(signatures.begin(), signatures.end());
+            std::ostringstream key;
+            for (size_t i = 0; i < signatures.size(); ++i) {
+                if (i != 0) {
+                    key << "||";
+                }
+                key << signatures[i];
+            }
+            resetGroups[key.str()].push_back(snId);
         }
     }
 
-    // Merge nodes with identical reset signatures
     for (const auto& [sig, nodes] : resetGroups) {
         if (nodes.size() > 1) {
             SuperNodeId target = nodes[0];
@@ -108,16 +286,10 @@ bool SuperNodeCoarsener::mergeWhenNodes() {
         for (const auto& opId : node.members) {
             auto op = graph_.getOperation(opId);
             if (op.kind() == wolvrix::lib::grh::OperationKind::kMux) {
-                // kMux operands: [condition, trueValue, falseValue]
                 auto operands = op.operands();
                 if (operands.size() >= 3) {
-                    auto condValue = graph_.getValue(operands[0]);
-                    auto condDefOp = condValue.definingOp();
-                    if (condDefOp.valid()) {
-                        // Use condition's defining operation as signature
-                        condSig = std::to_string(condDefOp.index);
-                        break;
-                    }
+                    condSig = valueSignature(graph_, operands[0]);
+                    break;
                 }
             }
         }
@@ -227,6 +399,13 @@ bool SuperNodeCoarsener::canMerge(SuperNodeId snId1, SuperNodeId snId2) const {
     }
     if (node1.timingDomain != node2.timingDomain) {
         return false;
+    }
+    const auto node1Control = nodeControlSignatures(graph_, node1);
+    const auto node2Control = nodeControlSignatures(graph_, node2);
+    if (!node1Control.empty() || !node2Control.empty()) {
+        if (node1Control != node2Control) {
+            return false;
+        }
     }
     return true;
 }

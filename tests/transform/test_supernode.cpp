@@ -48,6 +48,38 @@ grh::OperationId makeRegisterWrite(grh::Graph &graph,
     return op;
 }
 
+grh::ValueId makeConstant(grh::Graph &graph,
+                          std::string_view valueName,
+                          std::string_view opName,
+                          int32_t width,
+                          std::string literal)
+{
+    const auto value = graph.createValue(graph.internSymbol(valueName), width, false);
+    const auto op = graph.createOperation(grh::OperationKind::kConstant,
+                                          graph.internSymbol(opName));
+    graph.addResult(op, value);
+    graph.setAttr(op, "constValue", std::move(literal));
+    return value;
+}
+
+grh::ValueId makeMux(grh::Graph &graph,
+                     std::string_view valueName,
+                     std::string_view opName,
+                     grh::ValueId condition,
+                     grh::ValueId whenTrue,
+                     grh::ValueId whenFalse,
+                     int32_t width)
+{
+    const auto value = graph.createValue(graph.internSymbol(valueName), width, false);
+    const auto op = graph.createOperation(grh::OperationKind::kMux,
+                                          graph.internSymbol(opName));
+    graph.addOperand(op, condition);
+    graph.addOperand(op, whenTrue);
+    graph.addOperand(op, whenFalse);
+    graph.addResult(op, value);
+    return value;
+}
+
 void testSuperNodeGraphBasics()
 {
     SuperNodeGraph sg;
@@ -126,6 +158,81 @@ void testEdgeCounting()
     expect(sg.edgeCount() == 2, "expected edge counter to sum successor sets");
 }
 
+void testMergeRejectsContractionThatCreatesCycle()
+{
+    SuperNodeGraph sg;
+
+    const auto idA = sg.createSuperNode();
+    const auto idB = sg.createSuperNode();
+    const auto idC = sg.createSuperNode();
+
+    sg.getNode(idA).successors.insert(idB);
+    sg.getNode(idB).predecessors.insert(idA);
+    sg.getNode(idB).successors.insert(idC);
+    sg.getNode(idC).predecessors.insert(idB);
+
+    bool threw = false;
+    try
+    {
+        sg.merge(idC, idA);
+    }
+    catch (const std::invalid_argument &)
+    {
+        threw = true;
+    }
+
+    expect(threw, "expected merge(c, a) on a->b->c to throw");
+    expect(!sg.hasCircularDependency(), "failed merge must leave graph acyclic");
+    expect(sg.nodeCount() == 3, "failed merge must not mutate node count");
+}
+
+void testMergeAllowsDirectContractionWithoutIntroducingCycle()
+{
+    SuperNodeGraph sg;
+
+    const auto idA = sg.createSuperNode();
+    const auto idB = sg.createSuperNode();
+    const auto idC = sg.createSuperNode();
+
+    sg.getNode(idA).successors.insert(idB);
+    sg.getNode(idB).predecessors.insert(idA);
+    sg.getNode(idB).successors.insert(idC);
+    sg.getNode(idC).predecessors.insert(idB);
+
+    sg.merge(idA, idB);
+
+    expect(sg.nodeCount() == 2, "valid edge contraction should reduce node count");
+    expect(!sg.hasCircularDependency(), "valid edge contraction must preserve acyclicity");
+    expect(sg.successors(idA).count(idC) == 1, "merged node should reconnect to successor");
+    expect(sg.predecessors(idC).count(idA) == 1, "successor should point back to merged target");
+}
+
+void testTopologicalSortUsesStableCanonicalOrder()
+{
+    SuperNodeGraph sg;
+
+    const auto id0 = sg.createSuperNode();
+    const auto id1 = sg.createSuperNode();
+    const auto id2 = sg.createSuperNode();
+    const auto id3 = sg.createSuperNode();
+
+    sg.getNode(id0).successors.insert(id2);
+    sg.getNode(id0).successors.insert(id1);
+    sg.getNode(id2).predecessors.insert(id0);
+    sg.getNode(id1).predecessors.insert(id0);
+    sg.getNode(id1).successors.insert(id3);
+    sg.getNode(id2).successors.insert(id3);
+    sg.getNode(id3).predecessors.insert(id1);
+    sg.getNode(id3).predecessors.insert(id2);
+
+    const std::vector<SuperNodeId> expected{id0, id1, id2, id3};
+    const auto first = sg.topologicalSort();
+    const auto second = sg.topologicalSort();
+
+    expect(first == expected, "topological sort must use ascending-id canonical order");
+    expect(second == expected, "repeated topological sort must remain stable");
+}
+
 void testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic()
 {
     grh::Design design;
@@ -161,6 +268,73 @@ void testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic()
            "shared combinational logic should inherit the single reachable timing domain");
 }
 
+void testCoarsenerDoesNotMergeDifferentResetSemantics()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rstA = graph.createValue(graph.internSymbol("rst_a"), 1, false);
+    const auto rstB = graph.createValue(graph.internSymbol("rst_b"), 1, false);
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a", "mux_a", rstA, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b", "mux_b", rstB, zero, data, 8);
+
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a", one, nextA, mask, clk, "reg_a");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b", one, nextB, mask, clk, "reg_b");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 2,
+           "write ports with different reset semantics must not merge");
+}
+
+void testCoarsenerMergesIdenticalResetTrees()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a", "mux_a", rst, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b", "mux_b", rst, zero, data, 8);
+
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a", one, nextA, mask, clk, "reg_a");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b", one, nextB, mask, clk, "reg_b");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 1,
+           "write ports with the same reset tree should merge");
+}
+
 } // namespace
 
 int main()
@@ -172,7 +346,12 @@ int main()
         testCycleDetection();
         testMergeConstraints();
         testEdgeCounting();
+        testMergeRejectsContractionThatCreatesCycle();
+        testMergeAllowsDirectContractionWithoutIntroducingCycle();
+        testTopologicalSortUsesStableCanonicalOrder();
         testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic();
+        testCoarsenerDoesNotMergeDifferentResetSemantics();
+        testCoarsenerMergesIdenticalResetTrees();
     }
     catch (const std::exception &ex)
     {
