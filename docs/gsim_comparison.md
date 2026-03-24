@@ -62,6 +62,15 @@ Targeted regressions currently cover:
 - reset-sensitive coarsening
 - reset-sensitive partitioning
 - pass-level scratchpad coverage for sequential plus combinational graphs
+- conservative failure on unsupported shared cross-domain logic
+
+### Closest shape-level comparison recorded so far
+
+On the repository's linear 4-node chain fixture, the Wolvrix partitioner with
+`maxSuperNodeSize = 2` produces two 2-op intervals, reducing the graph from
+4 supernodes / 3 edges to 2 supernodes / 1 edge while preserving acyclicity.
+This matches the expected GSim-style outcome for a simple linear DAG under the
+same interval-size limit.
 
 ## Remaining Gaps
 

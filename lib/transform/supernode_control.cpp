@@ -214,7 +214,7 @@ bool haveCompatibleSequentialControl(const grh::Graph &graph,
 {
     const auto lhsControl = nodeControlSignatures(graph, lhs);
     const auto rhsControl = nodeControlSignatures(graph, rhs);
-    if (lhsControl.empty() && rhsControl.empty())
+    if (lhsControl.empty() || rhsControl.empty())
     {
         return true;
     }

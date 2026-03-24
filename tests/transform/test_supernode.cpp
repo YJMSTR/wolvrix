@@ -7,6 +7,7 @@
 #include "transform/supernode_partition_pass.hpp"
 
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -82,6 +83,28 @@ grh::ValueId makeMux(grh::Graph &graph,
     return value;
 }
 
+grh::OperationId makeCombOp(grh::Graph &graph, std::string_view opName)
+{
+    return graph.createOperation(grh::OperationKind::kAdd, graph.internSymbol(opName));
+}
+
+std::vector<std::vector<uint32_t>> partitionLayout(const SuperNodeGraph &sg)
+{
+    std::vector<std::vector<uint32_t>> layout;
+    for (const auto snId : sg.validNodeIds())
+    {
+        std::vector<uint32_t> members;
+        for (const auto opId : sg.getNode(snId).members)
+        {
+            members.push_back(opId.index);
+        }
+        std::sort(members.begin(), members.end());
+        layout.push_back(std::move(members));
+    }
+    std::sort(layout.begin(), layout.end());
+    return layout;
+}
+
 class PartitionScratchpadChecker : public Pass
 {
 public:
@@ -118,6 +141,8 @@ public:
         }
 
         using Mapping = std::unordered_map<grh::OperationId, SuperNodeId, grh::OperationIdHash>;
+        using Members = std::unordered_map<SuperNodeId, std::vector<grh::OperationId>>;
+        using Edges = std::unordered_map<SuperNodeId, std::vector<SuperNodeId>>;
         const auto *combinationalMap =
             getScratchpad<Mapping>("supernode.top.combinational.op_to_sn");
         const auto *sequentialMap =
@@ -133,6 +158,78 @@ public:
         if (sequentialMap->find(expectedSequentialOp_) == sequentialMap->end())
         {
             throw std::runtime_error("sequential op was not assigned to its timing-domain supernode");
+        }
+
+        const auto *combCount = getScratchpad<size_t>("supernode.top.combinational.count");
+        const auto *seqCount = getScratchpad<size_t>("supernode.top.domain_0.count");
+        const auto *combEdgeCount = getScratchpad<size_t>("supernode.top.combinational.edge_count");
+        const auto *seqEdgeCount = getScratchpad<size_t>("supernode.top.domain_0.edge_count");
+        const auto *combCutEdges = getScratchpad<size_t>("supernode.top.combinational.cut_edges");
+        const auto *seqCutEdges = getScratchpad<size_t>("supernode.top.domain_0.cut_edges");
+        const auto *combMaxSize = getScratchpad<size_t>("supernode.top.combinational.max_size");
+        const auto *seqMaxSize = getScratchpad<size_t>("supernode.top.domain_0.max_size");
+        const auto *combAvgSize = getScratchpad<double>("supernode.top.combinational.avg_size");
+        const auto *seqAvgSize = getScratchpad<double>("supernode.top.domain_0.avg_size");
+        const auto *combTiming = getScratchpad<std::string>("supernode.top.combinational.timing_domain");
+        const auto *seqTiming = getScratchpad<std::string>("supernode.top.domain_0.timing_domain");
+        const auto *combTopo = getScratchpad<std::vector<SuperNodeId>>("supernode.top.combinational.topo_order");
+        const auto *seqTopo = getScratchpad<std::vector<SuperNodeId>>("supernode.top.domain_0.topo_order");
+        const auto *combMembers = getScratchpad<Members>("supernode.top.combinational.sn_to_ops");
+        const auto *seqMembers = getScratchpad<Members>("supernode.top.domain_0.sn_to_ops");
+        const auto *combPreds = getScratchpad<Edges>("supernode.top.combinational.predecessors");
+        const auto *seqPreds = getScratchpad<Edges>("supernode.top.domain_0.predecessors");
+        const auto *combSuccs = getScratchpad<Edges>("supernode.top.combinational.successors");
+        const auto *seqSuccs = getScratchpad<Edges>("supernode.top.domain_0.successors");
+        const auto *crossDomainEdges =
+            getScratchpad<std::vector<std::pair<grh::OperationId, grh::OperationId>>>(
+                "supernode.top.cross_domain_edges");
+        if (combCount == nullptr || seqCount == nullptr || combEdgeCount == nullptr ||
+            seqEdgeCount == nullptr || combCutEdges == nullptr || seqCutEdges == nullptr ||
+            combMaxSize == nullptr || seqMaxSize == nullptr || combAvgSize == nullptr ||
+            seqAvgSize == nullptr || combTiming == nullptr || seqTiming == nullptr ||
+            combTopo == nullptr || seqTopo == nullptr || combMembers == nullptr ||
+            seqMembers == nullptr || combPreds == nullptr || seqPreds == nullptr ||
+            combSuccs == nullptr || seqSuccs == nullptr || crossDomainEdges == nullptr)
+        {
+            throw std::runtime_error("missing extended scratchpad contract keys");
+        }
+
+        if (*seqCount != 1 || *seqEdgeCount != 0 || *seqCutEdges != 0 || *seqMaxSize == 0)
+        {
+            throw std::runtime_error(
+                "unexpected sequential-domain statistics for minimal mixed graph: count=" +
+                std::to_string(*seqCount) + " edge_count=" + std::to_string(*seqEdgeCount) +
+                " cut_edges=" + std::to_string(*seqCutEdges) + " max_size=" +
+                std::to_string(*seqMaxSize));
+        }
+        if (*combCount != combMembers->size() || *seqCount != seqMembers->size())
+        {
+            throw std::runtime_error("count metadata does not match sn_to_ops cardinality");
+        }
+        if (combTopo->size() != *combCount || seqTopo->size() != *seqCount)
+        {
+            throw std::runtime_error("topological order size does not match domain node count");
+        }
+        if (combPreds->size() != *combCount || seqPreds->size() != *seqCount ||
+            combSuccs->size() != *combCount || seqSuccs->size() != *seqCount)
+        {
+            throw std::runtime_error("graph-structure metadata does not cover every emitted supernode");
+        }
+        if (*combTiming != "combinational" || *seqTiming != "domain_0")
+        {
+            throw std::runtime_error("unexpected timing-domain or average-size metadata");
+        }
+        if (*combAvgSize <= 0.0 || *seqAvgSize <= 0.0 || *combMaxSize == 0)
+        {
+            throw std::runtime_error(
+                "unexpected average/max size metadata: comb_avg=" +
+                std::to_string(*combAvgSize) + " seq_avg=" + std::to_string(*seqAvgSize) +
+                " comb_max=" + std::to_string(*combMaxSize) + " seq_max=" +
+                std::to_string(*seqMaxSize));
+        }
+        if (!crossDomainEdges->empty())
+        {
+            throw std::runtime_error("unexpected cross-domain edges in single-domain sequential fixture");
         }
         return {};
     }
@@ -466,6 +563,150 @@ void testPartitionerCanMergeIdenticalResetTrees()
            "partitioner should still merge compatible reset/control signatures");
 }
 
+void testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto lhs = graph.createValue(graph.internSymbol("lhs"), 8, false);
+    const auto rhs = graph.createValue(graph.internSymbol("rhs"), 8, false);
+    const auto addOut = graph.createValue(graph.internSymbol("add_out"), 8, false);
+    const auto add = graph.createOperation(grh::OperationKind::kAdd, graph.internSymbol("fanin_add"));
+    graph.addOperand(add, lhs);
+    graph.addOperand(add, rhs);
+    graph.addResult(add, addOut);
+
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto next = makeMux(graph, "next", "next_mux", rst, zero, addOut, 8);
+    const auto write = makeRegisterWrite(graph, "reg_write", one, next, mask, clk, "reg_a");
+
+    SuperNodeGraph sg;
+    const auto snComb = sg.createSuperNode();
+    const auto snWrite = sg.createSuperNode();
+    sg.addMember(snComb, add);
+    sg.addMember(snWrite, write);
+    sg.getNode(snComb).timingDomain = "domain_0";
+    sg.getNode(snWrite).timingDomain = "domain_0";
+    sg.getNode(snComb).successors.insert(snWrite);
+    sg.getNode(snWrite).predecessors.insert(snComb);
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(8);
+    partitioner.partition();
+
+    expect(sg.nodeCount() == 1,
+           "control-sensitive sequential nodes should still merge with compatible combinational fan-in");
+}
+
+void testPartitionerFindsStableTwoWayCut()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    SuperNodeGraph sg;
+    std::vector<SuperNodeId> nodeIds;
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto op = makeCombOp(graph, "op" + std::to_string(i));
+        const auto sn = sg.createSuperNode();
+        sg.addMember(sn, op);
+        sg.getNode(sn).timingDomain = "combinational";
+        nodeIds.push_back(sn);
+    }
+
+    for (size_t i = 0; i + 1 < nodeIds.size(); ++i)
+    {
+        sg.getNode(nodeIds[i]).successors.insert(nodeIds[i + 1]);
+        sg.getNode(nodeIds[i + 1]).predecessors.insert(nodeIds[i]);
+    }
+
+    const auto beforeNodeCount = sg.nodeCount();
+    const auto beforeEdgeCount = sg.edgeCount();
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(2);
+    partitioner.partition();
+
+    expect(sg.nodeCount() == 2, "chain of four singletons should partition into two intervals under max size 2");
+    expect(beforeNodeCount == 4 && beforeEdgeCount == 3,
+           "expected known pre-partition validation baseline for the chain fixture");
+    expect(sg.edgeCount() == 1 && sg.edgeCount() < beforeEdgeCount,
+           "partition should reduce cut edges on the validation chain fixture");
+    const auto layout = partitionLayout(sg);
+    expect(layout.size() == 2 && layout[0].size() == 2 && layout[1].size() == 2,
+           "expected stable two-by-two partition layout");
+}
+
+void testPartitionerRejectsImpossibleSizeConstraint()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    SuperNodeGraph sg;
+    const auto op = makeCombOp(graph, "only_op");
+    const auto sn = sg.createSuperNode();
+    sg.addMember(sn, op);
+    sg.getNode(sn).timingDomain = "combinational";
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(0);
+
+    bool threw = false;
+    try
+    {
+        partitioner.partition();
+    }
+    catch (const std::runtime_error &)
+    {
+        threw = true;
+    }
+    expect(threw, "partitioner should reject impossible size constraints");
+}
+
+void testPartitionerProducesStableLayoutAcrossRuns()
+{
+    grh::Design designA;
+    grh::Graph &graphA = designA.createGraph("top");
+    grh::Design designB;
+    grh::Graph &graphB = designB.createGraph("top");
+
+    auto buildChain = [](grh::Graph &graph) {
+        SuperNodeGraph sg;
+        std::vector<SuperNodeId> nodeIds;
+        for (int i = 0; i < 4; ++i)
+        {
+            const auto op = makeCombOp(graph, "stable_op" + std::to_string(i));
+            const auto sn = sg.createSuperNode();
+            sg.addMember(sn, op);
+            sg.getNode(sn).timingDomain = "combinational";
+            nodeIds.push_back(sn);
+        }
+        for (size_t i = 0; i + 1 < nodeIds.size(); ++i)
+        {
+            sg.getNode(nodeIds[i]).successors.insert(nodeIds[i + 1]);
+            sg.getNode(nodeIds[i + 1]).predecessors.insert(nodeIds[i]);
+        }
+        return sg;
+    };
+
+    auto sgA = buildChain(graphA);
+    auto sgB = buildChain(graphB);
+
+    SuperNodePartitioner partitionerA(sgA, graphA);
+    partitionerA.setMaxSuperNodeSize(2);
+    partitionerA.partition();
+    SuperNodePartitioner partitionerB(sgB, graphB);
+    partitionerB.setMaxSuperNodeSize(2);
+    partitionerB.partition();
+
+    expect(partitionLayout(sgA) == partitionLayout(sgB),
+           "repeated runs on equivalent graphs should produce the same partition layout");
+}
+
 void testPartitionPassBuildsTotalGraphScratchpadCoverage()
 {
     grh::Design design;
@@ -496,6 +737,35 @@ void testPartitionPassBuildsTotalGraphScratchpadCoverage()
     expect(!diags.hasError(), "unexpected diagnostics while checking partition scratchpad coverage");
 }
 
+void testPartitionPassRejectsSharedCrossDomainLogic()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto dataA = graph.createValue(graph.internSymbol("data_a"), 8, false);
+    const auto dataB = graph.createValue(graph.internSymbol("data_b"), 8, false);
+    const auto sharedValue = graph.createValue(graph.internSymbol("shared"), 8, false);
+    const auto sharedAdd = graph.createOperation(grh::OperationKind::kAdd, graph.internSymbol("shared_add"));
+    graph.addOperand(sharedAdd, dataA);
+    graph.addOperand(sharedAdd, dataB);
+    graph.addResult(sharedAdd, sharedValue);
+
+    const auto clkA = graph.createValue(graph.internSymbol("clk_a"), 1, false);
+    const auto clkB = graph.createValue(graph.internSymbol("clk_b"), 1, false);
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "reg_write_a", one, sharedValue, mask, clkA, "reg_a");
+    makeRegisterWrite(graph, "reg_write_b", one, sharedValue, mask, clkB, "reg_b");
+
+    PassManager manager;
+    manager.addPass(std::make_unique<SuperNodePartitionPass>());
+
+    PassDiagnostics diags;
+    const auto result = manager.run(design, diags);
+    expect(!result.success, "shared combinational logic across timing domains should follow the conservative failure path");
+    expect(diags.hasError(), "expected diagnostics for shared cross-domain logic");
+}
+
 } // namespace
 
 int main()
@@ -515,7 +785,12 @@ int main()
         testCoarsenerMergesIdenticalResetTrees();
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();
+        testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn();
+        testPartitionerFindsStableTwoWayCut();
+        testPartitionerRejectsImpossibleSizeConstraint();
+        testPartitionerProducesStableLayoutAcrossRuns();
         testPartitionPassBuildsTotalGraphScratchpadCoverage();
+        testPartitionPassRejectsSharedCrossDomainLogic();
     }
     catch (const std::exception &ex)
     {

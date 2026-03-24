@@ -118,5 +118,19 @@ The repository currently contains targeted regressions for:
 - control/reset-sensitive partitioning
 - pass-level scratchpad coverage for mixed sequential/combinational graphs
 
+### Recorded validation fixtures
+
+- Linear 4-node combinational chain with `maxSuperNodeSize = 2`
+  - before partition: 4 supernodes, 3 edges
+  - after partition: 2 supernodes, 1 edge
+  - stable layout: two 2-op intervals on repeated runs
+- Mixed sequential/combinational scratchpad fixture
+  - proves namespaced discovery keys
+  - proves total graph coverage via `op_to_sn`
+  - proves graph-level `cross_domain_edges` stays empty in the single-domain case
+- Shared cross-domain combinational logic fixture
+  - proves the current conservative failure path raises diagnostics instead of
+    silently partitioning unsupported multi-domain sharing
+
 Broader design-level validation and performance evidence still need to be
 expanded further.
