@@ -46,8 +46,10 @@ file(MAKE_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 add_subdirectory(external/slang)
 
 option(WOLVRIX_ENABLE_MT_KAHYPAR "Enable mt-kahypar backend for repcut" ON)
+option(WOLVRIX_USE_VENDORED_MT_KAHYPAR "Build bundled mt-kahypar when no installed copy is configured" ON)
 set(WOLVRIX_HAVE_MT_KAHYPAR 0)
 set(WOLVRIX_MTKAHYPAR_ROOT "" CACHE PATH "Root directory of an installed mt-kahypar")
+set(WOLVRIX_MTKAHYPAR_LINK_TARGET "")
 if (WOLVRIX_ENABLE_MT_KAHYPAR)
     set(WOLVRIX_MTKAHYPAR_HINT_DIRS)
     if (WOLVRIX_MTKAHYPAR_ROOT)
@@ -56,20 +58,47 @@ if (WOLVRIX_ENABLE_MT_KAHYPAR)
     if (DEFINED ENV{MTKAHYPAR_ROOT} AND NOT "$ENV{MTKAHYPAR_ROOT}" STREQUAL "")
         list(APPEND WOLVRIX_MTKAHYPAR_HINT_DIRS "$ENV{MTKAHYPAR_ROOT}")
     endif()
+    if (EXISTS "${CMAKE_SOURCE_DIR}/external/mt-kahypar/include/mtkahypar.h")
+        list(APPEND WOLVRIX_MTKAHYPAR_HINT_DIRS
+            "${CMAKE_SOURCE_DIR}/external/mt-kahypar"
+            "${CMAKE_BINARY_DIR}/external/mt-kahypar-build")
+    endif()
 
     find_path(WOLVRIX_MTKAHYPAR_INCLUDE_DIR
         NAMES mtkahypar.h
         HINTS ${WOLVRIX_MTKAHYPAR_HINT_DIRS}
-        PATH_SUFFIXES include
+        PATH_SUFFIXES include external/mt-kahypar/include
     )
     find_library(WOLVRIX_MTKAHYPAR_LIBRARY
         NAMES mtkahypar libmtkahypar
         HINTS ${WOLVRIX_MTKAHYPAR_HINT_DIRS}
-        PATH_SUFFIXES lib lib64
+        PATH_SUFFIXES lib lib64 external/mt-kahypar-build/lib
     )
     if (WOLVRIX_MTKAHYPAR_INCLUDE_DIR AND WOLVRIX_MTKAHYPAR_LIBRARY)
         set(WOLVRIX_HAVE_MT_KAHYPAR 1)
+        set(WOLVRIX_MTKAHYPAR_LINK_TARGET "${WOLVRIX_MTKAHYPAR_LIBRARY}")
         message(STATUS "MtKaHyPar enabled: ${WOLVRIX_MTKAHYPAR_LIBRARY}")
+    elseif (WOLVRIX_USE_VENDORED_MT_KAHYPAR AND EXISTS "${CMAKE_SOURCE_DIR}/external/mt-kahypar/CMakeLists.txt")
+        find_package(TBB 2021.5 QUIET COMPONENTS tbb tbbmalloc)
+        if (TBB_FOUND)
+            set(KAHYPAR_PYTHON OFF CACHE BOOL "" FORCE)
+            set(KAHYPAR_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+            set(KAHYPAR_INSTALL_CLI OFF CACHE BOOL "" FORCE)
+            set(KAHYPAR_BUILD_DEBIAN_PACKAGE OFF CACHE BOOL "" FORCE)
+            set(KAHYPAR_DISABLE_HWLOC ON CACHE BOOL "" FORCE)
+            set(KAHYPAR_DOWNLOAD_TBB OFF CACHE BOOL "" FORCE)
+            add_subdirectory(external/mt-kahypar external/mt-kahypar-build EXCLUDE_FROM_ALL)
+            if (TARGET mtkahypar)
+                set(WOLVRIX_HAVE_MT_KAHYPAR 1)
+                set(WOLVRIX_MTKAHYPAR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/external/mt-kahypar/include")
+                set(WOLVRIX_MTKAHYPAR_LINK_TARGET mtkahypar)
+                message(STATUS "MtKaHyPar enabled via vendored submodule target")
+            else()
+                message(WARNING "Vendored mt-kahypar was configured but did not provide target `mtkahypar`")
+            endif()
+        else()
+            message(WARNING "Vendored mt-kahypar detected but TBB was not found; repcut mt-kahypar backend will be unavailable")
+        endif()
     else()
         message(WARNING "MtKaHyPar not found; repcut mt-kahypar backend will be unavailable")
     endif()
@@ -126,14 +155,18 @@ target_link_libraries(wolvrix-lib
 )
 
 if (WOLVRIX_HAVE_MT_KAHYPAR)
-    target_include_directories(wolvrix-lib
-        PRIVATE
-            "${WOLVRIX_MTKAHYPAR_INCLUDE_DIR}"
-    )
-    target_link_libraries(wolvrix-lib
-        PRIVATE
-            "${WOLVRIX_MTKAHYPAR_LIBRARY}"
-    )
+    if (WOLVRIX_MTKAHYPAR_INCLUDE_DIR)
+        target_include_directories(wolvrix-lib
+            PRIVATE
+                "${WOLVRIX_MTKAHYPAR_INCLUDE_DIR}"
+        )
+    endif()
+    if (WOLVRIX_MTKAHYPAR_LINK_TARGET)
+        target_link_libraries(wolvrix-lib
+            PRIVATE
+                "${WOLVRIX_MTKAHYPAR_LINK_TARGET}"
+        )
+    endif()
 endif()
 
 target_compile_definitions(wolvrix-lib

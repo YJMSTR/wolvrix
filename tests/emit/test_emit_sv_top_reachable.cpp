@@ -44,9 +44,12 @@ std::size_t countSubstring(std::string_view text, std::string_view needle)
     return count;
 }
 
-void addNoPortInstance(Graph &graph, std::string_view instanceSymbol, std::string_view targetModule)
+void addNoPortModuleRef(Graph &graph,
+                        OperationKind kind,
+                        std::string_view instanceSymbol,
+                        std::string_view targetModule)
 {
-    const auto op = graph.createOperation(OperationKind::kInstance, graph.internSymbol(std::string(instanceSymbol)));
+    const auto op = graph.createOperation(kind, graph.internSymbol(std::string(instanceSymbol)));
     graph.setAttr(op, "moduleName", std::string(targetModule));
     graph.setAttr(op, "inputPortName", std::vector<std::string>{});
     graph.setAttr(op, "outputPortName", std::vector<std::string>{});
@@ -57,14 +60,17 @@ Design buildDesign()
     Design design;
     Graph &leaf = design.createGraph("leaf");
     Graph &mid = design.createGraph("mid");
+    Graph &bbLeaf = design.createGraph("bb_leaf");
     Graph &topA = design.createGraph("top_a");
     Graph &orphan = design.createGraph("orphan");
 
     (void)leaf;
+    (void)bbLeaf;
     (void)orphan;
 
-    addNoPortInstance(mid, "u_leaf", "leaf");
-    addNoPortInstance(topA, "u_mid", "mid");
+    addNoPortModuleRef(mid, OperationKind::kInstance, "u_leaf", "leaf");
+    addNoPortModuleRef(topA, OperationKind::kInstance, "u_mid", "mid");
+    addNoPortModuleRef(topA, OperationKind::kBlackbox, "u_bb_leaf", "bb_leaf");
 
     design.markAsTop("top_a");
     design.markAsTop("orphan");
@@ -147,7 +153,8 @@ int main()
     }
     if (singleOutput.find("module top_a") == std::string::npos ||
         singleOutput.find("module mid") == std::string::npos ||
-        singleOutput.find("module leaf") == std::string::npos)
+        singleOutput.find("module leaf") == std::string::npos ||
+        singleOutput.find("module bb_leaf") == std::string::npos)
     {
         return fail("reachable single-file emit is missing expected modules");
     }
@@ -184,7 +191,8 @@ int main()
     }
     if (orphanOutput.find("module top_a") != std::string::npos ||
         orphanOutput.find("module mid") != std::string::npos ||
-        orphanOutput.find("module leaf") != std::string::npos)
+        orphanOutput.find("module leaf") != std::string::npos ||
+        orphanOutput.find("module bb_leaf") != std::string::npos)
     {
         return fail("orphan-only emit should not include other modules");
     }
@@ -205,9 +213,9 @@ int main()
     {
         return fail("split-modules emit reported diagnostics errors");
     }
-    if (splitResult.artifacts.size() != 3)
+    if (splitResult.artifacts.size() != 4)
     {
-        return fail("split-modules emit should report exactly three artifacts");
+        return fail("split-modules emit should report exactly four artifacts");
     }
 
     std::set<std::string> artifactNames;
@@ -221,7 +229,7 @@ int main()
         artifactNames.insert(path.filename().string());
     }
 
-    const std::set<std::string> expectedArtifacts = {"leaf.sv", "mid.sv", "top_a.sv"};
+    const std::set<std::string> expectedArtifacts = {"bb_leaf.sv", "leaf.sv", "mid.sv", "top_a.sv"};
     if (artifactNames != expectedArtifacts)
     {
         return fail("split-modules artifact names do not match emitted module names");
@@ -241,6 +249,10 @@ int main()
         return fail(verifyError);
     }
     if (!verifySingleModuleFile(splitDir / "leaf.sv", "leaf", verifyError))
+    {
+        return fail(verifyError);
+    }
+    if (!verifySingleModuleFile(splitDir / "bb_leaf.sv", "bb_leaf", verifyError))
     {
         return fail(verifyError);
     }
