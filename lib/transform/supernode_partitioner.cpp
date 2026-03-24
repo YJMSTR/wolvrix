@@ -1,4 +1,5 @@
 #include "transform/supernode_partitioner.hpp"
+#include "transform/supernode_control.hpp"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -6,8 +7,8 @@
 namespace wolvrix::lib::transform
 {
 
-SuperNodePartitioner::SuperNodePartitioner(SuperNodeGraph& sg)
-    : sg_(sg) {}
+SuperNodePartitioner::SuperNodePartitioner(SuperNodeGraph& sg, const grh::Graph& graph)
+    : sg_(sg), graph_(graph) {}
 
 void SuperNodePartitioner::partition() {
     // Validate input: check for cycles
@@ -63,6 +64,12 @@ std::vector<int> SuperNodePartitioner::computeOptimalCuts() {
             if (totalMembers > maxSuperNodeSize_) {
                 continue;
             }
+            if (dp[j].cost == std::numeric_limits<int>::max()) {
+                continue;
+            }
+            if (!intervalIsCompatible(j, i)) {
+                continue;
+            }
 
             int cutCost = computeCutCost(j, i);
             int totalCost = dp[j].cost + cutCost;
@@ -78,6 +85,9 @@ std::vector<int> SuperNodePartitioner::computeOptimalCuts() {
     std::vector<int> cuts;
     int pos = n;
     while (pos > 0) {
+        if (dp[pos].backtrack < 0) {
+            throw std::runtime_error("No valid partition satisfies the current constraints");
+        }
         cuts.push_back(pos);
         pos = dp[pos].backtrack;
     }
@@ -108,6 +118,18 @@ int SuperNodePartitioner::computeCutCost(int start, int end) const {
     return cost;
 }
 
+bool SuperNodePartitioner::intervalIsCompatible(int start, int end) const {
+    const auto& sorted = cachedTopoOrder_;
+    for (int i = start; i < end; ++i) {
+        for (int j = i + 1; j < end; ++j) {
+            if (!haveCompatibleSequentialControl(graph_, sg_.getNode(sorted[i]), sg_.getNode(sorted[j]))) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void SuperNodePartitioner::mergeByIntervals(const std::vector<int>& cuts) {
     // Use cached topological order
     const auto& sorted = cachedTopoOrder_;
@@ -115,6 +137,9 @@ void SuperNodePartitioner::mergeByIntervals(const std::vector<int>& cuts) {
 
     for (int cut : cuts) {
         if (cut > start + 1) {
+            if (!intervalIsCompatible(start, cut)) {
+                throw std::runtime_error("Partition interval contains incompatible sequential control signatures");
+            }
             SuperNodeId targetId = sorted[start];
             for (int i = start + 1; i < cut; i++) {
                 sg_.merge(targetId, sorted[i]);

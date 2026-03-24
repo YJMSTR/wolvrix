@@ -106,6 +106,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/hrbcut.cpp
     lib/transform/repcut.cpp
     lib/transform/supernode_graph.cpp
+    lib/transform/supernode_control.cpp
     lib/transform/timing_domain_analyzer.cpp
     lib/transform/supernode_coarsener.cpp
     lib/transform/supernode_partitioner.cpp

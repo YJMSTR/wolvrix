@@ -11,7 +11,7 @@ namespace wolvrix::lib::transform
 
 class SuperNodePartitioner {
 public:
-    explicit SuperNodePartitioner(SuperNodeGraph& sg);
+    SuperNodePartitioner(SuperNodeGraph& sg, const grh::Graph& graph);
 
     void partition();
     void setMaxSuperNodeSize(size_t size) { maxSuperNodeSize_ = size; }
@@ -26,9 +26,11 @@ private:
 
     std::vector<int> computeOptimalCuts();
     int computeCutCost(int start, int end) const;
+    bool intervalIsCompatible(int start, int end) const;
     void mergeByIntervals(const std::vector<int>& cuts);
 
     SuperNodeGraph& sg_;
+    const grh::Graph& graph_;
     size_t maxSuperNodeSize_ = 35;
     std::vector<SuperNodeId> cachedTopoOrder_;
 };

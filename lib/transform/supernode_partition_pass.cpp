@@ -1,8 +1,10 @@
 #include "transform/supernode_partition_pass.hpp"
 #include "transform/supernode_graph.hpp"
-#include "transform/timing_domain_analyzer.hpp"
 #include "transform/supernode_coarsener.hpp"
 #include "transform/supernode_partitioner.hpp"
+#include "transform/timing_domain_analyzer.hpp"
+
+#include <algorithm>
 
 namespace wolvrix::lib::transform
 {
@@ -40,6 +42,7 @@ PassResult SuperNodePartitionPass::run() {
         // Analyze timing domains
         TimingDomainAnalyzer analyzer(graph);
         auto opToDomain = analyzer.assignTimingDomains();
+        const auto crossDomainEdges = analyzer.findCrossDomainEdges();
 
         // Group operations by timing domain, rejecting malformed/cross-domain ops
         std::unordered_map<std::string, std::vector<wolvrix::lib::grh::OperationId>> domainOps;
@@ -61,11 +64,22 @@ PassResult SuperNodePartitionPass::run() {
             domainOps[domain].push_back(opId);
         }
 
+        std::vector<std::string> orderedDomains;
+        orderedDomains.reserve(domainOps.size());
+        for (const auto& [domain, ops] : domainOps) {
+            orderedDomains.push_back(domain);
+        }
+        std::sort(orderedDomains.begin(), orderedDomains.end());
+
         // Track emitted namespaces for discovery
         std::vector<std::string> emittedDomains;
 
         // Process each timing domain separately
-        for (const auto& [domain, ops] : domainOps) {
+        for (const auto& domain : orderedDomains) {
+            auto ops = domainOps.at(domain);
+            std::sort(ops.begin(), ops.end(), [](const auto& lhs, const auto& rhs) {
+                return lhs.index < rhs.index;
+            });
             emittedDomains.push_back(domain);
             // Initialize supernode graph for this domain
             SuperNodeGraph sg;
@@ -103,7 +117,7 @@ PassResult SuperNodePartitionPass::run() {
             coarsener.coarsen();
 
             // Partition
-            SuperNodePartitioner partitioner(sg);
+            SuperNodePartitioner partitioner(sg, graph);
             partitioner.setMaxSuperNodeSize(maxSuperNodeSize_);
             partitioner.partition();
 
@@ -147,6 +161,8 @@ PassResult SuperNodePartitionPass::run() {
                 const auto& node = sg.getNode(snId);
                 predecessors[snId] = std::vector<SuperNodeId>(node.predecessors.begin(), node.predecessors.end());
                 successors[snId] = std::vector<SuperNodeId>(node.successors.begin(), node.successors.end());
+                std::sort(predecessors[snId].begin(), predecessors[snId].end());
+                std::sort(successors[snId].begin(), successors[snId].end());
             }
             setScratchpad(prefix + "predecessors", predecessors);
             setScratchpad(prefix + "successors", successors);
@@ -157,10 +173,6 @@ PassResult SuperNodePartitionPass::run() {
 
             // Timing domain
             setScratchpad(prefix + "timing_domain", domain);
-
-            // Cross-domain edges (empty for per-domain graphs)
-            std::vector<std::pair<SuperNodeId, SuperNodeId>> crossDomainEdges;
-            setScratchpad(prefix + "cross_domain_edges", crossDomainEdges);
 
             // Count cut edges
             size_t cutEdges = 0;
@@ -176,6 +188,7 @@ PassResult SuperNodePartitionPass::run() {
         // Write discovery key listing all emitted domains for this graph
         std::string discoveryKey = "supernode." + graphSymbol + ".domains";
         setScratchpad(discoveryKey, emittedDomains);
+        setScratchpad("supernode." + graphSymbol + ".cross_domain_edges", crossDomainEdges);
     }
 
     return result;

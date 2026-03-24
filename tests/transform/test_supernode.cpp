@@ -1,8 +1,10 @@
 #include "core/grh.hpp"
+#include "core/transform.hpp"
 #include "transform/supernode_graph.hpp"
 #include "transform/timing_domain_analyzer.hpp"
 #include "transform/supernode_coarsener.hpp"
 #include "transform/supernode_partitioner.hpp"
+#include "transform/supernode_partition_pass.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -79,6 +81,66 @@ grh::ValueId makeMux(grh::Graph &graph,
     graph.addResult(op, value);
     return value;
 }
+
+class PartitionScratchpadChecker : public Pass
+{
+public:
+    PartitionScratchpadChecker(grh::OperationId expectedCombinationalOp,
+                               grh::OperationId expectedSequentialOp)
+        : Pass("partition-scratchpad-checker", "partition-scratchpad-checker"),
+          expectedCombinationalOp_(expectedCombinationalOp),
+          expectedSequentialOp_(expectedSequentialOp)
+    {
+    }
+
+    PassResult run() override
+    {
+        const auto *domains = getScratchpad<std::vector<std::string>>("supernode.top.domains");
+        if (domains == nullptr)
+        {
+            throw std::runtime_error("missing supernode.top.domains discovery key");
+        }
+
+        bool sawCombinational = false;
+        bool sawSequential = false;
+        for (const auto &domain : *domains)
+        {
+            sawCombinational |= domain == "combinational";
+            sawSequential |= domain == "domain_0";
+        }
+        if (!sawCombinational)
+        {
+            throw std::runtime_error("expected combinational domain discovery entry");
+        }
+        if (!sawSequential)
+        {
+            throw std::runtime_error("expected sequential timing domain discovery entry");
+        }
+
+        using Mapping = std::unordered_map<grh::OperationId, SuperNodeId, grh::OperationIdHash>;
+        const auto *combinationalMap =
+            getScratchpad<Mapping>("supernode.top.combinational.op_to_sn");
+        const auto *sequentialMap =
+            getScratchpad<Mapping>("supernode.top.domain_0.op_to_sn");
+        if (combinationalMap == nullptr || sequentialMap == nullptr)
+        {
+            throw std::runtime_error("missing expected op_to_sn scratchpad keys");
+        }
+        if (combinationalMap->find(expectedCombinationalOp_) == combinationalMap->end())
+        {
+            throw std::runtime_error("unrelated combinational op was not assigned to any supernode");
+        }
+        if (sequentialMap->find(expectedSequentialOp_) == sequentialMap->end())
+        {
+            throw std::runtime_error("sequential op was not assigned to its timing-domain supernode");
+        }
+        return {};
+    }
+
+private:
+    grh::OperationId expectedCombinationalOp_;
+    grh::OperationId expectedSequentialOp_;
+};
 
 void testSuperNodeGraphBasics()
 {
@@ -335,6 +397,105 @@ void testCoarsenerMergesIdenticalResetTrees()
            "write ports with the same reset tree should merge");
 }
 
+void testPartitionerDoesNotMergeDifferentResetSemantics()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rstA = graph.createValue(graph.internSymbol("rst_a"), 1, false);
+    const auto rstB = graph.createValue(graph.internSymbol("rst_b"), 1, false);
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a", "mux_a", rstA, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b", "mux_b", rstB, zero, data, 8);
+
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a", one, nextA, mask, clk, "reg_a");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b", one, nextB, mask, clk, "reg_b");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(8);
+    partitioner.partition();
+
+    expect(sg.nodeCount() == 2,
+           "partitioner must not merge incompatible reset/control signatures");
+}
+
+void testPartitionerCanMergeIdenticalResetTrees()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a", "mux_a", rst, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b", "mux_b", rst, zero, data, 8);
+
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a", one, nextA, mask, clk, "reg_a");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b", one, nextB, mask, clk, "reg_b");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(8);
+    partitioner.partition();
+
+    expect(sg.nodeCount() == 1,
+           "partitioner should still merge compatible reset/control signatures");
+}
+
+void testPartitionPassBuildsTotalGraphScratchpadCoverage()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto lhs = graph.createValue(graph.internSymbol("lhs"), 8, false);
+    const auto rhs = graph.createValue(graph.internSymbol("rhs"), 8, false);
+    const auto dangling = graph.createValue(graph.internSymbol("dangling"), 8, false);
+    const auto add = graph.createOperation(grh::OperationKind::kAdd,
+                                           graph.internSymbol("dangling_add"));
+    graph.addOperand(add, lhs);
+    graph.addOperand(add, rhs);
+    graph.addResult(add, dangling);
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto write = makeRegisterWrite(graph, "reg_write", one, data, mask, clk, "reg_a");
+
+    PassManager manager;
+    manager.addPass(std::make_unique<SuperNodePartitionPass>());
+    manager.addPass(std::make_unique<PartitionScratchpadChecker>(add, write));
+
+    PassDiagnostics diags;
+    const auto result = manager.run(design, diags);
+    expect(result.success, "supernode partition pass should succeed on mixed sequential/combinational graph");
+    expect(!diags.hasError(), "unexpected diagnostics while checking partition scratchpad coverage");
+}
+
 } // namespace
 
 int main()
@@ -352,6 +513,9 @@ int main()
         testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic();
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
+        testPartitionerDoesNotMergeDifferentResetSemantics();
+        testPartitionerCanMergeIdenticalResetTrees();
+        testPartitionPassBuildsTotalGraphScratchpadCoverage();
     }
     catch (const std::exception &ex)
     {

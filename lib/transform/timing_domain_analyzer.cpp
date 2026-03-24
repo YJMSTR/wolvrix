@@ -5,6 +5,17 @@
 namespace wolvrix::lib::transform
 {
 
+namespace
+{
+
+bool isConcreteTimingDomain(const std::string &domain)
+{
+    return !domain.empty() && domain != "combinational" && domain != "cross_domain" &&
+           domain != "malformed";
+}
+
+} // namespace
+
 bool EventKey::operator==(const EventKey& other) const {
     return eventEdge == other.eventEdge && eventSignals == other.eventSignals;
 }
@@ -150,6 +161,12 @@ TimingDomainAnalyzer::assignTimingDomains() {
         }
     }
 
+    for (const auto& opId : graph_.operations()) {
+        if (result.find(opId) == result.end()) {
+            result[opId] = "combinational";
+        }
+    }
+
     opToDomain_ = result;
     return result;
 }
@@ -164,13 +181,23 @@ TimingDomainAnalyzer::findCrossDomainEdges() {
 
     for (const auto& opId : graph_.operations()) {
         auto op = graph_.getOperation(opId);
-        auto srcDomain = opToDomain_[op.id()];
+        auto srcIt = opToDomain_.find(op.id());
+        if (srcIt == opToDomain_.end()) {
+            continue;
+        }
+        const auto& srcDomain = srcIt->second;
         for (const auto& operand : op.operands()) {
             auto value = graph_.getValue(operand);
             auto defOpId = value.definingOp();
             if (defOpId.valid()) {
-                auto dstDomain = opToDomain_[defOpId];
-                if (srcDomain != dstDomain) {
+                auto dstIt = opToDomain_.find(defOpId);
+                if (dstIt == opToDomain_.end()) {
+                    continue;
+                }
+                const auto& dstDomain = dstIt->second;
+                if (srcDomain != dstDomain &&
+                    isConcreteTimingDomain(srcDomain) &&
+                    isConcreteTimingDomain(dstDomain)) {
                     result.push_back({defOpId, op.id()});
                 }
             }

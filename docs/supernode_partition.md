@@ -2,49 +2,121 @@
 
 ## Overview
 
-The SuperNode Partition Pass implements GSim's hypergraph partitioning algorithm for Wolvrix. It analyzes timing domains, coarsens operations into supernodes, and partitions them to optimize scheduling and reduce cross-domain communication.
+`SuperNodePartitionPass` builds timing-domain-scoped supernode metadata for each
+graph in a Wolvrix design. The pass:
 
-## Usage
+1. classifies every operation into a timing-domain bucket
+2. builds one `SuperNodeGraph` per bucket
+3. runs coarsening and initial partitioning
+4. writes namespaced scratchpad metadata for downstream passes
 
-```bash
-wolvrix-transform --pass=supernode-partition input.json -o output.json
-```
+The implementation is intentionally conservative today:
 
-The pass writes metadata to scratchpad for downstream passes:
+- shared combinational logic across concrete timing domains is rejected
+- interval merges must preserve sequential control/reset compatibility
+- operations outside sequential fan-in cones fall into a `combinational` bucket
 
-- `supernode.count`: Total number of supernodes
-- `supernode.avg_size`: Average supernode size (operation count)
-- `supernode.max_size`: Maximum supernode size
-- `supernode.edge_count`: Total edges between supernodes
-- `supernode.cut_edges`: Edges crossing partition boundaries
-- `supernode.cross_domain_edges`: Edges crossing timing domains
+## Scratchpad Contract
 
-## Algorithm
+Scratchpad keys are graph/domain namespaced.
 
-### 1. Timing Domain Analysis
-Analyzes event keys to identify timing domains and detect cross-domain edges.
+### Graph-level keys
 
-### 2. Coarsening
-Applies 5 merge strategies in order:
-- **mergeResetAll**: Groups nodes by reset signal
-- **mergeWhenNodes**: Groups nodes by conditional signals
-- **mergeOut1**: Merges nodes with single successor
-- **mergeIn1**: Merges nodes with single predecessor
-- **mergeSublings**: Merges nodes with identical predecessor patterns
+- `supernode.<graph>.domains`
+  - `vector<string>`
+  - discovery list for emitted domain buckets, including `combinational` when present
+- `supernode.<graph>.cross_domain_edges`
+  - `vector<pair<OperationId, OperationId>>`
+  - concrete cross-domain operation edges between distinct timing domains
+  - edges involving the `combinational`, `cross_domain`, or `malformed` buckets
+    are not emitted here
 
-### 3. Partitioning
-Uses dynamic programming to find optimal cuts that minimize cross-partition edges while respecting size constraints.
+### Per-domain keys
 
-## Constraints
+For each domain in `supernode.<graph>.domains`, the pass emits:
 
-- Supernodes respect timing domain boundaries (no cross-domain merges)
-- Maximum supernode size: 35 operations (default)
-- Graph must be acyclic (enforced by invariant checks)
+- `supernode.<graph>.<domain>.count`
+- `supernode.<graph>.<domain>.edge_count`
+- `supernode.<graph>.<domain>.avg_size`
+- `supernode.<graph>.<domain>.max_size`
+- `supernode.<graph>.<domain>.cut_edges`
+- `supernode.<graph>.<domain>.timing_domain`
+- `supernode.<graph>.<domain>.topo_order`
+- `supernode.<graph>.<domain>.op_to_sn`
+- `supernode.<graph>.<domain>.sn_to_ops`
+- `supernode.<graph>.<domain>.predecessors`
+- `supernode.<graph>.<domain>.successors`
 
-## Implementation
+`op_to_sn` / `sn_to_ops` are expected to cover every operation assigned to that
+domain bucket.
 
-- `SuperNodeGraph`: Core graph data structure
-- `TimingDomainAnalyzer`: Multi-clock domain analysis
-- `SuperNodeCoarsener`: Implements coarsening strategies
-- `SuperNodePartitioner`: DP-based partitioning algorithm
-- `SuperNodePartitionPass`: Transform pass integration
+## Timing-Domain Policy
+
+### Concrete timing domains
+
+Register and memory write ports derive event-key-based domains from
+`eventEdge` plus event operands. Latch write ports use latch-symbol-scoped
+domains.
+
+### Combinational bucket
+
+Operations that are not assigned to a concrete timing domain by backward
+propagation are still included in partition metadata under the
+`combinational` bucket so the scratchpad contract covers the full supported
+graph.
+
+### Cross-domain sharing
+
+If the same combinational operation is reached from more than one concrete
+timing domain, it is classified as `cross_domain`. The current pass treats that
+as unsupported and fails conservatively instead of merging or duplicating the
+logic.
+
+## Coarsening Policy
+
+The coarsener runs these strategies to a fixpoint:
+
+- `mergeResetAll`
+- `mergeWhenNodes`
+- `mergeOut1`
+- `mergeIn1`
+- `mergeSublings`
+
+All merge strategies now share the same sequential control compatibility rule.
+If two supernodes contain control-sensitive sequential write ports with
+different control/reset signatures, they must not merge.
+
+The signature is derived from:
+
+- `eventEdge`
+- control operands such as `updateCond`, `nextValue`, and mask/address fields
+- event operands
+
+This keeps reset-sensitive and async-sensitive behavior from collapsing during
+either coarsening or interval partitioning.
+
+## Partitioning Policy
+
+The partitioner uses deterministic topological order as its dense DP index.
+Intervals are only considered when:
+
+- total member count is within `maxSuperNodeSize`
+- all supernodes in the interval are sequential-control compatible
+- the DP prefix state is reachable
+
+If no valid partition satisfies these constraints, the pass fails instead of
+producing a bogus backtrack.
+
+## Current Validation Scope
+
+The repository currently contains targeted regressions for:
+
+- cycle-safe `SuperNodeGraph::merge()`
+- deterministic topological sorting
+- timing-domain duplicate-propagation handling
+- control/reset-sensitive coarsening
+- control/reset-sensitive partitioning
+- pass-level scratchpad coverage for mixed sequential/combinational graphs
+
+Broader design-level validation and performance evidence still need to be
+expanded further.
