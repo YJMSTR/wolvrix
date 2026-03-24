@@ -128,7 +128,7 @@ bool SuperNodeCoarsener::mergeOut1() {
     for (auto id : toMerge) {
         if (sg_.isValid(id) && sg_.successors(id).size() == 1) {
             auto succId = *sg_.successors(id).begin();
-            if (sg_.isValid(succId)) {
+            if (sg_.isValid(succId) && canMerge(id, succId)) {
                 doMerge(succId, id);
                 changed = true;
             }
@@ -151,7 +151,7 @@ bool SuperNodeCoarsener::mergeIn1() {
     for (auto id : toMerge) {
         if (sg_.isValid(id) && sg_.predecessors(id).size() == 1) {
             auto predId = *sg_.predecessors(id).begin();
-            if (sg_.isValid(predId)) {
+            if (sg_.isValid(predId) && canMerge(predId, id)) {
                 doMerge(predId, id);
                 changed = true;
             }

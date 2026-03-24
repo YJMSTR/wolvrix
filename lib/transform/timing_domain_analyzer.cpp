@@ -231,8 +231,10 @@ EventKey TimingDomainAnalyzer::extractEventKey(const grh::Operation& op) const {
     }
 
     // Validate that we have event signals if eventEdge is present
-    if (!key.eventEdge.empty() && operands.size() <= eventSignalStart) {
-        // Malformed write port: has eventEdge but no event signal operands
+    if (!key.eventEdge.empty() &&
+        (operands.size() <= eventSignalStart ||
+         operands.size() - eventSignalStart < key.eventEdge.size())) {
+        // Malformed write port: eventEdge requires more event signals than provided
         // Mark as special domain for error reporting
         key.eventEdge.clear();
         key.eventSignals.clear();

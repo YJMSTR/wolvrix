@@ -529,6 +529,31 @@ void testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic()
            "shared combinational logic should inherit the single reachable timing domain");
 }
 
+void testTimingDomainAnalyzerRejectsMissingEventOperands()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto en = graph.createValue(graph.internSymbol("en"), 1, false);
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+    const auto mask = graph.createValue(graph.internSymbol("mask"), 8, false);
+
+    const auto malformed =
+        graph.createOperation(grh::OperationKind::kRegisterWritePort, graph.internSymbol("reg_write_bad"));
+    graph.addOperand(malformed, en);
+    graph.addOperand(malformed, data);
+    graph.addOperand(malformed, mask);
+    graph.addOperand(malformed, en);
+    graph.setAttr(malformed, "regSymbol", std::string("reg_bad"));
+    graph.setAttr(malformed, "eventEdge", std::vector<std::string>{"posedge", "negedge"});
+
+    TimingDomainAnalyzer analyzer(graph);
+    const auto opToDomain = analyzer.assignTimingDomains();
+
+    expect(opToDomain.at(malformed) == "malformed",
+           "write ports with fewer event operands than eventEdge entries must be classified as malformed");
+}
+
 void testCoarsenerDoesNotMergeDifferentResetSemantics()
 {
     grh::Design design;
@@ -756,6 +781,41 @@ void testCoarsenerMergeIn1Path()
     expect(nodeMembers(sg, *merged) == std::set<uint32_t>{pred.index, mergeTarget.index},
            "mergeIn1 should merge exactly the predecessor pair");
     expect(!sg.hasCircularDependency(), "mergeIn1 fixture must remain acyclic");
+}
+
+void testCoarsenerRevalidatesQueuedDegreeOneMerges()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto a = makeCombOp(graph, "a");
+    const auto b = makeCombOp(graph, "b");
+    const auto c = makeCombOp(graph, "c");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    const auto snC = sg.createSuperNode();
+    sg.addMember(snA, a);
+    sg.addMember(snB, b);
+    sg.addMember(snC, c);
+
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+    sg.getNode(snC).timingDomain = "domain_0";
+
+    sg.getNode(snA).successors.insert(snB);
+    sg.getNode(snB).predecessors.insert(snA);
+    sg.getNode(snB).successors.insert(snC);
+    sg.getNode(snC).predecessors.insert(snB);
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.setMaxSuperNodeSize(1);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 3,
+           "queued degree-one contractions must be revalidated after earlier merges change eligibility");
+    expect(!sg.hasCircularDependency(), "revalidation fixture must remain acyclic");
 }
 
 void testCoarsenerMergeSiblingsPath()
@@ -1234,11 +1294,13 @@ int main()
         testMergeAllowsDirectContractionWithoutIntroducingCycle();
         testTopologicalSortUsesStableCanonicalOrder();
         testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic();
+        testTimingDomainAnalyzerRejectsMissingEventOperands();
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
         testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn();
         testMergeWhenNodesDirectPath();
         testCoarsenerMergeIn1Path();
+        testCoarsenerRevalidatesQueuedDegreeOneMerges();
         testCoarsenerMergeSiblingsPath();
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();
