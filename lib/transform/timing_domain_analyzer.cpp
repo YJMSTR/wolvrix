@@ -107,7 +107,7 @@ TimingDomainAnalyzer::assignTimingDomains() {
 
     // Second pass: propagate domains through combinational logic
     // Track which ops are reachable from each domain to detect sharing
-    std::unordered_map<grh::OperationId, std::vector<std::string>, grh::OperationIdHash> opDomainCandidates;
+    std::unordered_map<grh::OperationId, std::unordered_set<std::string>, grh::OperationIdHash> opDomainCandidates;
 
     for (const auto& [opId, domain] : seqDomains) {
         std::queue<grh::OperationId> queue;
@@ -131,7 +131,7 @@ TimingDomainAnalyzer::assignTimingDomains() {
                     if (defOp.kind() != grh::OperationKind::kRegisterWritePort &&
                         defOp.kind() != grh::OperationKind::kLatchWritePort &&
                         defOp.kind() != grh::OperationKind::kMemoryWritePort) {
-                        opDomainCandidates[defOpId].push_back(domain);
+                        opDomainCandidates[defOpId].insert(domain);
                         visited.insert(defOpId);
                         queue.push(defOpId);
                     }
@@ -143,7 +143,7 @@ TimingDomainAnalyzer::assignTimingDomains() {
     // Assign domains: single-domain ops get their domain, multi-domain ops are cross-domain
     for (const auto& [opId, domains] : opDomainCandidates) {
         if (domains.size() == 1) {
-            result[opId] = domains[0];
+            result[opId] = *domains.begin();
         } else {
             // Shared combinational logic - mark as cross-domain
             result[opId] = "cross_domain";
