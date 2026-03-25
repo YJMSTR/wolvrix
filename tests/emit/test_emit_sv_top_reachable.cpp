@@ -372,6 +372,24 @@ int main()
     }
 
     {
+        Design externalBbDesign = buildDesign();
+        Graph &bbTop = externalBbDesign.createGraph("bb_top");
+        addNoPortModuleRef(bbTop, OperationKind::kBlackbox, "u_ext", "external_ip");
+        externalBbDesign.markAsTop("bb_top");
+        EmitDiagnostics bbDiags;
+        EmitSystemVerilog bbEmitter(&bbDiags);
+        EmitOptions bbOptions;
+        bbOptions.outputDir = artifactRoot.string();
+        bbOptions.outputFilename = std::string("emit_bb_top.sv");
+        bbOptions.topOverrides = {"bb_top"};
+        const EmitResult bbResult = bbEmitter.emit(externalBbDesign, bbOptions);
+        if (!bbResult.success || bbDiags.hasError())
+        {
+            return fail("top-reachable emit should allow unresolved external blackbox references");
+        }
+    }
+
+    {
         Design badDesign = buildDesign();
         Graph &badTop = badDesign.createGraph("bad_top");
         addNoPortModuleRef(badTop, OperationKind::kInstance, "u_missing", "missing_leaf");

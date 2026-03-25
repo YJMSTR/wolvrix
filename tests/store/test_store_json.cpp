@@ -170,6 +170,30 @@ int main()
         return fail("Expected diagnostics for unresolved topOverrides");
     }
 
+    // Case 3b: unresolved external blackboxes should remain serializable in top-filtered export.
+    Design externalBbDesign;
+    Graph &bbTop = externalBbDesign.createGraph("bb_top");
+    const auto bbIn = bbTop.createValue(bbTop.internSymbol("in"), 1, false);
+    const auto bbOut = bbTop.createValue(bbTop.internSymbol("out"), 1, false);
+    bbTop.bindInputPort("in", bbIn);
+    bbTop.bindOutputPort("out", bbOut);
+    const auto bbInst = bbTop.createOperation(OperationKind::kBlackbox, bbTop.internSymbol("u_ext"));
+    bbTop.setAttr(bbInst, "moduleName", std::string("external_ip"));
+    bbTop.setAttr(bbInst, "inputPortName", std::vector<std::string>{"in"});
+    bbTop.setAttr(bbInst, "outputPortName", std::vector<std::string>{"out"});
+    bbTop.addOperand(bbInst, bbIn);
+    bbTop.addResult(bbInst, bbOut);
+    externalBbDesign.markAsTop("bb_top");
+    StoreDiagnostics diagExternalBb;
+    StoreJson emitterExternalBb(&diagExternalBb);
+    StoreOptions externalBbOptions;
+    externalBbOptions.topOverrides = {"bb_top"};
+    const auto externalBbJson = emitterExternalBb.storeToString(externalBbDesign, externalBbOptions);
+    if (!externalBbJson.has_value() || diagExternalBb.hasError())
+    {
+        return fail("top-filtered JSON should allow unresolved external blackboxes");
+    }
+
     // Case 4: compact mode should differ from prettyCompact output and avoid newlines.
     StoreDiagnostics diagCompact;
     StoreJson emitterCompact(&diagCompact);

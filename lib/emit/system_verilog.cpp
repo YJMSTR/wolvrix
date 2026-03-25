@@ -554,7 +554,11 @@ namespace wolvrix::lib::emit
                     const wolvrix::lib::grh::Graph *targetGraph = design.findGraph(*moduleName);
                     if (targetGraph == nullptr)
                     {
-                        throw std::runtime_error("reachable graph target not found: " + *moduleName);
+                        if (kind == wolvrix::lib::grh::OperationKind::kInstance)
+                        {
+                            throw std::runtime_error("reachable graph target not found: " + *moduleName);
+                        }
+                        continue;
                     }
 
                     if (reachableSymbols.insert(targetGraph->symbol()).second)
