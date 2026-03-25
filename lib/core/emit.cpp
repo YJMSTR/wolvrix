@@ -41,6 +41,7 @@ namespace wolvrix::lib::emit
     {
         std::vector<const wolvrix::lib::grh::Graph *> result;
         std::unordered_set<std::string> seen;
+        bool hadResolveError = false;
 
         auto tryAdd = [&](std::string_view name)
         {
@@ -53,6 +54,7 @@ namespace wolvrix::lib::emit
             if (graph == nullptr)
             {
                 reportError("Top graph not found", std::string(name));
+                hadResolveError = true;
                 return;
             }
 
@@ -73,6 +75,11 @@ namespace wolvrix::lib::emit
             {
                 tryAdd(name);
             }
+        }
+
+        if (hadResolveError)
+        {
+            result.clear();
         }
 
         return result;

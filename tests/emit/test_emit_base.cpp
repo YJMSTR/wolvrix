@@ -101,6 +101,27 @@ int main()
         return fail("emitImpl should not be called when override tops are unresolved");
     }
 
+    // Case 2b: override list mixes valid and missing tops; emission must still be all-or-nothing.
+    EmitDiagnostics diagMixedOverride;
+    StubEmit emitterMixedOverride(&diagMixedOverride);
+    EmitOptions mixedOverrideOptions;
+    mixedOverrideOptions.outputDir = std::string(WOLF_SV_EMIT_ARTIFACT_DIR);
+    mixedOverrideOptions.topOverrides.push_back("demo");
+    mixedOverrideOptions.topOverrides.push_back("absent_top");
+    EmitResult mixedOverrideResult = emitterMixedOverride.emit(designWithTop, mixedOverrideOptions);
+    if (mixedOverrideResult.success)
+    {
+        return fail("Expected emit to fail when any override top cannot be resolved");
+    }
+    if (!diagMixedOverride.hasError())
+    {
+        return fail("Expected diagnostics to capture mixed override resolution error");
+    }
+    if (emitterMixedOverride.callCount != 0)
+    {
+        return fail("emitImpl should not be called when override tops are only partially resolved");
+    }
+
     // Case 3: successful path with output
     EmitDiagnostics diagOk;
     StubEmit emitterOk(&diagOk);

@@ -602,6 +602,28 @@ void testTimingDomainAnalyzerGroupsSameClockDifferentResetIntoOneDomain()
            "shared fan-in on the same primary clock must not be marked cross_domain");
 }
 
+void testTimingDomainAnalyzerRejectsMissingLatchSymbol()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto en = graph.createValue(graph.internSymbol("en_latch"), 1, false);
+    const auto data = graph.createValue(graph.internSymbol("data_latch"), 8, false);
+    const auto mask = graph.createValue(graph.internSymbol("mask_latch"), 8, false);
+
+    const auto malformed =
+        graph.createOperation(grh::OperationKind::kLatchWritePort, graph.internSymbol("latch_write_bad"));
+    graph.addOperand(malformed, en);
+    graph.addOperand(malformed, data);
+    graph.addOperand(malformed, mask);
+
+    TimingDomainAnalyzer analyzer(graph);
+    const auto opToDomain = analyzer.assignTimingDomains();
+
+    expect(opToDomain.at(malformed) == "malformed",
+           "latch write ports without a valid latchSymbol must be classified as malformed");
+}
+
 void testCoarsenerDoesNotMergeDifferentResetSemantics()
 {
     grh::Design design;
@@ -1448,6 +1470,7 @@ int main()
         testTimingDomainAnalyzerDoesNotInventCrossDomainForSharedSameClockLogic();
         testTimingDomainAnalyzerRejectsMissingEventOperands();
         testTimingDomainAnalyzerGroupsSameClockDifferentResetIntoOneDomain();
+        testTimingDomainAnalyzerRejectsMissingLatchSymbol();
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
         testCoarsenerMergesThreeEquivalentResetTrees();

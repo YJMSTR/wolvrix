@@ -66,7 +66,11 @@ std::unordered_map<EventKey, std::string, EventKeyHash> TimingDomainAnalyzer::an
                 if (const auto* latchSymbol = std::get_if<std::string>(&*latchSymbolAttr)) {
                     std::string latchDomain = "latch_" + *latchSymbol;
                     latchDomains_[op.id()] = latchDomain;
+                } else {
+                    malformedOps_.insert(op.id());
                 }
+            } else {
+                malformedOps_.insert(op.id());
             }
         }
     }
