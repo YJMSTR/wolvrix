@@ -149,10 +149,10 @@ int main()
         {
             return fail("Expected target instance to be removed from parent graph");
         }
-        const auto leafInstId = findInstanceByName(mid, "u_leaf");
+        const auto leafInstId = findInstanceByName(mid, "u_mid$u_child$u_leaf");
         if (!leafInstId.valid())
         {
-            return fail("Expected nested child instance to remain after one-level inline");
+            return fail("Expected nested child instance to remain after one-level inline with renamed instanceName");
         }
         const auto leafInst = mid.getOperation(leafInstId);
         const auto moduleName = getAttrString(leafInst, "moduleName");

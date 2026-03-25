@@ -377,7 +377,14 @@ namespace wolvrix::lib::transform
             return found;
         }
 
-        std::optional<std::string> resolveTargetGraphName(wolvrix::lib::grh::Design &design,
+        struct ResolvedTarget {
+            std::string graphName;           // The graph to process
+            std::string parentGraphName;     // Parent graph containing the instance (empty if top-level)
+            std::string instanceName;        // Instance name (empty if top-level)
+            bool needsUniqueClone = false;   // True if we need to clone the module for a specific instance
+        };
+
+        std::optional<ResolvedTarget> resolveTargetGraphName(wolvrix::lib::grh::Design &design,
                                                           std::string_view path,
                                                           std::string &error)
         {
@@ -394,7 +401,7 @@ namespace wolvrix::lib::transform
                     error = "strip-debug graph not found: " + segments.front();
                     return std::nullopt;
                 }
-                return segments.front();
+                return ResolvedTarget{segments.front(), "", "", false};
             }
 
             Graph *current = design.findGraph(segments.front());
@@ -403,6 +410,7 @@ namespace wolvrix::lib::transform
                 error = "strip-debug root graph not found: " + segments.front();
                 return std::nullopt;
             }
+            std::string parentGraphName = segments.front();
             for (std::size_t i = 1; i < segments.size(); ++i)
             {
                 const OperationId instOp = findUniqueInstance(*current, segments[i]);
@@ -424,9 +432,15 @@ namespace wolvrix::lib::transform
                     error = "strip-debug child graph not found: " + *moduleName;
                     return std::nullopt;
                 }
+                // If this is the last segment, return with clone info
+                if (i + 1 == segments.size())
+                {
+                    return ResolvedTarget{*moduleName, parentGraphName, segments[i], true};
+                }
                 current = child;
+                parentGraphName = *moduleName;
             }
-            return current->symbol();
+            return ResolvedTarget{current->symbol(), "", "", false};
         }
 
     } // namespace
@@ -445,37 +459,119 @@ namespace wolvrix::lib::transform
     PassResult StripDebugPass::run()
     {
         PassResult result;
-        std::vector<std::string> targetNames;
+        std::vector<ResolvedTarget> targets;
         if (options_.path.empty())
         {
-            targetNames = design().topGraphs();
+            for (const auto &topName : design().topGraphs())
+            {
+                targets.push_back(ResolvedTarget{topName, "", "", false});
+            }
         }
         else
         {
             std::string resolveError;
-            auto targetName = resolveTargetGraphName(design(), options_.path, resolveError);
-            if (!targetName)
+            auto target = resolveTargetGraphName(design(), options_.path, resolveError);
+            if (!target)
             {
                 error(std::move(resolveError));
                 result.failed = true;
                 return result;
             }
-            targetNames.push_back(*targetName);
+            targets.push_back(*target);
         }
 
-        if (targetNames.empty())
+        if (targets.empty())
         {
             info("strip-debug: no target graphs to process");
             return result;
         }
 
-        for (const auto &topName : targetNames)
+        for (const auto &targetInfo : targets)
         {
+            std::string topName = targetInfo.graphName;
             Graph *top = design().findGraph(topName);
             if (!top)
             {
                 warning("strip-debug: top graph not found", topName);
                 continue;
+            }
+
+            // If this is an instance-scoped target, check if we need to clone the module
+            // to avoid affecting other instances. Only clone if the module is used by
+            // more than one instance in the design.
+            bool needsClone = false;
+            if (targetInfo.needsUniqueClone)
+            {
+                // Count how many instances use this module
+                int instanceCount = 0;
+                for (const auto &[name, graphPtr] : design().graphs())
+                {
+                    if (!graphPtr)
+                    {
+                        continue;
+                    }
+                    for (const auto opId : graphPtr->operations())
+                    {
+                        const auto op = graphPtr->getOperation(opId);
+                        if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
+                        {
+                            continue;
+                        }
+                        auto modName = getAttrString(op, "moduleName");
+                        if (modName && *modName == topName)
+                        {
+                            ++instanceCount;
+                            if (instanceCount > 1)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if (instanceCount > 1)
+                    {
+                        break;
+                    }
+                }
+                needsClone = (instanceCount > 1);
+            }
+
+            // If this is an instance-scoped target, clone the module to avoid affecting other instances
+            std::optional<Graph> clonedGraph;
+            if (needsClone)
+            {
+                // Generate a unique name for the cloned module
+                std::string uniqueName = topName + "_stripped_0";
+                int suffix = 1;
+                while (design().findGraph(uniqueName) != nullptr)
+                {
+                    uniqueName = topName + "_stripped_" + std::to_string(suffix++);
+                }
+                Graph &newGraph = design().cloneGraph(topName, uniqueName);
+                // Update the instance's moduleName to point to the cloned module
+                if (!targetInfo.parentGraphName.empty() && !targetInfo.instanceName.empty())
+                {
+                    Graph *parentGraph = design().findGraph(targetInfo.parentGraphName);
+                    if (parentGraph)
+                    {
+                        // Find the instance operation by name
+                        for (const auto opId : parentGraph->operations())
+                        {
+                            const auto op = parentGraph->getOperation(opId);
+                            if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
+                            {
+                                continue;
+                            }
+                            auto instName = getAttrString(op, "instanceName");
+                            if (instName && *instName == targetInfo.instanceName)
+                            {
+                                parentGraph->setAttr(opId, "moduleName", uniqueName);
+                                break;
+                            }
+                        }
+                    }
+                }
+                top = &newGraph;
+                topName = uniqueName;
             }
 
             StripPlan plan;

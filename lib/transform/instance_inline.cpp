@@ -49,6 +49,16 @@ namespace wolvrix::lib::transform
             std::size_t aliasAssigns = 0;
         };
 
+        struct InstanceSnapshot
+        {
+            wolvrix::lib::grh::OperationKind kind = wolvrix::lib::grh::OperationKind::kInstance;
+            wolvrix::lib::grh::SymbolId symbol = wolvrix::lib::grh::SymbolId::invalid();
+            std::vector<wolvrix::lib::grh::ValueId> operands;
+            std::vector<wolvrix::lib::grh::ValueId> results;
+            std::vector<wolvrix::lib::grh::AttrKV> attrs;
+            std::optional<wolvrix::lib::grh::SrcLoc> srcLoc;
+        };
+
         struct Reporter
         {
             std::function<void(const wolvrix::lib::grh::Graph &, std::string)> graphError;
@@ -550,8 +560,10 @@ namespace wolvrix::lib::transform
                                    const std::string &key,
                                    const wolvrix::lib::grh::AttributeValue &value) {
                 target.setAttr(newOp, key, value);
+                // Rewrite symbol references: storage symbols, DPI imports, and instance names
                 if (key != "regSymbol" && key != "memSymbol" &&
-                    key != "latchSymbol" && key != "targetImportSymbol")
+                    key != "latchSymbol" && key != "targetImportSymbol" &&
+                    key != "instanceName")
                 {
                     return;
                 }
@@ -644,6 +656,13 @@ namespace wolvrix::lib::transform
                 if (!oldName.empty() && !newName.empty())
                 {
                     opRename.emplace(oldName, newName);
+                }
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kInstance)
+                {
+                    if (auto oldInstanceName = getAttrString(op, "instanceName"); oldInstanceName && !oldInstanceName->empty())
+                    {
+                        opRename.emplace(*oldInstanceName, makeHierName(targetInfo.prefix, *oldInstanceName));
+                    }
                 }
 
                 const auto newOp = target.createOperation(op.kind(), newSym);
@@ -771,13 +790,6 @@ namespace wolvrix::lib::transform
             return result;
         }
 
-        if (!resolved->parentGraph->eraseOpUnchecked(resolved->instanceOp))
-        {
-            error(*resolved->parentGraph, instOp, "instance-inline failed to remove target instance");
-            result.failed = true;
-            return result;
-        }
-
         CloneStats stats;
         const Reporter reporter{
             [this](const wolvrix::lib::grh::Graph &graph, std::string message) {
@@ -788,6 +800,49 @@ namespace wolvrix::lib::transform
                    std::string message) {
                 error(graph, op, std::move(message));
             }};
+
+        // Validate the clone in an isolated design copy before mutating the real design.
+        {
+            auto trialDesign = design().clone();
+            std::string trialResolveError;
+            auto trialResolved = resolveTargetPath(trialDesign, options_.path, trialResolveError);
+            if (!trialResolved)
+            {
+                error(std::move(trialResolveError));
+                result.failed = true;
+                return result;
+            }
+
+            const auto trialInstOp = trialResolved->parentGraph->getOperation(trialResolved->instanceOp);
+            ValueMap trialPortMap;
+            std::vector<AliasOutput> trialAliasOutputs;
+            std::string trialMapError;
+            if (!buildPortMap(*trialResolved->childGraph, trialInstOp, trialPortMap, trialAliasOutputs, trialMapError))
+            {
+                error(*trialResolved->parentGraph, trialInstOp, std::move(trialMapError));
+                result.failed = true;
+                return result;
+            }
+            if (!trialResolved->parentGraph->eraseOpUnchecked(trialResolved->instanceOp))
+            {
+                error(*trialResolved->parentGraph, trialInstOp, "instance-inline failed to remove target instance during trial clone");
+                result.failed = true;
+                return result;
+            }
+            CloneStats trialStats;
+            if (!cloneChildOneLevel(reporter, *trialResolved, trialPortMap, trialAliasOutputs, trialStats))
+            {
+                result.failed = true;
+                return result;
+            }
+        }
+
+        if (!resolved->parentGraph->eraseOpUnchecked(resolved->instanceOp))
+        {
+            error(*resolved->parentGraph, instOp, "instance-inline failed to remove target instance");
+            result.failed = true;
+            return result;
+        }
 
         if (!cloneChildOneLevel(reporter, *resolved, portMap, aliasOutputs, stats))
         {
