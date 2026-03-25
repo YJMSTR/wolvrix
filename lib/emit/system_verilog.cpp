@@ -4895,9 +4895,14 @@ namespace wolvrix::lib::emit
                         reportError("Instance port counts do not match operands/results", opContext);
                         break;
                     }
-                    const auto moduleNameIt = emittedModuleNames.find(*moduleName);
+                    std::string emittedLookupName = *moduleName;
+                    if (const auto *targetGraph = design.findGraph(*moduleName); targetGraph != nullptr)
+                    {
+                        emittedLookupName = targetGraph->symbol();
+                    }
+                    const auto moduleNameIt = emittedModuleNames.find(emittedLookupName);
                     const std::string &targetModuleName =
-                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : *moduleName;
+                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : emittedLookupName;
 
                     std::ostringstream decl;
                     if (op.kind() == wolvrix::lib::grh::OperationKind::kBlackbox)

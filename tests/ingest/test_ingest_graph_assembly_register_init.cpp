@@ -94,18 +94,41 @@ int testGraphAssemblyRegisterInit(const std::filesystem::path& sourcePath) {
     int regWrites = 0;
     bool foundRandomDecl = false;
     bool foundRandomRead = false;
+    bool foundURandomDecl = false;
+    bool foundWideDecl = false;
+    bool foundXDecl = false;
 
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
         switch (op.kind()) {
         case wolvrix::lib::grh::OperationKind::kRegister: {
             ++regDecls;
+            auto initValue = getAttrString(op, "initValue");
             if (op.symbolText() == "random_bits") {
-                auto initValue = getAttrString(op, "initValue");
                 if (!initValue || *initValue != "$random") {
                     return fail("kRegister random_bits missing initValue=$random");
                 }
                 foundRandomDecl = true;
+            }
+            else if (op.symbolText() == "urandom_bits") {
+                if (!initValue || *initValue != "$urandom") {
+                    return fail("kRegister urandom_bits missing initValue=$urandom");
+                }
+                foundURandomDecl = true;
+            }
+            else if (op.symbolText() == "wide_init") {
+                if (!initValue || initValue->find("128'h") != 0 ||
+                    initValue->find("123456789abcdef0011223344556677") == std::string::npos) {
+                    return fail("kRegister wide_init did not preserve full 128-bit literal");
+                }
+                foundWideDecl = true;
+            }
+            else if (op.symbolText() == "x_init") {
+                if (!initValue || initValue->find("4'h") != 0 ||
+                    (initValue->back() != 'x' && initValue->back() != 'X')) {
+                    return fail("kRegister x_init did not preserve four-state literal");
+                }
+                foundXDecl = true;
             }
             break;
         }
@@ -128,10 +151,19 @@ int testGraphAssemblyRegisterInit(const std::filesystem::path& sourcePath) {
     if (!foundRandomDecl) {
         return fail("Expected kRegister declaration for random_bits");
     }
+    if (!foundURandomDecl) {
+        return fail("Expected kRegister declaration for urandom_bits");
+    }
+    if (!foundWideDecl) {
+        return fail("Expected kRegister declaration for wide_init");
+    }
+    if (!foundXDecl) {
+        return fail("Expected kRegister declaration for x_init");
+    }
     if (!foundRandomRead) {
         return fail("Expected kRegisterReadPort for random_bits");
     }
-    if (regDecls != 1 || regReads != 1) {
+    if (regDecls != 4 || regReads != 4) {
         return fail("Unexpected kRegister/kRegisterReadPort count");
     }
     if (regWrites != 0) {

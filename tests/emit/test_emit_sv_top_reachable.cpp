@@ -153,6 +153,10 @@ int main()
     {
         return fail("failed to read single-file reachable output");
     }
+    if (singleOutput.find("top_a#(8)") != std::string::npos)
+    {
+        return fail("alias text should not appear as an emitted module or instance target name");
+    }
     if (singleOutput.find("module top_a") == std::string::npos ||
         singleOutput.find("module mid") == std::string::npos ||
         singleOutput.find("module leaf") == std::string::npos ||

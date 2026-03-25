@@ -8264,17 +8264,11 @@ private:
             return tryExtractInitValue(conv.operand());
         }
 
-        // Case 1: IntegerLiteral -> hex string representation
+        // Case 1: IntegerLiteral -> preserve the full exact SV literal in hex form
         if (rhs.kind == slang::ast::ExpressionKind::IntegerLiteral) {
             const auto& lit = rhs.as<slang::ast::IntegerLiteral>();
             auto value = lit.getValue();
-            std::ostringstream oss;
-            // Output as hex with appropriate width (at least 1 hex digit)
-            oss << value.getBitWidth() << "'h" << std::hex << std::setfill('0');
-            int hexDigits = (value.getBitWidth() + 3) / 4;
-            if (hexDigits < 1) hexDigits = 1;
-            oss << std::setw(hexDigits) << value.getRawPtr()[0];
-            return oss.str();
+            return value.toString(slang::LiteralBase::Hex, /*includeBase*/ true, slang::SVInt::MAX_BITS);
         }
 
         // Case 2: UnbasedUnsizedIntegerLiteral -> "0" or "1"
@@ -8298,14 +8292,15 @@ private:
             if (name == "$random" || name == "$urandom") {
                 const auto& args = call.arguments();
                 if (args.empty()) {
-                    return "$random";
+                    return name;
                 } else if (args.size() == 1) {
                     // Try to extract seed if it's a constant
                     if (args[0]->kind == slang::ast::ExpressionKind::IntegerLiteral) {
                         const auto& seedLit = args[0]->as<slang::ast::IntegerLiteral>();
                         auto seed = seedLit.getValue();
                         std::ostringstream oss;
-                        oss << "$random(" << seed.getRawPtr()[0] << ")";
+                        oss << name << "(" << seed.toString(slang::LiteralBase::Decimal, /*includeBase*/ false,
+                                                            slang::SVInt::MAX_BITS) << ")";
                         return oss.str();
                     }
                 }
