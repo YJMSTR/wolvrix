@@ -753,11 +753,6 @@ namespace wolvrix::lib::transform
             const std::size_t memWriteCount = memWriteIt == index.memoryWritePorts.end() ? 0 : memWriteIt->second.size();
             if (memWriteCount == 0)
             {
-                if (keepDeclaredSymbols && graph.isDeclaredSymbol(addressRegOp.symbol()))
-                {
-                    ++stats.skipDeclaredSymbol;
-                    return std::nullopt;
-                }
                 candidate.mode = Candidate::Mode::Rom;
                 return candidate;
             }

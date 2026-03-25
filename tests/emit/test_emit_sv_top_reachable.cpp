@@ -306,12 +306,12 @@ int main()
     {
         return fail("split-modules re-emit should not delete unrelated .sv files from the output directory");
     }
-    if (std::filesystem::exists(staleManagedPath) ||
-        std::filesystem::exists(splitDir / "top_a.sv") ||
-        std::filesystem::exists(splitDir / "mid.sv") ||
-        std::filesystem::exists(splitDir / "bb_leaf.sv"))
+    if (!std::filesystem::exists(splitDir / "top_a.sv") ||
+        !std::filesystem::exists(splitDir / "mid.sv") ||
+        !std::filesystem::exists(splitDir / "bb_leaf.sv") ||
+        !std::filesystem::exists(splitDir / "leaf.sv"))
     {
-        return fail("split-modules re-emit should remove stale reachable module files from the previous top set");
+        return fail("split-modules re-emit should not delete stale files for unrelated tops");
     }
     if (!verifySingleModuleFile(splitDir / "orphan.sv", "orphan", verifyError))
     {

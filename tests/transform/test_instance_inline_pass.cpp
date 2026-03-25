@@ -181,6 +181,7 @@ int main()
         wolvrix::lib::grh::Design design;
         auto &child = design.createGraph("child");
         auto &top = design.createGraph("top");
+        auto &library = design.createGraph("library");
         design.markAsTop("top");
 
         const auto childA = child.createValue(child.internSymbol("a"), 1, false);
@@ -203,15 +204,15 @@ int main()
         top.setAttr(topChildInst, "inputPortName", std::vector<std::string>{"a"});
         top.setAttr(topChildInst, "outputPortName", std::vector<std::string>{"y"});
 
-        const auto xmrVal = top.createValue(top.makeInternalValSym(), 1, false);
-        const auto xmrOp = top.createOperation(wolvrix::lib::grh::OperationKind::kXMRRead, top.makeInternalOpSym());
-        top.addResult(xmrOp, xmrVal);
-        top.setAttr(xmrOp, "xmrPath", std::string("top.u_child.y"));
+        const auto libVal = library.createValue(library.makeInternalValSym(), 1, false);
+        const auto libXmr = library.createOperation(wolvrix::lib::grh::OperationKind::kXMRRead, library.makeInternalOpSym());
+        library.addResult(libXmr, libVal);
+        library.setAttr(libXmr, "xmrPath", std::string("top.somewhere.else"));
 
         PassDiagnostics diags;
-        if (!runInlinePass(design, "top.u_child", diags, false))
+        if (!runInlinePass(design, "top.u_child", diags, true))
         {
-            return fail("Expected instance-inline to reject graphs with unresolved XMR");
+            return fail("Expected unrelated XMR in untouched graphs to not block instance-inline");
         }
     }
 

@@ -191,7 +191,13 @@ int main()
 
     {
         Design design;
-        Graph &graph = buildBaseReadPath(design, false, false, false);
+        Graph &graph = buildBaseReadPath(design, false, false);
+        const auto addrRegId = graph.findOperation("addr_q");
+        if (!addrRegId.valid())
+        {
+            return fail("ROM declared-symbol fixture missing addr_q register");
+        }
+        graph.addDeclaredSymbol(graph.getOperation(addrRegId).symbol());
 
         PassManager manager;
         manager.addPass(std::make_unique<MemoryReadRetimePass>());
@@ -200,15 +206,15 @@ int main()
 
         if (!result.success || diags.hasError())
         {
-            return fail("ROM case without address init should still succeed");
+            return fail("ROM case with declared address register should succeed");
         }
         if (!result.changed)
         {
-            return fail("ROM case without address init should still change graph");
+            return fail("ROM case with declared address register should still retime");
         }
         if (graph.findOperation("addr_q").valid())
         {
-            return fail("ROM case without address init should still remove original address register");
+            return fail("ROM case with declared address register should remove original address register");
         }
     }
 

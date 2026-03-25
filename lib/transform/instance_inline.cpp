@@ -760,16 +760,6 @@ namespace wolvrix::lib::transform
             return result;
         }
 
-        for (const auto &entry : design().graphs())
-        {
-            if (entry.second && hasXmrOps(*entry.second))
-            {
-                error(*entry.second, "instance-inline requires xmr-resolve before inline");
-                result.failed = true;
-                return result;
-            }
-        }
-
         std::string resolveError;
         auto resolved = resolveTargetPath(design(), options_.path, resolveError);
         if (!resolved)
@@ -777,6 +767,24 @@ namespace wolvrix::lib::transform
             error(std::move(resolveError));
             result.failed = true;
             return result;
+        }
+
+        {
+            std::vector<const wolvrix::lib::grh::Graph *> graphsToCheck;
+            graphsToCheck.push_back(resolved->parentGraph);
+            if (resolved->childGraph != resolved->parentGraph)
+            {
+                graphsToCheck.push_back(resolved->childGraph);
+            }
+            for (const auto *graph : graphsToCheck)
+            {
+                if (graph != nullptr && hasXmrOps(*graph))
+                {
+                    error(*graph, "instance-inline requires xmr-resolve before inline");
+                    result.failed = true;
+                    return result;
+                }
+            }
         }
 
         const auto instOp = resolved->parentGraph->getOperation(resolved->instanceOp);

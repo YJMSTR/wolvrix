@@ -5814,16 +5814,16 @@ namespace wolvrix::lib::emit
                     return result;
                 }
                 std::unordered_set<std::string> managedModuleFiles;
-                for (const auto &graphSymbol : design.graphOrder())
+                for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
                 {
-                    auto moduleNameIt = emittedModuleNames.find(graphSymbol);
-                    const std::string moduleName =
-                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graphSymbol;
-                    managedModuleFiles.insert(moduleName + ".sv");
-                    for (const auto &alias : design.aliasesForGraph(graphSymbol))
+                    if (!graph)
                     {
-                        managedModuleFiles.insert(alias + ".sv");
+                        continue;
                     }
+                    auto moduleNameIt = emittedModuleNames.find(graph->symbol());
+                    const std::string moduleName =
+                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
+                    managedModuleFiles.insert(moduleName + ".sv");
                 }
                 for (const auto &entry : std::filesystem::directory_iterator(outputDir))
                 {
