@@ -258,13 +258,22 @@ int main()
     }
 
     const std::filesystem::path stalePath = splitDir / "stale_only.sv";
+    const std::filesystem::path staleManagedPath = splitDir / "leaf.sv";
     {
         std::ofstream stale(stalePath);
         stale << "module stale_only;\nendmodule\n";
     }
+    {
+        std::ofstream staleManaged(staleManagedPath);
+        staleManaged << "module leaf;\nendmodule\n";
+    }
     if (!std::filesystem::exists(stalePath))
     {
         return fail("failed to create stale split-module file");
+    }
+    if (!std::filesystem::exists(staleManagedPath))
+    {
+        return fail("failed to create stale managed split-module file");
     }
 
     EmitDiagnostics diagSplitTopOnly;
@@ -283,13 +292,13 @@ int main()
     {
         return fail("split-modules re-emit on existing directory reported diagnostics errors");
     }
-    if (std::filesystem::exists(stalePath))
+    if (!std::filesystem::exists(stalePath))
     {
-        return fail("split-modules re-emit should remove stale module files from the output directory");
+        return fail("split-modules re-emit should not delete unrelated .sv files from the output directory");
     }
-    if (std::filesystem::exists(splitDir / "top_a.sv") ||
+    if (std::filesystem::exists(staleManagedPath) ||
+        std::filesystem::exists(splitDir / "top_a.sv") ||
         std::filesystem::exists(splitDir / "mid.sv") ||
-        std::filesystem::exists(splitDir / "leaf.sv") ||
         std::filesystem::exists(splitDir / "bb_leaf.sv"))
     {
         return fail("split-modules re-emit should remove stale reachable module files from the previous top set");

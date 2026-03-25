@@ -205,6 +205,7 @@ std::vector<std::string> nodeControlSignatures(const grh::Graph &graph,
         }
     }
     std::sort(signatures.begin(), signatures.end());
+    signatures.erase(std::unique(signatures.begin(), signatures.end()), signatures.end());
     return signatures;
 }
 

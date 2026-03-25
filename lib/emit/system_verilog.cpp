@@ -5811,9 +5811,23 @@ namespace wolvrix::lib::emit
             const std::filesystem::path outputDir = resolveOutputDir(options);
             if (std::filesystem::exists(outputDir))
             {
+                std::unordered_set<std::string> managedModuleFiles;
+                for (const auto &graphSymbol : design.graphOrder())
+                {
+                    auto moduleNameIt = emittedModuleNames.find(graphSymbol);
+                    const std::string moduleName =
+                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graphSymbol;
+                    managedModuleFiles.insert(moduleName + ".sv");
+                    for (const auto &alias : design.aliasesForGraph(graphSymbol))
+                    {
+                        managedModuleFiles.insert(alias + ".sv");
+                    }
+                }
                 for (const auto &entry : std::filesystem::directory_iterator(outputDir))
                 {
-                    if (entry.is_regular_file() && entry.path().extension() == ".sv")
+                    if (entry.is_regular_file() &&
+                        entry.path().extension() == ".sv" &&
+                        managedModuleFiles.find(entry.path().filename().string()) != managedModuleFiles.end())
                     {
                         std::error_code removeEc;
                         std::filesystem::remove(entry.path(), removeEc);

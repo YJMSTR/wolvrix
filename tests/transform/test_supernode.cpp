@@ -669,6 +669,44 @@ void testCoarsenerMergesIdenticalResetTrees()
            "write ports with the same reset tree should merge");
 }
 
+void testCoarsenerMergesThreeEquivalentResetTrees()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto mask = makeConstant(graph, "mask_three", "mask_const_three", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero_three", "zero_const_three", 8, "8'h00");
+    const auto one = makeConstant(graph, "one_three", "one_const_three", 1, "1'b1");
+    const auto data = graph.createValue(graph.internSymbol("data_three"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a_three", "mux_a_three", rst, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b_three", "mux_b_three", rst, zero, data, 8);
+    const auto nextC = makeMux(graph, "next_c_three", "mux_c_three", rst, zero, data, 8);
+
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a_three", one, nextA, mask, clk, "reg_a_three");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b_three", one, nextB, mask, clk, "reg_b_three");
+    const auto writeC = makeRegisterWrite(graph, "reg_write_c_three", one, nextC, mask, clk, "reg_c_three");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    const auto snC = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.addMember(snC, writeC);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+    sg.getNode(snC).timingDomain = "domain_0";
+
+    SuperNodeCoarsener coarsener(sg, graph);
+    coarsener.coarsen();
+
+    expect(sg.nodeCount() == 1,
+           "deduplicated control signatures should allow 3+ equivalent reset trees to merge into one supernode");
+}
+
 void testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn()
 {
     grh::Design design;
@@ -1412,6 +1450,7 @@ int main()
         testTimingDomainAnalyzerGroupsSameClockDifferentResetIntoOneDomain();
         testCoarsenerDoesNotMergeDifferentResetSemantics();
         testCoarsenerMergesIdenticalResetTrees();
+        testCoarsenerMergesThreeEquivalentResetTrees();
         testCoarsenerAllowsResetWriteToMergeWithCombinationalFanIn();
         testMergeWhenNodesDirectPath();
         testCoarsenerMergeIn1Path();

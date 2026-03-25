@@ -119,7 +119,15 @@ PassResult SuperNodePartitionPass::run() {
             // Partition
             SuperNodePartitioner partitioner(sg, graph);
             partitioner.setMaxSuperNodeSize(maxSuperNodeSize_);
-            partitioner.partition();
+            try {
+                partitioner.partition();
+            } catch (const std::exception& ex) {
+                diags().error("supernode-partition",
+                    std::string("Partitioning failed: ") + ex.what(),
+                    "Graph: " + graphSymbol + ", Domain: " + domain);
+                result.failed = true;
+                return result;
+            }
 
             // Write scratchpad metadata with graph and domain namespace
             std::string prefix = "supernode." + graphSymbol + "." + domain + ".";
