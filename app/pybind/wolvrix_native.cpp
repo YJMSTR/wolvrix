@@ -1226,7 +1226,16 @@ namespace
         options.outputDir = out_path.string();
         options.topOverrides = std::move(top_names);
 
-        const auto result = emitter.emit(*design, options);
+        wolvrix::lib::emit::EmitResult result;
+        try
+        {
+            result = emitter.emit(*design, options);
+        }
+        catch (const std::exception &ex)
+        {
+            PyErr_SetString(PyExc_RuntimeError, ex.what());
+            return nullptr;
+        }
         if (diagnostics.hasError() || !result.success)
         {
             const std::string diagText =

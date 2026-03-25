@@ -153,6 +153,7 @@ namespace wolvrix::lib::emit
             std::string direction;
             int64_t width = 1;
             bool isSigned = false;
+            std::string valueType = "logic";
         };
 
         struct ManifestUnit
@@ -354,6 +355,7 @@ namespace wolvrix::lib::emit
                 match[1].str(),
                 match[4].matched ? (msb - lsb + 1) : 1,
                 match[3].matched,
+                (match[2].matched && (match[2].str() == "real" || match[2].str() == "string")) ? match[2].str() : std::string("logic"),
             };
         }
 
@@ -650,6 +652,11 @@ namespace wolvrix::lib::emit
             {
                 const char bitChar = static_cast<char>(std::tolower(
                     static_cast<unsigned char>(value[static_cast<int32_t>(bit)].toChar())));
+                if (bitChar == 'x' || bitChar == 'z')
+                {
+                    throw std::runtime_error("Verilator repcut package does not support 4-state constants in wrapper generation: " +
+                                             std::string(literal));
+                }
                 if (bitChar == '1')
                 {
                     out[static_cast<std::size_t>(bit / 32)] |= (uint32_t(1) << static_cast<uint32_t>(bit % 32));
@@ -704,6 +711,8 @@ namespace wolvrix::lib::emit
             writer.writeValue(port.width);
             writer.writeProperty("signed");
             writer.writeValue(port.isSigned);
+            writer.writeProperty("value_type");
+            writer.writeValue(port.valueType);
             writer.endObject();
         }
 
@@ -1830,6 +1839,21 @@ namespace wolvrix::lib::emit
         auto topModuleIt = emittedModuleNameByGraph.find(topGraph.symbol());
         manifest.topModule = topModuleIt != emittedModuleNameByGraph.end() ? topModuleIt->second : topGraph.symbol();
 
+        auto validateManifestPortKinds = [&](std::span<const ManifestPort> ports,
+                                             std::string_view context) -> bool
+        {
+            for (const auto &port : ports)
+            {
+                if (port.valueType != "logic")
+                {
+                    reportError("emitVerilatorRepCutPackage does not support non-logic ports", std::string(context) + ":" + port.name);
+                    result.success = false;
+                    return false;
+                }
+            }
+            return true;
+        };
+
         manifest.topInputs.reserve(topGraph.inputPorts().size());
         for (const auto &port : topGraph.inputPorts())
         {
@@ -1838,6 +1862,7 @@ namespace wolvrix::lib::emit
                 "input",
                 topGraph.valueWidth(port.value),
                 topGraph.valueSigned(port.value),
+                std::string(wolvrix::lib::grh::toString(topGraph.valueType(port.value))),
             });
         }
         manifest.topOutputs.reserve(topGraph.outputPorts().size());
@@ -1848,7 +1873,14 @@ namespace wolvrix::lib::emit
                 "output",
                 topGraph.valueWidth(port.value),
                 topGraph.valueSigned(port.value),
+                std::string(wolvrix::lib::grh::toString(topGraph.valueType(port.value))),
             });
+        }
+
+        if (!validateManifestPortKinds(manifest.topInputs, topGraph.symbol()) ||
+            !validateManifestPortKinds(manifest.topOutputs, topGraph.symbol()))
+        {
+            return result;
         }
 
         std::unordered_map<wolvrix::lib::grh::ValueId, DriverDesc, wolvrix::lib::grh::ValueIdHash> drivers;
@@ -2007,6 +2039,10 @@ namespace wolvrix::lib::emit
                 storedShim.wrapperSourceSv,
                 storedShim.wrapperPorts,
             });
+            if (!validateManifestPortKinds(manifest.units.back().ports, instanceName))
+            {
+                return result;
+            }
 
             const auto operands = topGraph.opOperands(opId);
             const auto results = topGraph.opResults(opId);
@@ -2212,7 +2248,17 @@ namespace wolvrix::lib::emit
             result.artifacts.push_back(fileListPath.string());
         }
 
-        const WrapperCode wrapperCode = generatePartitionedWrapperCode(manifest);
+        WrapperCode wrapperCode;
+        try
+        {
+            wrapperCode = generatePartitionedWrapperCode(manifest);
+        }
+        catch (const std::exception &ex)
+        {
+            reportError(ex.what(), topGraph.symbol());
+            result.success = false;
+            return result;
+        }
         std::error_code cleanupEc;
         std::filesystem::remove(packageDir / "partitioned_wrapper.h", cleanupEc);
         cleanupEc.clear();

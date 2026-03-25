@@ -212,7 +212,10 @@ int main()
     {
         return fail("manifest missing top_module");
     }
-    if (!contains(manifest, "\"top_inputs\":[{\"name\":\"clock\",\"width\":1,\"signed\":false},{\"name\":\"reset\",\"width\":1,\"signed\":false},{\"name\":\"in_data\",\"width\":8,\"signed\":false}]"))
+    if (!contains(manifest, "\"top_inputs\":[") ||
+        !contains(manifest, "\"name\":\"clock\",\"width\":1,\"signed\":false,\"value_type\":\"logic\"") ||
+        !contains(manifest, "\"name\":\"reset\",\"width\":1,\"signed\":false,\"value_type\":\"logic\"") ||
+        !contains(manifest, "\"name\":\"in_data\",\"width\":8,\"signed\":false,\"value_type\":\"logic\""))
     {
         return fail("manifest missing top_inputs");
     }
@@ -495,9 +498,57 @@ int main()
         opts.outputDir = (artifactRoot / "with_real_ports").string();
         opts.topOverrides = {"RealTop"};
         const EmitResult res = emitter.emit(design, opts);
-        if (!res.success || diags.hasError())
+        if (res.success || !diags.hasError())
         {
-            return fail("package emit should accept emitted real ports");
+            return fail("package emit should reject non-logic ports instead of silently mis-modeling them");
+        }
+    }
+
+    {
+        Design design = buildDesign();
+        Graph *topXConst = design.findGraph("SimTop");
+        if (!topXConst)
+        {
+            return fail("missing SimTop graph for 4-state const test");
+        }
+        const auto xConst = topXConst->createValue(topXConst->internSymbol("x_const"), 1, false);
+        const auto xConstOp = topXConst->createOperation(OperationKind::kConstant, topXConst->internSymbol("const_x"));
+        topXConst->setAttr(xConstOp, "constValue", std::string("1'bx"));
+        topXConst->addResult(xConstOp, xConst);
+        OperationId part1 = OperationId::invalid();
+        for (const auto opId : topXConst->operations())
+        {
+            auto op = topXConst->getOperation(opId);
+            if (op.kind() != OperationKind::kInstance)
+            {
+                continue;
+            }
+            auto attr = op.attr("instanceName");
+            if (!attr)
+            {
+                continue;
+            }
+            if (const auto *name = std::get_if<std::string>(&*attr); name && *name == "part_1")
+            {
+                part1 = opId;
+                break;
+            }
+        }
+        if (!part1.valid())
+        {
+            return fail("missing part_1 instance for 4-state const test");
+        }
+        topXConst->replaceOperand(part1, 3, xConst);
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_x_const").string();
+        opts.topOverrides = {"SimTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (res.success || !diags.hasError())
+        {
+            return fail("package emit should reject 4-state const_to_unit wrapper literals");
         }
     }
 
