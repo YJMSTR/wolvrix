@@ -1546,6 +1546,16 @@ namespace wolvrix::lib::emit
                     }
                 }
             };
+            bool hasNonDebugUnitDependencies = false;
+            for (const auto &edge : manifest.connections)
+            {
+                if (edge.kind == "unit_to_unit" && edge.driver.kind == DriverDesc::Kind::Unit &&
+                    edge.driver.instanceName != "debug_part")
+                {
+                    hasNonDebugUnitDependencies = true;
+                    break;
+                }
+            }
             source << "  // Scatter a single cross-partition snapshot into every unit input first.\n";
             for (const auto &instanceName : manifest.serialEvalOrder)
             {
@@ -1616,9 +1626,12 @@ namespace wolvrix::lib::emit
             {
                 source << "  // Evaluate all units after every cross-partition input has been loaded.\n";
             }
-            source << "  // eval part_* on fixed worker threads\n";
-            source << "  run_part_eval_workers_();\n";
-            source << "\n";
+            if (!hasNonDebugUnitDependencies)
+            {
+                source << "  // eval part_* on fixed worker threads\n";
+                source << "  run_part_eval_workers_();\n";
+                source << "\n";
+            }
             if (hasDebugPart)
             {
                 source << "  // Gather non-debug outputs after every logic unit has completed eval().\n";
@@ -1627,14 +1640,37 @@ namespace wolvrix::lib::emit
             {
                 source << "  // Gather outputs only after every unit has completed eval().\n";
             }
-            for (const auto &instanceName : manifest.serialEvalOrder)
+            if (hasNonDebugUnitDependencies)
             {
-                if (hasDebugPart && instanceName == "debug_part")
+                source << "  // Non-debug units have same-step dependencies; evaluate them serially in manifest order.\n";
+                for (const auto &instanceName : manifest.serialEvalOrder)
                 {
-                    continue;
+                    if (hasDebugPart && instanceName == "debug_part")
+                    {
+                        continue;
+                    }
+                    const auto unitIt = unitInfoByInstance.find(instanceName);
+                    if (unitIt == unitInfoByInstance.end())
+                    {
+                        continue;
+                    }
+                    emitScatterInputsForUnit(instanceName);
+                    source << "  " << unitIt->second.memberName << "->eval();\n";
+                    emitGatherOutputsForUnit(instanceName);
+                    source << "\n";
                 }
-                emitGatherOutputsForUnit(instanceName);
-                source << "\n";
+            }
+            else
+            {
+                for (const auto &instanceName : manifest.serialEvalOrder)
+                {
+                    if (hasDebugPart && instanceName == "debug_part")
+                    {
+                        continue;
+                    }
+                    emitGatherOutputsForUnit(instanceName);
+                    source << "\n";
+                }
             }
             emitTopDrivenOutputs();
             source << "}\n";

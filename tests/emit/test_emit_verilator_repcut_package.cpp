@@ -318,9 +318,9 @@ int main()
         return fail("wrapper source missing expected scatter code");
     }
     if (!contains(wrapperSource, "unit_debug_part_->eval();") ||
-        !contains(wrapperSource, "logic_eval_fns_.emplace_back([this]() { unit_part_0_->eval(); });") ||
-        !contains(wrapperSource, "logic_eval_fns_.emplace_back([this]() { unit_part_1_->eval(); });") ||
-        !contains(wrapperSource, "run_part_eval_workers_();"))
+        !contains(wrapperSource, "unit_part_0_->eval();") ||
+        !contains(wrapperSource, "unit_part_1_->eval();") ||
+        !contains(wrapperSource, "Non-debug units have same-step dependencies; evaluate them serially in manifest order."))
     {
         return fail("wrapper source missing expected eval calls");
     }
@@ -340,18 +340,22 @@ int main()
     {
         return fail("wrapper source missing expected gather code");
     }
-    const std::size_t part1InputPos = wrapperSource.find("unit_part_1_->in_2 = signal_mid_;");
-    const std::size_t debugEvalPos = wrapperSource.find("unit_debug_part_->eval();");
-    const std::size_t partEvalPos = wrapperSource.find("run_part_eval_workers_();");
-    const std::size_t gatherPos = wrapperSource.find("signal_mid_ = unit_part_0_->out_0;");
+    const std::size_t part1InputPos = wrapperSource.rfind("  unit_part_1_->in_2 = signal_mid_;");
+    const std::size_t debugEvalPos = wrapperSource.find("  unit_debug_part_->eval();");
+    const std::size_t part0EvalPos = wrapperSource.find("  unit_part_0_->eval();");
+    const std::size_t part1ScatterPos = wrapperSource.rfind("  unit_part_1_->in_2 = signal_mid_;");
+    const std::size_t part1EvalPos = wrapperSource.find("  unit_part_1_->eval();");
+    const std::size_t gatherPos = wrapperSource.find("  signal_mid_ = unit_part_0_->out_0;");
     if (part1InputPos == std::string::npos || debugEvalPos == std::string::npos ||
-        partEvalPos == std::string::npos || gatherPos == std::string::npos)
+        part0EvalPos == std::string::npos || part1ScatterPos == std::string::npos ||
+        part1EvalPos == std::string::npos || gatherPos == std::string::npos)
     {
         return fail("wrapper source missing phase-order markers");
     }
-    if (!(part1InputPos < debugEvalPos && debugEvalPos < partEvalPos && partEvalPos < gatherPos))
+    if (!(debugEvalPos < part0EvalPos &&
+          part0EvalPos < gatherPos && gatherPos < part1ScatterPos && part1ScatterPos < part1EvalPos))
     {
-        return fail("wrapper source should scatter all inputs, eval debug_part first, then run parallel part eval, then gather outputs");
+        return fail("wrapper source should eval producer before scattering dependent consumer inputs in same-step unit chains");
     }
     if (!contains(wrapperSource, "const CData WolviRepCutVerilatorSim::const_sel_const_ = static_cast<CData>(0x1ULL);"))
     {

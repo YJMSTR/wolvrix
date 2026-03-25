@@ -5829,7 +5829,7 @@ namespace wolvrix::lib::emit
                 managedModuleFiles.insert(moduleName + ".sv");
             }
 
-            std::unordered_set<std::string> staleFiles = managedModuleFiles;
+            std::unordered_set<std::string> previousManagedFiles;
             if (std::ifstream staleManifest(staleManifestPath); staleManifest)
             {
                 std::string line;
@@ -5837,8 +5837,16 @@ namespace wolvrix::lib::emit
                 {
                     if (!line.empty())
                     {
-                        staleFiles.insert(line);
+                        previousManagedFiles.insert(line);
                     }
+                }
+            }
+            std::unordered_set<std::string> staleFiles;
+            for (const auto &name : previousManagedFiles)
+            {
+                if (managedModuleFiles.find(name) == managedModuleFiles.end())
+                {
+                    staleFiles.insert(name);
                 }
             }
 
@@ -5879,29 +5887,6 @@ namespace wolvrix::lib::emit
                 pendingWrites.push_back(PendingWrite{tempPath, outputPath, outputPath.string()});
             }
 
-            for (const auto &entry : std::filesystem::directory_iterator(outputDir))
-            {
-                if (entry.is_regular_file() &&
-                    entry.path().extension() == ".sv" &&
-                    staleFiles.find(entry.path().filename().string()) != staleFiles.end())
-                {
-                    std::error_code removeEc;
-                    std::filesystem::remove(entry.path(), removeEc);
-                    if (removeEc)
-                    {
-                        for (const auto &pending : pendingWrites)
-                        {
-                            std::error_code cleanupEc;
-                            std::filesystem::remove(pending.tempPath, cleanupEc);
-                        }
-                        reportError("failed to remove stale split-module file: " + entry.path().string(),
-                                    outputDir.string());
-                        result.success = false;
-                        return result;
-                    }
-                }
-            }
-
             for (const auto &pending : pendingWrites)
             {
                 std::error_code renameEc;
@@ -5919,6 +5904,24 @@ namespace wolvrix::lib::emit
                     return result;
                 }
                 result.artifacts.push_back(pending.artifactPath);
+            }
+
+            for (const auto &entry : std::filesystem::directory_iterator(outputDir))
+            {
+                if (entry.is_regular_file() &&
+                    entry.path().extension() == ".sv" &&
+                    staleFiles.find(entry.path().filename().string()) != staleFiles.end())
+                {
+                    std::error_code removeEc;
+                    std::filesystem::remove(entry.path(), removeEc);
+                    if (removeEc)
+                    {
+                        reportError("failed to remove stale split-module file: " + entry.path().string(),
+                                    outputDir.string());
+                        result.success = false;
+                        return result;
+                    }
+                }
             }
 
             {
