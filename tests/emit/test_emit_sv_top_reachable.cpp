@@ -72,6 +72,8 @@ Design buildDesign()
     addNoPortModuleRef(topA, OperationKind::kInstance, "u_mid", "mid");
     addNoPortModuleRef(topA, OperationKind::kBlackbox, "u_bb_leaf", "bb_leaf");
 
+    design.registerGraphAlias("top_a#(8)", topA);
+
     design.markAsTop("top_a");
     design.markAsTop("orphan");
     return design;
@@ -157,6 +159,10 @@ int main()
         singleOutput.find("module bb_leaf") == std::string::npos)
     {
         return fail("reachable single-file emit is missing expected modules");
+    }
+    if (singleOutput.find("module top_a#(8)") != std::string::npos)
+    {
+        return fail("single-file emit should keep canonical graph symbol instead of alias as module name");
     }
     if (singleOutput.find("module orphan") != std::string::npos)
     {

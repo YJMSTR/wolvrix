@@ -649,15 +649,109 @@ namespace wolvrix::lib::store
             return graphs;
         }
 
+        std::vector<const wolvrix::lib::grh::Graph *> reachableGraphsFromTops(
+            const wolvrix::lib::grh::Design &design,
+            std::span<const wolvrix::lib::grh::Graph *const> topGraphs)
+        {
+            std::unordered_set<std::string> reachableSymbols;
+            std::vector<const wolvrix::lib::grh::Graph *> worklist;
+            worklist.reserve(topGraphs.size());
+
+            for (const wolvrix::lib::grh::Graph *graph : topGraphs)
+            {
+                if (graph == nullptr)
+                {
+                    continue;
+                }
+                if (reachableSymbols.insert(graph->symbol()).second)
+                {
+                    worklist.push_back(graph);
+                }
+            }
+
+            for (std::size_t index = 0; index < worklist.size(); ++index)
+            {
+                const wolvrix::lib::grh::Graph *graph = worklist[index];
+                if (graph == nullptr)
+                {
+                    continue;
+                }
+
+                for (const auto opId : graph->operations())
+                {
+                    const auto kind = graph->opKind(opId);
+                    if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
+                        kind != wolvrix::lib::grh::OperationKind::kBlackbox)
+                    {
+                        continue;
+                    }
+
+                    const auto op = graph->getOperation(opId);
+                    const auto moduleAttr = op.attr("moduleName");
+                    if (!moduleAttr)
+                    {
+                        continue;
+                    }
+
+                    const auto *moduleName = std::get_if<std::string>(&*moduleAttr);
+                    if (moduleName == nullptr || moduleName->empty())
+                    {
+                        continue;
+                    }
+
+                    const wolvrix::lib::grh::Graph *targetGraph = design.findGraph(*moduleName);
+                    if (targetGraph == nullptr)
+                    {
+                        continue;
+                    }
+
+                    if (reachableSymbols.insert(targetGraph->symbol()).second)
+                    {
+                        worklist.push_back(targetGraph);
+                    }
+                }
+            }
+
+            std::vector<const wolvrix::lib::grh::Graph *> graphs;
+            graphs.reserve(reachableSymbols.size());
+            for (const auto &symbol : design.graphOrder())
+            {
+                if (reachableSymbols.find(symbol) == reachableSymbols.end())
+                {
+                    continue;
+                }
+                if (auto it = design.graphs().find(symbol); it != design.graphs().end())
+                {
+                    graphs.push_back(it->second.get());
+                }
+            }
+            return graphs;
+        }
+
         std::string serializeWithJsonWriter(const wolvrix::lib::grh::Design &design,
                                             std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
                                             bool pretty)
         {
+            const auto reachableGraphs = reachableGraphsFromTops(design, topGraphs);
+            std::unordered_set<std::string> reachableSymbols;
+            reachableSymbols.reserve(reachableGraphs.size());
+            for (const auto *graph : reachableGraphs)
+            {
+                if (graph != nullptr)
+                {
+                    reachableSymbols.insert(graph->symbol());
+                }
+            }
+
             auto collectAliases = [&](const wolvrix::lib::grh::Design &source)
                 -> std::vector<std::pair<std::string, std::string>> {
                 std::vector<std::pair<std::string, std::string>> result;
                 for (const auto &graphSymbol : source.graphOrder())
                 {
+                    if (reachableSymbols.find(graphSymbol) == reachableSymbols.end())
+                    {
+                        continue;
+                    }
                     for (const auto &alias : source.aliasesForGraph(graphSymbol))
                     {
                         result.emplace_back(alias, graphSymbol);
@@ -675,7 +769,7 @@ namespace wolvrix::lib::store
             const bool timingEnabled = jsonTimingEnabled();
             writer.writeProperty("graphs");
             writer.startArray();
-            for (const wolvrix::lib::grh::Graph *graph : graphsSortedByName(design))
+            for (const wolvrix::lib::grh::Graph *graph : reachableGraphs)
             {
                 TimingClock::time_point graphStart;
                 if (timingEnabled)
@@ -1665,6 +1759,16 @@ namespace wolvrix::lib::store
         {
             std::string out;
             int indent = 0;
+            const auto graphs = reachableGraphsFromTops(design, topGraphs);
+            std::unordered_set<std::string> reachableSymbols;
+            reachableSymbols.reserve(graphs.size());
+            for (const auto *graph : graphs)
+            {
+                if (graph != nullptr)
+                {
+                    reachableSymbols.insert(graph->symbol());
+                }
+            }
 
             out.push_back('{');
             indent = 1;
@@ -1673,7 +1777,6 @@ namespace wolvrix::lib::store
             appendQuotedString(out, "graphs");
             out.append(": [");
 
-            const auto graphs = graphsSortedByName(design);
             const bool timingEnabled = jsonTimingEnabled();
             const std::size_t progressStep = timingEnabled ? jsonTimingStep() : 0;
             if (!graphs.empty())
@@ -1725,6 +1828,10 @@ namespace wolvrix::lib::store
             std::vector<std::pair<std::string, std::string>> aliases;
             for (const auto &graphSymbol : design.graphOrder())
             {
+                if (reachableSymbols.find(graphSymbol) == reachableSymbols.end())
+                {
+                    continue;
+                }
                 for (const auto &alias : design.aliasesForGraph(graphSymbol))
                 {
                     aliases.emplace_back(alias, graphSymbol);
@@ -1854,6 +1961,7 @@ namespace wolvrix::lib::store
     {
         std::vector<const wolvrix::lib::grh::Graph *> result;
         std::unordered_set<std::string> seen;
+        bool hadMissingTop = false;
 
         auto tryAdd = [&](std::string_view name)
         {
@@ -1866,6 +1974,7 @@ namespace wolvrix::lib::store
             if (graph == nullptr)
             {
                 reportError("Top graph not found", std::string(name));
+                hadMissingTop = true;
                 return;
             }
 
@@ -1886,6 +1995,11 @@ namespace wolvrix::lib::store
             {
                 tryAdd(name);
             }
+        }
+
+        if (hadMissingTop)
+        {
+            result.clear();
         }
 
         return result;

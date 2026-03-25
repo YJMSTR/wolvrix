@@ -32,6 +32,7 @@ namespace
     {
         Design design;
         Graph &graph = design.createGraph("demo");
+        Graph &helper = design.createGraph("helper");
 
         ValueId in = graph.createValue(graph.internSymbol("in"), 8, false);
         graph.bindInputPort("in", in);
@@ -49,8 +50,17 @@ namespace
         graph.addOperand(assign, sum);
         graph.addResult(assign, out);
 
+        ValueId helperIn = helper.createValue(helper.internSymbol("in"), 8, false);
+        helper.bindInputPort("in", helperIn);
+        ValueId helperOut = helper.createValue(helper.internSymbol("out"), 8, false);
+        helper.bindOutputPort("out", helperOut);
+        OperationId helperAssign = helper.createOperation(OperationKind::kAssign, helper.internSymbol("assign_helper"));
+        helper.addOperand(helperAssign, helperIn);
+        helper.addResult(helperAssign, helperOut);
+
         design.registerGraphAlias("demo_alias", graph);
         design.markAsTop(graph.symbol());
+        design.markAsTop(helper.symbol());
         return design;
     }
 
@@ -83,6 +93,7 @@ int main()
     StoreJson emitterPrettyCompact(&diagPrettyCompact);
     StoreOptions prettyCompactOptions;
     prettyCompactOptions.outputDir = std::string(WOLF_SV_EMIT_ARTIFACT_DIR);
+    prettyCompactOptions.topOverrides = {"demo"};
 
     StoreResult prettyCompactResult = emitterPrettyCompact.store(design, prettyCompactOptions);
     if (!prettyCompactResult.success)
@@ -134,13 +145,32 @@ int main()
     {
         return fail("Round-trip parsed design missing demo graph");
     }
+    if (parsed.findGraph("helper"))
+    {
+        return fail("Top-filtered JSON should not serialize unrelated helper graph");
+    }
     Graph *aliasGraph = parsed.findGraph("demo_alias");
     if (!aliasGraph || aliasGraph->symbol() != "demo")
     {
         return fail("Round-trip parsed design missing alias mapping");
     }
 
-    // Case 3: compact mode should differ from prettyCompact output and avoid newlines.
+    // Case 3: unresolved topOverrides should fail atomically instead of returning partial JSON.
+    StoreDiagnostics diagMissingTop;
+    StoreJson emitterMissingTop(&diagMissingTop);
+    StoreOptions missingTopOptions = prettyCompactOptions;
+    missingTopOptions.topOverrides = {"demo", "missing_top"};
+    const auto missingTopJson = emitterMissingTop.storeToString(design, missingTopOptions);
+    if (missingTopJson.has_value())
+    {
+        return fail("storeToString should fail when any requested top is unresolved");
+    }
+    if (!diagMissingTop.hasError())
+    {
+        return fail("Expected diagnostics for unresolved topOverrides");
+    }
+
+    // Case 4: compact mode should differ from prettyCompact output and avoid newlines.
     StoreDiagnostics diagCompact;
     StoreJson emitterCompact(&diagCompact);
     StoreOptions compactOptions = prettyCompactOptions;

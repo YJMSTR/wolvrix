@@ -1250,15 +1250,6 @@ namespace wolvrix::lib::emit
             }
             const std::string &graphSymbol = graph->symbol();
             std::string emittedName = graphSymbol;
-            auto aliases = design.aliasesForGraph(graphSymbol);
-            for (const auto &alias : aliases)
-            {
-                if (usedModuleNames.find(alias) == usedModuleNames.end())
-                {
-                    emittedName = alias;
-                    break;
-                }
-            }
             usedModuleNames.insert(emittedName);
             emittedModuleNames.emplace(graphSymbol, std::move(emittedName));
         }
