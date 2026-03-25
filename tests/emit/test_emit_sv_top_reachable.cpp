@@ -159,10 +159,13 @@ int main()
     }
     if (singleOutput.find("module top_a") == std::string::npos ||
         singleOutput.find("module mid") == std::string::npos ||
-        singleOutput.find("module leaf") == std::string::npos ||
-        singleOutput.find("module bb_leaf") == std::string::npos)
+        singleOutput.find("module leaf") == std::string::npos)
     {
         return fail("reachable single-file emit is missing expected modules");
+    }
+    if (singleOutput.find("module bb_leaf") != std::string::npos)
+    {
+        return fail("top-reachable emit should not traverse blackbox module references into internal definitions");
     }
     if (singleOutput.find("module top_a#(8)") != std::string::npos)
     {
@@ -223,9 +226,9 @@ int main()
     {
         return fail("split-modules emit reported diagnostics errors");
     }
-    if (splitResult.artifacts.size() != 4)
+    if (splitResult.artifacts.size() != 3)
     {
-        return fail("split-modules emit should report exactly four artifacts");
+        return fail("split-modules emit should report exactly three artifacts for reachable instance graphs only");
     }
 
     std::set<std::string> artifactNames;
@@ -239,7 +242,7 @@ int main()
         artifactNames.insert(path.filename().string());
     }
 
-    const std::set<std::string> expectedArtifacts = {"bb_leaf.sv", "leaf.sv", "mid.sv", "top_a.sv"};
+    const std::set<std::string> expectedArtifacts = {"leaf.sv", "mid.sv", "top_a.sv"};
     if (artifactNames != expectedArtifacts)
     {
         return fail("split-modules artifact names do not match emitted module names");
@@ -262,9 +265,9 @@ int main()
     {
         return fail(verifyError);
     }
-    if (!verifySingleModuleFile(splitDir / "bb_leaf.sv", "bb_leaf", verifyError))
+    if (std::filesystem::exists(splitDir / "bb_leaf.sv"))
     {
-        return fail(verifyError);
+        return fail("split-modules emit should not materialize blackbox module references as internal module files");
     }
 
     const std::filesystem::path stalePath = splitDir / "stale_only.sv";
@@ -308,7 +311,6 @@ int main()
     }
     if (std::filesystem::exists(splitDir / "top_a.sv") ||
         std::filesystem::exists(splitDir / "mid.sv") ||
-        std::filesystem::exists(splitDir / "bb_leaf.sv") ||
         std::filesystem::exists(splitDir / "leaf.sv"))
     {
         return fail("split-modules re-emit should remove stale module files that are no longer reachable");
@@ -344,8 +346,7 @@ int main()
     }
     if (!std::filesystem::exists(failureDir / "top_a.sv") ||
         !std::filesystem::exists(failureDir / "mid.sv") ||
-        !std::filesystem::exists(failureDir / "leaf.sv") ||
-        !std::filesystem::exists(failureDir / "bb_leaf.sv"))
+        !std::filesystem::exists(failureDir / "leaf.sv"))
     {
         return fail("failed split-modules regeneration should preserve the previous emitted module set");
     }

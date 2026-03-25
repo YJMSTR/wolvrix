@@ -532,8 +532,7 @@ namespace wolvrix::lib::emit
                 for (const auto opId : graph->operations())
                 {
                     const auto kind = graph->opKind(opId);
-                    if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
-                        kind != wolvrix::lib::grh::OperationKind::kBlackbox)
+                    if (kind != wolvrix::lib::grh::OperationKind::kInstance)
                     {
                         continue;
                     }

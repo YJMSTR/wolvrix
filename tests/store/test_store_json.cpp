@@ -194,6 +194,21 @@ int main()
         return fail("top-filtered JSON should allow unresolved external blackboxes");
     }
 
+    // Case 3c: topOverrides should deduplicate alias/canonical duplicates after resolution.
+    StoreDiagnostics diagDedupAlias;
+    StoreJson emitterDedupAlias(&diagDedupAlias);
+    StoreOptions dedupAliasOptions = prettyCompactOptions;
+    dedupAliasOptions.topOverrides = {"demo", "demo_alias", "demo_alias"};
+    const auto dedupAliasJson = emitterDedupAlias.storeToString(design, dedupAliasOptions);
+    if (!dedupAliasJson.has_value() || diagDedupAlias.hasError())
+    {
+        return fail("top-filtered JSON with alias/canonical duplicates should still serialize");
+    }
+    if (dedupAliasJson->find("\"tops\":[\"demo\",\"demo\"") != std::string::npos)
+    {
+        return fail("top-filtered JSON should not duplicate tops after alias resolution");
+    }
+
     // Case 4: compact mode should differ from prettyCompact output and avoid newlines.
     StoreDiagnostics diagCompact;
     StoreJson emitterCompact(&diagCompact);

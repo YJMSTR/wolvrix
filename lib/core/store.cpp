@@ -680,8 +680,7 @@ namespace wolvrix::lib::store
                 for (const auto opId : graph->operations())
                 {
                     const auto kind = graph->opKind(opId);
-                    if (kind != wolvrix::lib::grh::OperationKind::kInstance &&
-                        kind != wolvrix::lib::grh::OperationKind::kBlackbox)
+                    if (kind != wolvrix::lib::grh::OperationKind::kInstance)
                     {
                         continue;
                     }
@@ -1969,11 +1968,6 @@ namespace wolvrix::lib::store
 
         auto tryAdd = [&](std::string_view name)
         {
-            if (seen.find(std::string(name)) != seen.end())
-            {
-                return;
-            }
-
             const wolvrix::lib::grh::Graph *graph = design.findGraph(name);
             if (graph == nullptr)
             {
@@ -1982,7 +1976,13 @@ namespace wolvrix::lib::store
                 return;
             }
 
-            seen.insert(std::string(graph->symbol()));
+            const std::string canonical = graph->symbol();
+            if (seen.find(canonical) != seen.end())
+            {
+                return;
+            }
+
+            seen.insert(canonical);
             result.push_back(graph);
         };
 
