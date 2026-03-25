@@ -338,11 +338,11 @@ namespace wolvrix::lib::emit
 
         std::optional<ManifestPort> parseEmittedSvPortLine(std::string_view line)
         {
-            static const std::regex kLogicPortRegex(
-                R"(^\s*(input|output|inout)\s+(?:(wire|reg)\s+)?(?:(signed)\s+)?(?:\[(\d+):(\d+)\]\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*,?\s*$)");
+            static const std::regex kPortRegex(
+                R"(^\s*(input|output|inout)\s+(?:(wire|reg|logic|real|string)\s+)?(?:(signed)\s+)?(?:\[(\d+):(\d+)\]\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*,?\s*$)");
 
             std::match_results<std::string_view::const_iterator> match;
-            if (!std::regex_match(line.begin(), line.end(), match, kLogicPortRegex))
+            if (!std::regex_match(line.begin(), line.end(), match, kPortRegex))
             {
                 return std::nullopt;
             }
@@ -399,7 +399,7 @@ namespace wolvrix::lib::emit
                 ports.push_back(*port);
             }
 
-            if (!inPortList || ports.empty())
+            if (!inPortList)
             {
                 throw std::runtime_error("Failed to parse emitted SV ports for module " +
                                          std::string(moduleName) + " from " + svPath.string());
@@ -2195,7 +2195,7 @@ namespace wolvrix::lib::emit
                 return result;
             }
 
-            *fileListStream << (packageDir / unit.sourceSv).generic_string() << '\n';
+            *fileListStream << unit.sourceSv << '\n';
             for (const auto *reachableGraph : reachableForUnit)
             {
                 if (!reachableGraph)
@@ -2207,7 +2207,7 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                *fileListStream << (packageDir / "sv" / (emittedNameIt->second + ".sv")).generic_string() << '\n';
+                *fileListStream << (std::filesystem::path("sv") / (emittedNameIt->second + ".sv")).generic_string() << '\n';
             }
             result.artifacts.push_back(fileListPath.string());
         }

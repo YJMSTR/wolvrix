@@ -257,20 +257,20 @@ int main()
     }
 
     if (readFile(debugFileList) !=
-        (artifactRoot / "sv" / "WolviRepCutUnit_debug_part.sv").generic_string() + "\n" +
-            (artifactRoot / "sv" / "SimTop_debug_part.sv").generic_string() + "\n")
+        (std::filesystem::path("sv") / "WolviRepCutUnit_debug_part.sv").generic_string() + "\n" +
+            (std::filesystem::path("sv") / "SimTop_debug_part.sv").generic_string() + "\n")
     {
         return fail("unexpected debug_part file list content");
     }
     if (readFile(part0FileList) !=
-        (artifactRoot / "sv" / "WolviRepCutUnit_part_0.sv").generic_string() + "\n" +
-            (artifactRoot / "sv" / "SimTop_logic_part_repcut_part0.sv").generic_string() + "\n")
+        (std::filesystem::path("sv") / "WolviRepCutUnit_part_0.sv").generic_string() + "\n" +
+            (std::filesystem::path("sv") / "SimTop_logic_part_repcut_part0.sv").generic_string() + "\n")
     {
         return fail("unexpected part_0 file list content");
     }
     if (readFile(part1FileList) !=
-        (artifactRoot / "sv" / "WolviRepCutUnit_part_1.sv").generic_string() + "\n" +
-            (artifactRoot / "sv" / "SimTop_logic_part_repcut_part1.sv").generic_string() + "\n")
+        (std::filesystem::path("sv") / "WolviRepCutUnit_part_1.sv").generic_string() + "\n" +
+            (std::filesystem::path("sv") / "SimTop_logic_part_repcut_part1.sv").generic_string() + "\n")
     {
         return fail("unexpected part_1 file list content");
     }
@@ -448,6 +448,56 @@ int main()
         if (res.success || !diags.hasError())
         {
             return fail("package emit should fail on unresolved nested blackboxes");
+        }
+    }
+
+    {
+        Design design;
+        design.createGraph("ZeroUnit");
+        Graph &top = design.createGraph("ZeroTop");
+        addInstance(top, "u_zero", "ZeroUnit", {}, {}, {}, {});
+        design.markAsTop("ZeroTop");
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_zero_port_unit").string();
+        opts.topOverrides = {"ZeroTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (!res.success || diags.hasError())
+        {
+            return fail("package emit should accept zero-port modules");
+        }
+    }
+
+    {
+        Design design;
+        Graph &unit = design.createGraph("RealUnit");
+        const auto unitIn = unit.createValue(unit.internSymbol("rin"), 1, false, ValueType::Real);
+        const auto unitOut = unit.createValue(unit.internSymbol("rout"), 1, false, ValueType::Real);
+        unit.bindInputPort("rin", unitIn);
+        unit.bindOutputPort("rout", unitOut);
+        const auto assign = unit.createOperation(OperationKind::kAssign, unit.makeInternalOpSym());
+        unit.addOperand(assign, unitIn);
+        unit.addResult(assign, unitOut);
+
+        Graph &top = design.createGraph("RealTop");
+        const auto topIn = top.createValue(top.internSymbol("rin"), 1, false, ValueType::Real);
+        const auto topOut = top.createValue(top.internSymbol("rout"), 1, false, ValueType::Real);
+        top.bindInputPort("rin", topIn);
+        top.bindOutputPort("rout", topOut);
+        addInstance(top, "u_real", "RealUnit", {topIn}, {topOut}, {"rin"}, {"rout"});
+        design.markAsTop("RealTop");
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_real_ports").string();
+        opts.topOverrides = {"RealTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (!res.success || diags.hasError())
+        {
+            return fail("package emit should accept emitted real ports");
         }
     }
 
