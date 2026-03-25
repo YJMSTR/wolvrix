@@ -90,9 +90,10 @@ namespace wolvrix::lib::emit
             return graphs;
         }
 
-        std::vector<const wolvrix::lib::grh::Graph *> reachableGraphsFromTops(
+        std::optional<std::vector<const wolvrix::lib::grh::Graph *>> reachableGraphsFromTops(
             const wolvrix::lib::grh::Design &design,
-            std::span<const wolvrix::lib::grh::Graph *const> topGraphs)
+            std::span<const wolvrix::lib::grh::Graph *const> topGraphs,
+            std::string &error)
         {
             std::unordered_set<std::string> reachableSymbols;
             std::vector<const wolvrix::lib::grh::Graph *> worklist;
@@ -133,7 +134,8 @@ namespace wolvrix::lib::emit
                     const auto *targetGraph = design.findGraph(*moduleName);
                     if (!targetGraph)
                     {
-                        continue;
+                        error = "reachable instance/blackbox target graph not found: " + *moduleName;
+                        return std::nullopt;
                     }
                     if (reachableSymbols.insert(targetGraph->symbol()).second)
                     {
@@ -1708,8 +1710,24 @@ namespace wolvrix::lib::emit
         }
 
         const wolvrix::lib::grh::Graph &topGraph = *topGraphs.front();
+        if (!topGraph.inoutPorts().empty())
+        {
+            reportError("emitVerilatorRepCutPackage does not support top-level inout ports", topGraph.symbol());
+            result.success = false;
+            return result;
+        }
         const std::filesystem::path packageDir = resolveOutputDir(options);
         const std::filesystem::path svDir = packageDir / "sv";
+
+        std::string reachableError;
+        const auto emittedGraphsOpt = reachableGraphsFromTops(design, topGraphs, reachableError);
+        if (!emittedGraphsOpt)
+        {
+            reportError(reachableError, topGraph.symbol());
+            result.success = false;
+            return result;
+        }
+        const std::vector<const wolvrix::lib::grh::Graph *> emittedGraphs = *emittedGraphsOpt;
 
         EmitSystemVerilog svEmitter(diagnostics());
         EmitOptions svOptions = options;
@@ -1727,8 +1745,6 @@ namespace wolvrix::lib::emit
         }
         result.artifacts = svResult.artifacts;
 
-        const std::vector<const wolvrix::lib::grh::Graph *> emittedGraphs =
-            reachableGraphsFromTops(design, topGraphs);
         if (emittedGraphs.size() != svResult.artifacts.size())
         {
             reportError("SV split emit artifacts do not match reachable graph count", topGraph.symbol());
@@ -2097,7 +2113,15 @@ namespace wolvrix::lib::emit
             }
 
             const std::array<const wolvrix::lib::grh::Graph *, 1> unitTopGraphs = {unitGraph};
-            const auto reachableForUnit = reachableGraphsFromTops(design, unitTopGraphs);
+            std::string unitReachableError;
+            const auto reachableForUnitOpt = reachableGraphsFromTops(design, unitTopGraphs, unitReachableError);
+            if (!reachableForUnitOpt)
+            {
+                reportError(unitReachableError, unit.moduleGraphName);
+                result.success = false;
+                return result;
+            }
+            const auto &reachableForUnit = *reachableForUnitOpt;
             const std::filesystem::path fileListPath = packageDir / "verilate" / (unit.instanceName + ".f");
             auto fileListStream = openOutputFile(fileListPath);
             if (!fileListStream)

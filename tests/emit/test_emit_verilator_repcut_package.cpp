@@ -385,5 +385,49 @@ int main()
         return fail("Makefile missing expected top-level build rules");
     }
 
+    {
+        Design design = buildDesign();
+        Graph *topWithInout = design.findGraph("SimTop");
+        if (!topWithInout)
+        {
+            return fail("missing SimTop graph for inout test");
+        }
+        const auto ioIn = topWithInout->createValue(topWithInout->internSymbol("io_in"), 1, false);
+        const auto ioOut = topWithInout->createValue(topWithInout->internSymbol("io_out"), 1, false);
+        const auto ioOe = topWithInout->createValue(topWithInout->internSymbol("io_oe"), 1, false);
+        topWithInout->bindInoutPort("io", ioIn, ioOut, ioOe);
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_inout").string();
+        opts.topOverrides = {"SimTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (res.success || !diags.hasError())
+        {
+            return fail("package emit should reject top-level inout ports");
+        }
+    }
+
+    {
+        Design design = buildDesign();
+        Graph &leafless = design.createGraph("NestedBlackboxLeaf");
+        addInstance(leafless, "u_missing", "MissingLeaf", {}, {}, {}, {});
+        Graph &top = design.createGraph("BlackboxTop");
+        addInstance(top, "u_nested", "NestedBlackboxLeaf", {}, {}, {}, {});
+        design.markAsTop("BlackboxTop");
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_missing_nested_blackbox").string();
+        opts.topOverrides = {"BlackboxTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (res.success || !diags.hasError())
+        {
+            return fail("package emit should fail on unresolved nested blackboxes");
+        }
+    }
+
     return 0;
 }
