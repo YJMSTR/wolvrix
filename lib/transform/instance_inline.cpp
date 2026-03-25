@@ -183,10 +183,13 @@ namespace wolvrix::lib::transform
             int suffix = 0;
             while (true)
             {
-                wolvrix::lib::grh::SymbolId sym = graph.internSymbol(candidate);
-                if (sym.valid())
+                const auto existingValue = graph.findValue(candidate);
+                const auto existingOp = graph.findOperation(candidate);
+                const auto existingSym = graph.lookupSymbol(candidate);
+                if (!existingValue.valid() && !existingOp.valid() &&
+                    (!existingSym.valid() || !graph.isDeclaredSymbol(existingSym)))
                 {
-                    return sym;
+                    return graph.internSymbol(candidate);
                 }
                 candidate = base + "_" + std::to_string(++suffix);
             }
@@ -489,6 +492,11 @@ namespace wolvrix::lib::transform
         {
             auto &source = *targetInfo.childGraph;
             auto &target = *targetInfo.parentGraph;
+            if (targetInfo.childGraph == targetInfo.parentGraph)
+            {
+                reporter.graphError(target, "instance-inline does not support self-inlining into the same graph");
+                return false;
+            }
 
             auto requireMappedPort = [&](wolvrix::lib::grh::ValueId valueId, std::string_view role) {
                 if (portMap.find(valueId) == portMap.end())

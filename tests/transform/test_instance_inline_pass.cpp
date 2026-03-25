@@ -216,5 +216,64 @@ int main()
         }
     }
 
+    {
+        wolvrix::lib::grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+
+        const auto childA = child.createValue(child.internSymbol("a"), 1, false);
+        const auto childY = child.createValue(child.internSymbol("y"), 1, false);
+        child.bindInputPort("a", childA);
+        child.bindOutputPort("y", childY);
+        const auto childAssign = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign, child.makeInternalOpSym());
+        child.addOperand(childAssign, childA);
+        child.addResult(childAssign, childY);
+
+        // Pre-create a colliding user-authored symbol that matches the first generated hierarchical name.
+        const auto collidingValue = top.createValue(top.internSymbol("u_child$a"), 1, false);
+        top.bindInputPort("colliding", collidingValue);
+        const auto topA = top.createValue(top.internSymbol("a"), 1, false);
+        const auto topY = top.createValue(top.internSymbol("y"), 1, false);
+        top.bindInputPort("a", topA);
+        top.bindOutputPort("y", topY);
+        const auto topChildInst = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topChildInst, topA);
+        top.addResult(topChildInst, topY);
+        top.setAttr(topChildInst, "moduleName", std::string("child"));
+        top.setAttr(topChildInst, "instanceName", std::string("u_child"));
+        top.setAttr(topChildInst, "inputPortName", std::vector<std::string>{"a"});
+        top.setAttr(topChildInst, "outputPortName", std::vector<std::string>{"y"});
+
+        PassDiagnostics diags;
+        if (!runInlinePass(design, "top.u_child", diags, true))
+        {
+            return fail("Expected instance-inline to handle hierarchical symbol collisions by generating a unique name");
+        }
+    }
+
+    {
+        wolvrix::lib::grh::Design design;
+        auto &self = design.createGraph("self");
+        design.markAsTop("self");
+        const auto in = self.createValue(self.internSymbol("a"), 1, false);
+        const auto out = self.createValue(self.internSymbol("y"), 1, false);
+        self.bindInputPort("a", in);
+        self.bindOutputPort("y", out);
+        const auto selfInst = self.createOperation(wolvrix::lib::grh::OperationKind::kInstance, self.makeInternalOpSym());
+        self.addOperand(selfInst, in);
+        self.addResult(selfInst, out);
+        self.setAttr(selfInst, "moduleName", std::string("self"));
+        self.setAttr(selfInst, "instanceName", std::string("u_self"));
+        self.setAttr(selfInst, "inputPortName", std::vector<std::string>{"a"});
+        self.setAttr(selfInst, "outputPortName", std::vector<std::string>{"y"});
+
+        PassDiagnostics diags;
+        if (!runInlinePass(design, "self.u_self", diags, false))
+        {
+            return fail("Expected instance-inline to reject self-inlining");
+        }
+    }
+
     return 0;
 }
