@@ -1151,6 +1151,12 @@ namespace
         std::filesystem::path out_path(output);
         if (options.splitModules)
         {
+            if (out_path.empty())
+            {
+                PyErr_SetString(PyExc_ValueError,
+                                "write_sv(..., split_modules=True) expects a non-empty output directory path");
+                return nullptr;
+            }
             if (out_path.has_extension() && out_path.extension() == ".sv")
             {
                 PyErr_SetString(PyExc_ValueError,

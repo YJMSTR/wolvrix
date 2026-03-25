@@ -5866,7 +5866,9 @@ namespace wolvrix::lib::emit
             {
                 std::filesystem::path tempPath;
                 std::filesystem::path finalPath;
+                std::filesystem::path backupPath;
                 std::string artifactPath;
+                bool hadExistingFile = false;
             };
             std::vector<PendingWrite> pendingWrites;
             pendingWrites.reserve(emittedGraphs.size());
@@ -5883,6 +5885,7 @@ namespace wolvrix::lib::emit
                     moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
                 const std::filesystem::path outputPath = outputDir / (moduleName + ".sv");
                 const std::filesystem::path tempPath = outputDir / ("." + moduleName + ".sv.tmp");
+                const std::filesystem::path backupPath = outputDir / ("." + moduleName + ".sv.bak");
                 auto stream = openOutputFile(tempPath);
                 if (!stream)
                 {
@@ -5896,11 +5899,53 @@ namespace wolvrix::lib::emit
                 }
 
                 emitGraph(graph, *stream);
-                pendingWrites.push_back(PendingWrite{tempPath, outputPath, outputPath.string()});
+                pendingWrites.push_back(PendingWrite{tempPath,
+                                                     outputPath,
+                                                     backupPath,
+                                                     outputPath.string(),
+                                                     std::filesystem::exists(outputPath)});
             }
+
+            auto restoreBackups = [&]() {
+                for (const auto &pending : pendingWrites)
+                {
+                    if (!pending.hadExistingFile)
+                    {
+                        continue;
+                    }
+                    if (!std::filesystem::exists(pending.backupPath))
+                    {
+                        continue;
+                    }
+                    std::error_code cleanupEc;
+                    std::filesystem::remove(pending.finalPath, cleanupEc);
+                    cleanupEc.clear();
+                    std::filesystem::rename(pending.backupPath, pending.finalPath, cleanupEc);
+                }
+            };
 
             for (const auto &pending : pendingWrites)
             {
+                if (pending.hadExistingFile)
+                {
+                    std::error_code backupEc;
+                    std::filesystem::remove(pending.backupPath, backupEc);
+                    backupEc.clear();
+                    std::filesystem::rename(pending.finalPath, pending.backupPath, backupEc);
+                    if (backupEc)
+                    {
+                        for (const auto &cleanup : pendingWrites)
+                        {
+                            std::error_code cleanupEc;
+                            std::filesystem::remove(cleanup.tempPath, cleanupEc);
+                        }
+                        reportError("failed to stage previous split-module file for rollback: " + pending.finalPath.string(),
+                                    outputDir.string());
+                        result.success = false;
+                        return result;
+                    }
+                }
+
                 std::error_code publishEc;
                 std::filesystem::copy_file(pending.tempPath,
                                            pending.finalPath,
@@ -5913,6 +5958,7 @@ namespace wolvrix::lib::emit
                         std::error_code cleanupEc;
                         std::filesystem::remove(cleanup.tempPath, cleanupEc);
                     }
+                    restoreBackups();
                     reportError("failed to publish split-module file: " + pending.finalPath.string(),
                                 outputDir.string());
                     result.success = false;
@@ -5920,6 +5966,11 @@ namespace wolvrix::lib::emit
                 }
                 std::error_code cleanupEc;
                 std::filesystem::remove(pending.tempPath, cleanupEc);
+                if (pending.hadExistingFile)
+                {
+                    cleanupEc.clear();
+                    std::filesystem::remove(pending.backupPath, cleanupEc);
+                }
                 result.artifacts.push_back(pending.artifactPath);
             }
 
