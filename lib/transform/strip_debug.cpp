@@ -533,6 +533,14 @@ namespace wolvrix::lib::transform
                     }
                 }
                 needsClone = (instanceCount > 1);
+                if (!needsClone)
+                {
+                    const bool isAlsoTop = std::find(design().topGraphs().begin(),
+                                                     design().topGraphs().end(),
+                                                     topName) != design().topGraphs().end();
+                    const bool hasAliases = !design().aliasesForGraph(topName).empty();
+                    needsClone = isAlsoTop || hasAliases;
+                }
             }
 
             // If this is an instance-scoped target, clone the module to avoid affecting other instances

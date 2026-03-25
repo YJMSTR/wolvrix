@@ -602,8 +602,8 @@ namespace wolvrix::lib::transform
                         graph,
                         outValue.width(),
                         outValue.isSigned(),
-                        makeIntLiteral(outValue.width(), 0),
-                        "read_default_zero");
+                        std::to_string(outValue.width()) + "'hx",
+                        "read_default_unknown");
 
                     for (int64_t i = row - 1; i >= 0; --i)
                     {

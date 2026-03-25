@@ -394,6 +394,64 @@ int runInstancePathTest()
     return 0;
 }
 
+int runInstancePathSharedTopTest()
+{
+    wolvrix::lib::grh::Design design;
+    wolvrix::lib::grh::Graph &child = design.createGraph("child");
+    wolvrix::lib::grh::Graph &top = design.createGraph("top");
+
+    auto makeChildValue = [&](const std::string &name) {
+        wolvrix::lib::grh::SymbolId sym = child.internSymbol(name);
+        return child.createValue(sym, 1, false);
+    };
+    auto makeTopValue = [&](const std::string &name) {
+        wolvrix::lib::grh::SymbolId sym = top.internSymbol(name);
+        return top.createValue(sym, 1, false);
+    };
+
+    wolvrix::lib::grh::ValueId childIn = makeChildValue("a");
+    wolvrix::lib::grh::ValueId childOut = makeChildValue("y");
+    child.bindInputPort("a", childIn);
+    child.bindOutputPort("y", childOut);
+    const auto sysTask = child.createOperation(wolvrix::lib::grh::OperationKind::kSystemTask, child.internSymbol("child_debug_task"));
+    child.addOperand(sysTask, childIn);
+    child.setAttr(sysTask, "name", std::string("$display"));
+    const auto assign = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign, child.internSymbol("assign_y"));
+    child.addOperand(assign, childIn);
+    child.addResult(assign, childOut);
+
+    wolvrix::lib::grh::ValueId topIn = makeTopValue("a");
+    wolvrix::lib::grh::ValueId topOut = makeTopValue("y");
+    top.bindInputPort("a", topIn);
+    top.bindOutputPort("y", topOut);
+    const auto inst = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.internSymbol("u_child"));
+    top.addOperand(inst, topIn);
+    top.addResult(inst, topOut);
+    top.setAttr(inst, "moduleName", std::string("child"));
+    top.setAttr(inst, "instanceName", std::string("u_child"));
+    top.setAttr(inst, "inputPortName", std::vector<std::string>{"a"});
+    top.setAttr(inst, "outputPortName", std::vector<std::string>{"y"});
+
+    design.markAsTop("top");
+    design.markAsTop("child");
+
+    PassManager manager;
+    manager.addPass(std::make_unique<StripDebugPass>(StripDebugOptions{.path = "top.u_child"}));
+    PassDiagnostics diags;
+    const auto res = manager.run(design, diags);
+    if (!res.success || diags.hasError())
+    {
+        return fail("Expected strip-debug to succeed when target graph is also a top");
+    }
+
+    auto *originalChild = design.findGraph("child");
+    if (!originalChild || !originalChild->findOperation("child_debug_task").valid())
+    {
+        return fail("Instance-scoped strip-debug should preserve the original shared top graph");
+    }
+    return 0;
+}
+
 int main()
 {
     if (int rc = runBasicTest())
@@ -405,6 +463,10 @@ int main()
         return rc;
     }
     if (int rc = runInstancePathTest())
+    {
+        return rc;
+    }
+    if (int rc = runInstancePathSharedTopTest())
     {
         return rc;
     }

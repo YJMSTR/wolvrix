@@ -55,8 +55,38 @@ bool isConstOne(const grh::Graph &graph, grh::ValueId valueId)
         return false;
     }
 
-    const auto literal = constantLiteral(defOp);
-    return literal == "1'b1" || literal == "1'h1" || literal == "1";
+    auto literal = constantLiteral(defOp);
+    literal.erase(std::remove_if(literal.begin(), literal.end(), [](unsigned char ch) {
+        return std::isspace(ch) || ch == '_';
+    }), literal.end());
+    std::transform(literal.begin(), literal.end(), literal.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (literal == "1")
+    {
+        return true;
+    }
+    const auto quotePos = literal.find('\'');
+    if (quotePos == std::string::npos)
+    {
+        return false;
+    }
+    std::size_t digitsPos = quotePos + 1;
+    if (digitsPos < literal.size() && literal[digitsPos] == 's')
+    {
+        ++digitsPos;
+    }
+    if (digitsPos < literal.size() && (literal[digitsPos] == 'b' || literal[digitsPos] == 'o' ||
+                                       literal[digitsPos] == 'd' || literal[digitsPos] == 'h'))
+    {
+        ++digitsPos;
+    }
+    if (digitsPos >= literal.size())
+    {
+        return false;
+    }
+    const auto digits = literal.substr(digitsPos);
+    return digits == "1";
 }
 
 } // namespace

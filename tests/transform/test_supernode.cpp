@@ -1356,6 +1356,39 @@ void testPartitionerReducesEdgesOnBranchedDagFixture()
     expect(sg.edgeCount() == 2, "branched DAG fixture should collapse to exactly two remaining cut edges");
 }
 
+void testPartitionerTreatsDecimalOneEnableAsUnconditional()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst"), 1, false);
+    const auto mask = makeConstant(graph, "mask_dec_one", "mask_const_dec_one", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero_dec_one", "zero_const_dec_one", 8, "8'h00");
+    const auto one = makeConstant(graph, "one_dec_one", "one_const_dec_one", 1, "1'd1");
+    const auto data = graph.createValue(graph.internSymbol("data_dec_one"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a_dec_one", "mux_a_dec_one", rst, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b_dec_one", "mux_b_dec_one", rst, zero, data, 8);
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a_dec_one", one, nextA, mask, clk, "reg_a_dec_one");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b_dec_one", one, nextB, mask, clk, "reg_b_dec_one");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(8);
+    partitioner.partition();
+
+    expect(sg.nodeCount() == 1,
+           "decimal constant-one enables should be treated as unconditional and allow compatible merges");
+}
+
 void testPartitionPassBuildsTotalGraphScratchpadCoverage()
 {
     grh::Design design;
@@ -1536,6 +1569,7 @@ int main()
         testPartitionerDoesNotMergeDifferentResetSemantics();
         testPartitionerCanMergeIdenticalResetTrees();
         testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn();
+        testPartitionerTreatsDecimalOneEnableAsUnconditional();
         testPartitionerPeerReportsExactCutCosts();
         testPartitionerPeerReportsExactBacktrackedCuts();
         testPartitionerFindsStableTwoWayCut();
