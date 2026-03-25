@@ -1,6 +1,7 @@
 #include "transform/supernode_coarsener.hpp"
 #include "transform/supernode_control.hpp"
 #include <algorithm>
+#include <sstream>
 #include <unordered_map>
 
 namespace wolvrix::lib::transform
