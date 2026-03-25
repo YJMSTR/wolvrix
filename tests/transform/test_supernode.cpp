@@ -1432,6 +1432,59 @@ void testPartitionPassRejectsSharedCrossDomainLogic()
     expect(sawExpectedDiagnostic, "expected exact supernode-partition cross-domain diagnostic");
 }
 
+void testTimingDomainAnalyzerAllowsSharedConstantAcrossDomains()
+{
+    // Regression: shared kConstant should NOT be marked as cross_domain.
+    // Two timing domains sharing the same constant (e.g., a shared enable or mask literal)
+    // is legal and should not cause SuperNodePartitionPass to reject the design.
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clkA = graph.createValue(graph.internSymbol("clk_a"), 1, false);
+    const auto clkB = graph.createValue(graph.internSymbol("clk_b"), 1, false);
+    const auto dataA = graph.createValue(graph.internSymbol("data_a"), 8, false);
+    const auto dataB = graph.createValue(graph.internSymbol("data_b"), 8, false);
+
+    // Shared constant used by both domains
+    const auto sharedConst = makeConstant(graph, "shared_const", "shared_const_op", 8, "8'hFF");
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+
+    // Domain A register write using shared constant
+    makeRegisterWrite(graph, "reg_write_a", one, sharedConst, mask, clkA, "reg_a");
+    // Domain B register write using the same shared constant
+    makeRegisterWrite(graph, "reg_write_b", one, sharedConst, mask, clkB, "reg_b");
+
+    TimingDomainAnalyzer analyzer(graph);
+    const auto domains = analyzer.assignTimingDomains();
+
+    // Find the shared constant op
+    const auto sharedConstOp = graph.getValue(sharedConst).definingOp();
+    expect(sharedConstOp.valid(), "shared constant should have a defining op");
+
+    // The shared constant should NOT be marked as cross_domain
+    const auto it = domains.find(sharedConstOp);
+    expect(it != domains.end(), "shared constant should have a domain assignment");
+    expect(it->second != "cross_domain",
+           "shared kConstant should NOT be marked as cross_domain even when used by multiple timing domains");
+
+    // Also verify no cross-domain edges are detected for this legal design
+    const auto crossDomainEdges = analyzer.findCrossDomainEdges();
+    for (const auto &[src, dst] : crossDomainEdges)
+    {
+        // Neither endpoint should be the shared constant
+        expect(src != sharedConstOp && dst != sharedConstOp,
+               "shared constant should not appear in cross-domain edges");
+    }
+
+    // The partition pass should succeed (not reject due to cross_domain)
+    PassManager manager;
+    manager.addPass(std::make_unique<SuperNodePartitionPass>());
+    PassDiagnostics diags;
+    const auto result = manager.run(design, diags);
+    expect(result.success, "design with shared constant across domains should not be rejected");
+}
+
 void testPartitionPassIsScratchpadOnly()
 {
     grh::Design design;
@@ -1491,6 +1544,7 @@ int main()
         testPartitionerReducesEdgesOnBranchedDagFixture();
         testPartitionPassBuildsTotalGraphScratchpadCoverage();
         testPartitionPassRejectsSharedCrossDomainLogic();
+        testTimingDomainAnalyzerAllowsSharedConstantAcrossDomains();
         testPartitionPassIsScratchpadOnly();
     }
     catch (const std::exception &ex)

@@ -483,7 +483,8 @@ namespace wolvrix::lib::transform
             std::string_view instanceBase,
             const wolvrix::lib::grh::Graph &target,
             const std::unordered_map<std::string, wolvrix::lib::grh::ValueId> &inputMapping,
-            const std::unordered_map<std::string, wolvrix::lib::grh::ValueId> &outputMapping)
+            const std::unordered_map<std::string, wolvrix::lib::grh::ValueId> &outputMapping,
+            const std::unordered_map<std::string, std::tuple<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId>> &inoutMapping = {})
         {
             const std::string opBase = std::string("inst_") + std::string(instanceBase);
             const wolvrix::lib::grh::SymbolId opSym = internUniqueSymbol(parent, opBase);
@@ -502,8 +503,15 @@ namespace wolvrix::lib::transform
             {
                 outputNames.push_back(port.name);
             }
+            std::vector<std::string> inoutNames;
+            inoutNames.reserve(target.inoutPorts().size());
+            for (const auto &port : target.inoutPorts())
+            {
+                inoutNames.push_back(port.name);
+            }
             parent.setAttr(inst, "inputPortName", inputNames);
             parent.setAttr(inst, "outputPortName", outputNames);
+            parent.setAttr(inst, "inoutPortName", inoutNames);
             parent.setAttr(inst, "instanceName", std::string(instanceBase));
 
             for (const auto &portName : inputNames)
@@ -520,6 +528,18 @@ namespace wolvrix::lib::transform
                 if (it != outputMapping.end())
                 {
                     parent.addResult(inst, it->second);
+                }
+            }
+            // Connect inout ports: in, out, oe (in that order)
+            for (const auto &portName : inoutNames)
+            {
+                auto it = inoutMapping.find(portName);
+                if (it != inoutMapping.end())
+                {
+                    const auto &[inVal, outVal, oeVal] = it->second;
+                    parent.addOperand(inst, inVal);
+                    parent.addOperand(inst, outVal);
+                    parent.addOperand(inst, oeVal);
                 }
             }
             return inst;
@@ -3914,6 +3934,8 @@ namespace wolvrix::lib::transform
             std::string name;
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> inputPortByValue;
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> outputPortByValue;
+            // For inout ports: maps port name to (inValue, outValue, oeValue)
+            std::unordered_map<std::string, std::tuple<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId>> inoutPortByName;
         };
 
         std::vector<PartitionGraphInfo> partInfos;
@@ -4189,6 +4211,57 @@ namespace wolvrix::lib::transform
                 info.outputPortByValue.emplace(valueId, portName);
             }
 
+            // Handle inout ports: if an inout port's values are used in this partition, create corresponding inout port
+            for (const auto &inoutPort : graph->inoutPorts())
+            {
+                // Check if any of the inout port's values are used in this partition
+                auto inIt = valueMap.find(inoutPort.in);
+                auto outIt = valueMap.find(inoutPort.out);
+                auto oeIt = valueMap.find(inoutPort.oe);
+
+                // For an inout port to be included, at least the 'in' value should be in the partition
+                if (inIt != valueMap.end())
+                {
+                    const std::string portName = uniquePortName(usedPortNames, "inout_" + inoutPort.name);
+                    wolvrix::lib::grh::ValueId inVal = inIt->second;
+                    // For 'out' and 'oe', use mapped value if available, otherwise create a new value
+                    wolvrix::lib::grh::ValueId outVal;
+                    wolvrix::lib::grh::ValueId oeVal;
+                    if (outIt != valueMap.end())
+                    {
+                        outVal = outIt->second;
+                    }
+                    else
+                    {
+                        // Create a placeholder value for output
+                        const auto vinfoIt = valueInfos.find(inoutPort.out);
+                        const std::string outName = portName + "_out";
+                        const wolvrix::lib::grh::SymbolId outSym = internUniqueSymbol(partGraph, outName);
+                        outVal = partGraph.createValue(outSym,
+                                                       vinfoIt != valueInfos.end() ? vinfoIt->second.width : 1,
+                                                       vinfoIt != valueInfos.end() ? vinfoIt->second.isSigned : false,
+                                                       vinfoIt != valueInfos.end() ? vinfoIt->second.type : wolvrix::lib::grh::ValueType::Logic);
+                    }
+                    if (oeIt != valueMap.end())
+                    {
+                        oeVal = oeIt->second;
+                    }
+                    else
+                    {
+                        // Create a placeholder value for oe
+                        const auto vinfoIt = valueInfos.find(inoutPort.oe);
+                        const std::string oeName = portName + "_oe";
+                        const wolvrix::lib::grh::SymbolId oeSym = internUniqueSymbol(partGraph, oeName);
+                        oeVal = partGraph.createValue(oeSym,
+                                                      vinfoIt != valueInfos.end() ? vinfoIt->second.width : 1,
+                                                      vinfoIt != valueInfos.end() ? vinfoIt->second.isSigned : false,
+                                                      vinfoIt != valueInfos.end() ? vinfoIt->second.type : wolvrix::lib::grh::ValueType::Logic);
+                    }
+                    partGraph.bindInoutPort(portName, inVal, outVal, oeVal);
+                    info.inoutPortByName.emplace(portName, std::make_tuple(inVal, outVal, oeVal));
+                }
+            }
+
             partInfos.push_back(std::move(info));
             logInfo("repcut phase-e rebuild: partition_clone_done index=" +
                     std::to_string(p + 1) + "/" + std::to_string(partitionOps.size()) +
@@ -4319,11 +4392,12 @@ namespace wolvrix::lib::transform
         }
 
         const std::string topName = graph->symbol();
+        const std::string tempTopName = topName + "_repcut_new";
         logInfo("repcut phase-e rebuild: rebuilding top graph graph=" + topName +
                 " aliases=" + std::to_string(topAliases.size()) +
                 " was_top=" + std::string(wasTop ? "true" : "false"));
-        design().deleteGraph(topName);
-        wolvrix::lib::grh::Graph &newTop = design().createGraph(topName);
+        // Create new graph with temporary name first; only delete original after successful rebuild
+        wolvrix::lib::grh::Graph &newTop = design().createGraph(tempTopName);
 
         std::unordered_map<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash>
             topValueBySource;
@@ -4650,7 +4724,14 @@ namespace wolvrix::lib::transform
                 return result;
             }
 
-            buildInstance(newTop, part.graph->symbol(), "part_" + std::to_string(p), *part.graph, inputMapping, outputMapping);
+            // Build inout mapping for this partition instance
+            std::unordered_map<std::string, std::tuple<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueId>> inoutMapping;
+            for (const auto &[portName, tuple] : part.inoutPortByName)
+            {
+                inoutMapping.emplace(portName, tuple);
+            }
+
+            buildInstance(newTop, part.graph->symbol(), "part_" + std::to_string(p), *part.graph, inputMapping, outputMapping, inoutMapping);
             if (((p + 1) % 8) == 0 || (p + 1) == partInfos.size())
             {
                 logInfo("repcut phase-e rebuild: instance_wiring_progress done=" +
@@ -4675,6 +4756,12 @@ namespace wolvrix::lib::transform
         {
             design().markAsTop(topName);
         }
+
+        // Rebuild successful: now replace original graph with new one
+        design().deleteGraph(topName);
+        wolvrix::lib::grh::Graph &finalTop = design().cloneGraph(tempTopName, topName);
+        design().deleteGraph(tempTopName);
+        (void)finalTop;
 
         result.changed = true;
 

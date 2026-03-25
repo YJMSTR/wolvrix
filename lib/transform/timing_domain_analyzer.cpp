@@ -156,12 +156,20 @@ TimingDomainAnalyzer::assignTimingDomains() {
     }
 
     // Assign domains: single-domain ops get their domain, multi-domain ops are cross-domain
+    // Exception: kConstant ops are never marked as cross_domain (sharing constants is legal)
     for (const auto& [opId, domains] : opDomainCandidates) {
         if (domains.size() == 1) {
             result[opId] = *domains.begin();
         } else {
-            // Shared combinational logic - mark as cross-domain
-            result[opId] = "cross_domain";
+            // Check if this is a constant op - constants should not be marked cross_domain
+            auto op = graph_.getOperation(opId);
+            if (op.kind() == grh::OperationKind::kConstant) {
+                // Shared constants remain combinational (sharing constants across clocks is legal)
+                result[opId] = "combinational";
+            } else {
+                // Shared combinational logic - mark as cross-domain
+                result[opId] = "cross_domain";
+            }
         }
     }
 
