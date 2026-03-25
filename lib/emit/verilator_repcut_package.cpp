@@ -340,7 +340,7 @@ namespace wolvrix::lib::emit
         std::optional<ManifestPort> parseEmittedSvPortLine(std::string_view line)
         {
             static const std::regex kPortRegex(
-                R"(^\s*(input|output|inout)\s+(?:(wire|reg|logic|real|string)\s+)?(?:(signed)\s+)?(?:\[(\d+):(\d+)\]\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*,?\s*$)");
+                R"(^\s*(input|output|inout)\s+(?:(wire|reg|logic|real|string)\s+)?(?:(signed)\s+)?(?:\[(\d+):(\d+)\]\s+)?((?:\\[^,()]+)|(?:[A-Za-z_$][A-Za-z0-9_$]*))\s*,?\s*$)");
 
             std::match_results<std::string_view::const_iterator> match;
             if (!std::regex_match(line.begin(), line.end(), match, kPortRegex))

@@ -556,5 +556,36 @@ int main()
         }
     }
 
+    {
+        Design design = buildDesign();
+        Graph &unit = design.createGraph("DollarUnit");
+        const auto in = unit.createValue(unit.internSymbol("sig$in"), 1, false);
+        const auto out = unit.createValue(unit.internSymbol("sig$out"), 1, false);
+        unit.bindInputPort("sig$in", in);
+        unit.bindOutputPort("sig$out", out);
+        const auto assign = unit.createOperation(OperationKind::kAssign, unit.makeInternalOpSym());
+        unit.addOperand(assign, in);
+        unit.addResult(assign, out);
+
+        Graph &top = design.createGraph("DollarTop");
+        const auto topIn = top.createValue(top.internSymbol("sig$in"), 1, false);
+        const auto topOut = top.createValue(top.internSymbol("sig$out"), 1, false);
+        top.bindInputPort("sig$in", topIn);
+        top.bindOutputPort("sig$out", topOut);
+        addInstance(top, "u_dollar", "DollarUnit", {topIn}, {topOut}, {"sig$in"}, {"sig$out"});
+        design.markAsTop("DollarTop");
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_dollar_ports").string();
+        opts.topOverrides = {"DollarTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (!res.success || diags.hasError())
+        {
+            return fail("package emit should accept legal SV identifiers containing $");
+        }
+    }
+
     return 0;
 }
