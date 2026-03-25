@@ -1389,6 +1389,39 @@ void testPartitionerTreatsDecimalOneEnableAsUnconditional()
            "decimal constant-one enables should be treated as unconditional and allow compatible merges");
 }
 
+void testPartitionerTreatsPaddedConstOneEnableAsUnconditional()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk_pad_one"), 1, false);
+    const auto rst = graph.createValue(graph.internSymbol("rst_pad_one"), 1, false);
+    const auto mask = makeConstant(graph, "mask_pad_one", "mask_const_pad_one", 8, "8'hff");
+    const auto zero = makeConstant(graph, "zero_pad_one", "zero_const_pad_one", 8, "8'h00");
+    const auto one = makeConstant(graph, "one_pad_one", "one_const_pad_one", 2, "2'b01");
+    const auto data = graph.createValue(graph.internSymbol("data_pad_one"), 8, false);
+
+    const auto nextA = makeMux(graph, "next_a_pad_one", "mux_a_pad_one", rst, zero, data, 8);
+    const auto nextB = makeMux(graph, "next_b_pad_one", "mux_b_pad_one", rst, zero, data, 8);
+    const auto writeA = makeRegisterWrite(graph, "reg_write_a_pad_one", one, nextA, mask, clk, "reg_a_pad_one");
+    const auto writeB = makeRegisterWrite(graph, "reg_write_b_pad_one", one, nextB, mask, clk, "reg_b_pad_one");
+
+    SuperNodeGraph sg;
+    const auto snA = sg.createSuperNode();
+    const auto snB = sg.createSuperNode();
+    sg.addMember(snA, writeA);
+    sg.addMember(snB, writeB);
+    sg.getNode(snA).timingDomain = "domain_0";
+    sg.getNode(snB).timingDomain = "domain_0";
+
+    SuperNodePartitioner partitioner(sg, graph);
+    partitioner.setMaxSuperNodeSize(8);
+    partitioner.partition();
+
+    expect(sg.nodeCount() == 1,
+           "zero-padded constant-one enables should be treated as unconditional and allow compatible merges");
+}
+
 void testPartitionPassBuildsTotalGraphScratchpadCoverage()
 {
     grh::Design design;
@@ -1570,6 +1603,7 @@ int main()
         testPartitionerCanMergeIdenticalResetTrees();
         testPartitionerAllowsResetWriteToMergeWithCombinationalFanIn();
         testPartitionerTreatsDecimalOneEnableAsUnconditional();
+        testPartitionerTreatsPaddedConstOneEnableAsUnconditional();
         testPartitionerPeerReportsExactCutCosts();
         testPartitionerPeerReportsExactBacktrackedCuts();
         testPartitionerFindsStableTwoWayCut();

@@ -5902,9 +5902,12 @@ namespace wolvrix::lib::emit
 
             for (const auto &pending : pendingWrites)
             {
-                std::error_code renameEc;
-                std::filesystem::rename(pending.tempPath, pending.finalPath, renameEc);
-                if (renameEc)
+                std::error_code publishEc;
+                std::filesystem::copy_file(pending.tempPath,
+                                           pending.finalPath,
+                                           std::filesystem::copy_options::overwrite_existing,
+                                           publishEc);
+                if (publishEc)
                 {
                     for (const auto &cleanup : pendingWrites)
                     {
@@ -5916,6 +5919,8 @@ namespace wolvrix::lib::emit
                     result.success = false;
                     return result;
                 }
+                std::error_code cleanupEc;
+                std::filesystem::remove(pending.tempPath, cleanupEc);
                 result.artifacts.push_back(pending.artifactPath);
             }
 

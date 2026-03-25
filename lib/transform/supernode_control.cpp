@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <sstream>
 
+#include "slang/numeric/SVInt.h"
+
 namespace wolvrix::lib::transform
 {
 
@@ -66,27 +68,19 @@ bool isConstOne(const grh::Graph &graph, grh::ValueId valueId)
     {
         return true;
     }
-    const auto quotePos = literal.find('\'');
-    if (quotePos == std::string::npos)
+    try
+    {
+        auto parsed = slang::SVInt::fromString(literal);
+        if (parsed.hasUnknown())
+        {
+            return false;
+        }
+        return bool(parsed == slang::SVInt(parsed.getBitWidth(), uint64_t(1), parsed.isSigned()));
+    }
+    catch (const std::exception &)
     {
         return false;
     }
-    std::size_t digitsPos = quotePos + 1;
-    if (digitsPos < literal.size() && literal[digitsPos] == 's')
-    {
-        ++digitsPos;
-    }
-    if (digitsPos < literal.size() && (literal[digitsPos] == 'b' || literal[digitsPos] == 'o' ||
-                                       literal[digitsPos] == 'd' || literal[digitsPos] == 'h'))
-    {
-        ++digitsPos;
-    }
-    if (digitsPos >= literal.size())
-    {
-        return false;
-    }
-    const auto digits = literal.substr(digitsPos);
-    return digits == "1";
 }
 
 } // namespace
