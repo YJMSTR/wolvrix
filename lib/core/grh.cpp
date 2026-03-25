@@ -4764,11 +4764,12 @@ namespace wolvrix::lib::grh
 
     void Design::markAsTop(std::string_view graphSymbol)
     {
-        if (!findGraph(graphSymbol))
+        const Graph *graph = findGraph(graphSymbol);
+        if (!graph)
         {
             throw std::runtime_error("Cannot mark unknown graph as top: " + std::string(graphSymbol));
         }
-        auto symbolStr = std::string(graphSymbol);
+        auto symbolStr = graph->symbol();
         if (std::find(topGraphs_.begin(), topGraphs_.end(), symbolStr) == topGraphs_.end())
         {
             topGraphs_.push_back(std::move(symbolStr));
@@ -4777,11 +4778,12 @@ namespace wolvrix::lib::grh
 
     void Design::unmarkAsTop(std::string_view graphSymbol)
     {
-        if (!findGraph(graphSymbol))
+        const Graph *graph = findGraph(graphSymbol);
+        if (!graph)
         {
             throw std::runtime_error("Cannot unmark unknown graph as top: " + std::string(graphSymbol));
         }
-        auto symbolStr = std::string(graphSymbol);
+        auto symbolStr = graph->symbol();
         auto it = std::remove(topGraphs_.begin(), topGraphs_.end(), symbolStr);
         if (it != topGraphs_.end())
         {

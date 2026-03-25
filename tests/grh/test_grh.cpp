@@ -185,6 +185,28 @@ int main()
 
         design.markAsTop("demo");
 
+        Graph &aliasTop = design.createGraph("alias_target");
+        design.registerGraphAlias("alias_top", aliasTop);
+        design.markAsTop("alias_top");
+        if (std::find(design.topGraphs().begin(), design.topGraphs().end(), std::string("alias_target")) == design.topGraphs().end())
+        {
+            return fail("markAsTop should canonicalize alias-backed graph names");
+        }
+        design.unmarkAsTop("alias_top");
+        if (std::find(design.topGraphs().begin(), design.topGraphs().end(), std::string("alias_target")) != design.topGraphs().end())
+        {
+            return fail("unmarkAsTop should remove canonical top even when called through alias");
+        }
+        design.markAsTop("alias_top");
+        if (!design.deleteGraph("alias_target"))
+        {
+            return fail("Expected deleteGraph to remove canonical graph");
+        }
+        if (std::find(design.topGraphs().begin(), design.topGraphs().end(), std::string("alias_target")) != design.topGraphs().end())
+        {
+            return fail("deleteGraph should remove canonicalized top entries");
+        }
+
         StoreDiagnostics emitDiagnostics;
         StoreJson emitter(&emitDiagnostics);
         StoreOptions emitOptions;

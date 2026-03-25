@@ -1477,6 +1477,66 @@ namespace wolvrix::lib::emit
                     }
                 }
             };
+            auto emitTopDrivenOutputs = [&]()
+            {
+                source << "  // top-driven outputs\n";
+                for (const auto &edge : manifest.connections)
+                {
+                    if (edge.kind != "top_to_top" && edge.kind != "const_to_top")
+                    {
+                        continue;
+                    }
+                    std::string srcExpr;
+                    bool srcIsWide = false;
+                    std::size_t srcWordCount = 1;
+                    if (edge.driver.kind == DriverDesc::Kind::Top)
+                    {
+                        const auto topInputIt = topInputByPort.find(edge.driver.portName);
+                        if (topInputIt == topInputByPort.end())
+                        {
+                            continue;
+                        }
+                        srcExpr = topInputIt->second.memberName;
+                        srcIsWide = topInputIt->second.desc.isWide;
+                        srcWordCount = topInputIt->second.desc.wordCount;
+                    }
+                    else if (edge.driver.kind == DriverDesc::Kind::Const)
+                    {
+                        const auto constIt = constSignalByName.find(edge.signal);
+                        if (constIt == constSignalByName.end())
+                        {
+                            continue;
+                        }
+                        srcExpr = constIt->second.memberName;
+                        srcIsWide = constIt->second.desc.isWide;
+                        srcWordCount = constIt->second.desc.wordCount;
+                    }
+                    else
+                    {
+                        continue;
+                    }
+                    for (const auto &sink : edge.sinks)
+                    {
+                        if (sink.kind != SinkDesc::Kind::Top)
+                        {
+                            continue;
+                        }
+                        const auto topOutputIt = topOutputByPort.find(sink.portName);
+                        if (topOutputIt == topOutputByPort.end())
+                        {
+                            continue;
+                        }
+                        emitAssign(source,
+                                   topOutputIt->second.memberName,
+                                   topOutputIt->second.desc.isWide,
+                                   topOutputIt->second.desc.wordCount,
+                                   srcExpr,
+                                   srcIsWide,
+                                   srcWordCount,
+                                   1);
+                    }
+                }
+            };
             source << "  // Scatter a single cross-partition snapshot into every unit input first.\n";
             for (const auto &instanceName : manifest.serialEvalOrder)
             {
@@ -1567,6 +1627,7 @@ namespace wolvrix::lib::emit
                 emitGatherOutputsForUnit(instanceName);
                 source << "\n";
             }
+            emitTopDrivenOutputs();
             source << "}\n";
 
             return WrapperCode{header.str(), source.str()};
@@ -2082,14 +2143,18 @@ namespace wolvrix::lib::emit
             }
 
             const DriverDesc &driver = driverIt->second;
-            if (driver.kind != DriverDesc::Kind::Unit)
+            if (driver.kind == DriverDesc::Kind::Unit)
             {
-                reportError("Top outputs must be driven by unit outputs in the initial serial-semantics backend",
-                            port.name);
-                result.success = false;
-                return result;
+                appendSink("unit_to_top", port.value, driver, SinkDesc{SinkDesc::Kind::Top, {}, port.name});
             }
-            appendSink("unit_to_top", port.value, driver, SinkDesc{SinkDesc::Kind::Top, {}, port.name});
+            else if (driver.kind == DriverDesc::Kind::Top)
+            {
+                appendSink("top_to_top", port.value, driver, SinkDesc{SinkDesc::Kind::Top, {}, port.name});
+            }
+            else if (driver.kind == DriverDesc::Kind::Const)
+            {
+                appendSink("const_to_top", port.value, driver, SinkDesc{SinkDesc::Kind::Top, {}, port.name});
+            }
         }
 
         const std::filesystem::path manifestPath = packageDir / "manifest.json";

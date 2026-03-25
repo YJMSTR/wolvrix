@@ -387,6 +387,28 @@ int main()
 
     {
         Design design = buildDesign();
+        Graph *topPassthrough = design.findGraph("SimTop");
+        if (!topPassthrough)
+        {
+            return fail("missing SimTop graph for passthrough output test");
+        }
+        topPassthrough->removeOutputPort("out");
+        topPassthrough->bindOutputPort("out", topPassthrough->inputPortValue("in_data"));
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_passthrough_output").string();
+        opts.topOverrides = {"SimTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (!res.success || diags.hasError())
+        {
+            return fail("package emit should allow top outputs driven directly by top inputs");
+        }
+    }
+
+    {
+        Design design = buildDesign();
         Graph *topWithInout = design.findGraph("SimTop");
         if (!topWithInout)
         {

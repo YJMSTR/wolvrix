@@ -5805,6 +5805,7 @@ namespace wolvrix::lib::emit
         if (options.splitModules)
         {
             const std::filesystem::path outputDir = resolveOutputDir(options);
+            const std::filesystem::path staleManifestPath = outputDir / ".wolvrix_split_modules_manifest";
             if (std::filesystem::exists(outputDir))
             {
                 if (!std::filesystem::is_directory(outputDir))
@@ -5825,11 +5826,24 @@ namespace wolvrix::lib::emit
                         moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
                     managedModuleFiles.insert(moduleName + ".sv");
                 }
+
+                std::unordered_set<std::string> staleFiles = managedModuleFiles;
+                if (std::ifstream staleManifest(staleManifestPath); staleManifest)
+                {
+                    std::string line;
+                    while (std::getline(staleManifest, line))
+                    {
+                        if (!line.empty())
+                        {
+                            staleFiles.insert(line);
+                        }
+                    }
+                }
                 for (const auto &entry : std::filesystem::directory_iterator(outputDir))
                 {
                     if (entry.is_regular_file() &&
                         entry.path().extension() == ".sv" &&
-                        managedModuleFiles.find(entry.path().filename().string()) != managedModuleFiles.end())
+                        staleFiles.find(entry.path().filename().string()) != staleFiles.end())
                     {
                         std::error_code removeEc;
                         std::filesystem::remove(entry.path(), removeEc);
@@ -5863,6 +5877,26 @@ namespace wolvrix::lib::emit
 
                 emitGraph(graph, *stream);
                 result.artifacts.push_back(outputPath.string());
+            }
+            {
+                std::ofstream staleManifest(staleManifestPath, std::ios::trunc);
+                if (!staleManifest)
+                {
+                    reportError("failed to write split-modules manifest", staleManifestPath.string());
+                    result.success = false;
+                    return result;
+                }
+                for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
+                {
+                    if (!graph)
+                    {
+                        continue;
+                    }
+                    const auto moduleNameIt = emittedModuleNames.find(graph->symbol());
+                    const std::string moduleName =
+                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
+                    staleManifest << moduleName << ".sv\n";
+                }
             }
             return result;
         }
