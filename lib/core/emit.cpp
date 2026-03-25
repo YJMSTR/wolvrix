@@ -45,11 +45,6 @@ namespace wolvrix::lib::emit
 
         auto tryAdd = [&](std::string_view name)
         {
-            if (seen.find(std::string(name)) != seen.end())
-            {
-                return;
-            }
-
             const wolvrix::lib::grh::Graph *graph = design.findGraph(name);
             if (graph == nullptr)
             {
@@ -58,7 +53,10 @@ namespace wolvrix::lib::emit
                 return;
             }
 
-            seen.insert(std::string(graph->symbol()));
+            if (!seen.insert(std::string(graph->symbol())).second)
+            {
+                return;
+            }
             result.push_back(graph);
         };
 

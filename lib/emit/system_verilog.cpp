@@ -5811,6 +5811,12 @@ namespace wolvrix::lib::emit
             const std::filesystem::path outputDir = resolveOutputDir(options);
             if (std::filesystem::exists(outputDir))
             {
+                if (!std::filesystem::is_directory(outputDir))
+                {
+                    reportError("split-modules output path is not a directory", outputDir.string());
+                    result.success = false;
+                    return result;
+                }
                 std::unordered_set<std::string> managedModuleFiles;
                 for (const auto &graphSymbol : design.graphOrder())
                 {

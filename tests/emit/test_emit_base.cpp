@@ -122,6 +122,33 @@ int main()
         return fail("emitImpl should not be called when override tops are only partially resolved");
     }
 
+    // Case 2c: canonical name plus alias for the same graph should still resolve to one top.
+    EmitDiagnostics diagAliasOverride;
+    StubEmit emitterAliasOverride(&diagAliasOverride);
+    Graph *demoGraph = designWithTop.findGraph("demo");
+    if (demoGraph == nullptr)
+    {
+        return fail("Expected demo graph to exist before alias registration");
+    }
+    designWithTop.registerGraphAlias("demo_alias", *demoGraph);
+    EmitOptions aliasOverrideOptions;
+    aliasOverrideOptions.outputDir = std::string(WOLF_SV_EMIT_ARTIFACT_DIR);
+    aliasOverrideOptions.topOverrides.push_back("demo");
+    aliasOverrideOptions.topOverrides.push_back("demo_alias");
+    EmitResult aliasOverrideResult = emitterAliasOverride.emit(designWithTop, aliasOverrideOptions);
+    if (!aliasOverrideResult.success)
+    {
+        return fail("Expected emit to succeed when alias and canonical top name resolve to the same graph");
+    }
+    if (diagAliasOverride.hasError())
+    {
+        return fail("Did not expect diagnostics for alias + canonical duplicate top override");
+    }
+    if (emitterAliasOverride.callCount != 1 || emitterAliasOverride.lastTopCount != 1)
+    {
+        return fail("Alias + canonical duplicate top overrides should resolve to exactly one top graph");
+    }
+
     // Case 3: successful path with output
     EmitDiagnostics diagOk;
     StubEmit emitterOk(&diagOk);

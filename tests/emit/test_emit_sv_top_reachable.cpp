@@ -308,5 +308,26 @@ int main()
         return fail(verifyError);
     }
 
+    const std::filesystem::path splitAsFile = artifactRoot / "emit_top_split_as_file.sv";
+    {
+        std::ofstream file(splitAsFile);
+        file << "not_a_directory\n";
+    }
+    EmitDiagnostics diagSplitFile;
+    EmitSystemVerilog emitterSplitFile(&diagSplitFile);
+    EmitOptions splitFileOptions;
+    splitFileOptions.outputDir = splitAsFile.string();
+    splitFileOptions.topOverrides = {"top_a"};
+    splitFileOptions.splitModules = true;
+    const EmitResult splitFileResult = emitterSplitFile.emit(design, splitFileOptions);
+    if (splitFileResult.success)
+    {
+        return fail("split-modules emit should fail when outputDir points at a regular file");
+    }
+    if (!diagSplitFile.hasError())
+    {
+        return fail("split-modules emit should report diagnostics when outputDir is not a directory");
+    }
+
     return 0;
 }
