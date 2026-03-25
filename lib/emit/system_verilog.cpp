@@ -554,7 +554,7 @@ namespace wolvrix::lib::emit
                     const wolvrix::lib::grh::Graph *targetGraph = design.findGraph(*moduleName);
                     if (targetGraph == nullptr)
                     {
-                        continue;
+                        throw std::runtime_error("reachable graph target not found: " + *moduleName);
                     }
 
                     if (reachableSymbols.insert(targetGraph->symbol()).second)
@@ -1237,8 +1237,17 @@ namespace wolvrix::lib::emit
             }
         }
 
-        const std::vector<const wolvrix::lib::grh::Graph *> emittedGraphs =
-            reachableGraphsFromTops(design, topGraphs);
+        std::vector<const wolvrix::lib::grh::Graph *> emittedGraphs;
+        try
+        {
+            emittedGraphs = reachableGraphsFromTops(design, topGraphs);
+        }
+        catch (const std::exception &ex)
+        {
+            reportError(ex.what());
+            result.success = false;
+            return result;
+        }
 
         std::unordered_map<std::string, std::string> emittedModuleNames;
         std::unordered_set<std::string> usedModuleNames;

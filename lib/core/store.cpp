@@ -702,7 +702,7 @@ namespace wolvrix::lib::store
                     const wolvrix::lib::grh::Graph *targetGraph = design.findGraph(*moduleName);
                     if (targetGraph == nullptr)
                     {
-                        continue;
+                        throw std::runtime_error("reachable graph target not found: " + *moduleName);
                     }
 
                     if (reachableSymbols.insert(targetGraph->symbol()).second)

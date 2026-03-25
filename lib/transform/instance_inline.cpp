@@ -409,6 +409,40 @@ namespace wolvrix::lib::transform
             return graphs;
         }
 
+        bool designHasXmrTargetingSubtree(wolvrix::lib::grh::Design &design,
+                                          std::string_view path)
+        {
+            const std::string prefix = std::string(path) + ".";
+            for (const auto &entry : design.graphs())
+            {
+                if (!entry.second)
+                {
+                    continue;
+                }
+                const auto &graph = *entry.second;
+                for (const auto opId : graph.operations())
+                {
+                    const auto kind = graph.opKind(opId);
+                    if (kind != wolvrix::lib::grh::OperationKind::kXMRRead &&
+                        kind != wolvrix::lib::grh::OperationKind::kXMRWrite)
+                    {
+                        continue;
+                    }
+                    const auto op = graph.getOperation(opId);
+                    const auto xmrPath = getAttrString(op, "xmrPath");
+                    if (!xmrPath)
+                    {
+                        continue;
+                    }
+                    if (*xmrPath == path || xmrPath->rfind(prefix, 0) == 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         std::optional<ResolvedTarget> resolveTargetPath(wolvrix::lib::grh::Design &design,
                                                         std::string_view path,
                                                         std::string &error)
@@ -909,6 +943,12 @@ namespace wolvrix::lib::transform
         }
 
         std::string resolveError;
+        if (designHasXmrTargetingSubtree(design(), options_.path))
+        {
+            error("instance-inline requires xmr-resolve before inline");
+            result.failed = true;
+            return result;
+        }
         if (!specializePathAncestors(design(), options_.path, resolveError))
         {
             error(std::move(resolveError));

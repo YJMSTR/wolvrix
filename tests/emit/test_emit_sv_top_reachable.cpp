@@ -371,5 +371,23 @@ int main()
         return fail("split-modules emit should report diagnostics when outputDir is not a directory");
     }
 
+    {
+        Design badDesign = buildDesign();
+        Graph &badTop = badDesign.createGraph("bad_top");
+        addNoPortModuleRef(badTop, OperationKind::kInstance, "u_missing", "missing_leaf");
+        badDesign.markAsTop("bad_top");
+        EmitDiagnostics badDiags;
+        EmitSystemVerilog badEmitter(&badDiags);
+        EmitOptions badOptions;
+        badOptions.outputDir = artifactRoot.string();
+        badOptions.outputFilename = std::string("emit_bad_top.sv");
+        badOptions.topOverrides = {"bad_top"};
+        const EmitResult badResult = badEmitter.emit(badDesign, badOptions);
+        if (badResult.success || !badDiags.hasError())
+        {
+            return fail("top-reachable emit should fail on unresolved instance targets");
+        }
+    }
+
     return 0;
 }

@@ -404,5 +404,57 @@ int main()
         }
     }
 
+    {
+        wolvrix::lib::grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &mid = design.createGraph("mid");
+        auto &top = design.createGraph("top");
+        auto &helper = design.createGraph("helper");
+        design.markAsTop("top");
+
+        const auto childA = child.createValue(child.internSymbol("a"), 1, false);
+        const auto childY = child.createValue(child.internSymbol("y"), 1, false);
+        child.bindInputPort("a", childA);
+        child.bindOutputPort("y", childY);
+        const auto childAssign = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign, child.makeInternalOpSym());
+        child.addOperand(childAssign, childA);
+        child.addResult(childAssign, childY);
+
+        const auto midA = mid.createValue(mid.internSymbol("a"), 1, false);
+        const auto midY = mid.createValue(mid.internSymbol("y"), 1, false);
+        mid.bindInputPort("a", midA);
+        mid.bindOutputPort("y", midY);
+        const auto midInst = mid.createOperation(wolvrix::lib::grh::OperationKind::kInstance, mid.makeInternalOpSym());
+        mid.addOperand(midInst, midA);
+        mid.addResult(midInst, midY);
+        mid.setAttr(midInst, "moduleName", std::string("child"));
+        mid.setAttr(midInst, "instanceName", std::string("u_child"));
+        mid.setAttr(midInst, "inputPortName", std::vector<std::string>{"a"});
+        mid.setAttr(midInst, "outputPortName", std::vector<std::string>{"y"});
+
+        const auto topA = top.createValue(top.internSymbol("a"), 1, false);
+        const auto topY = top.createValue(top.internSymbol("y"), 1, false);
+        top.bindInputPort("a", topA);
+        top.bindOutputPort("y", topY);
+        const auto topMidInst = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topMidInst, topA);
+        top.addResult(topMidInst, topY);
+        top.setAttr(topMidInst, "moduleName", std::string("mid"));
+        top.setAttr(topMidInst, "instanceName", std::string("u_mid"));
+        top.setAttr(topMidInst, "inputPortName", std::vector<std::string>{"a"});
+        top.setAttr(topMidInst, "outputPortName", std::vector<std::string>{"y"});
+
+        const auto helperVal = helper.createValue(helper.makeInternalValSym(), 1, false);
+        const auto helperXmr = helper.createOperation(wolvrix::lib::grh::OperationKind::kXMRRead, helper.makeInternalOpSym());
+        helper.addResult(helperXmr, helperVal);
+        helper.setAttr(helperXmr, "xmrPath", std::string("top.u_mid.u_child.state"));
+
+        PassDiagnostics diags;
+        if (!runInlinePass(design, "top.u_mid.u_child", diags, false))
+        {
+            return fail("Expected external graphs with XMRs into the selected subtree to block instance-inline");
+        }
+    }
+
     return 0;
 }
