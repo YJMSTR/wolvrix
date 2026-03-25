@@ -257,5 +257,47 @@ int main()
         return fail(verifyError);
     }
 
+    const std::filesystem::path stalePath = splitDir / "stale_only.sv";
+    {
+        std::ofstream stale(stalePath);
+        stale << "module stale_only;\nendmodule\n";
+    }
+    if (!std::filesystem::exists(stalePath))
+    {
+        return fail("failed to create stale split-module file");
+    }
+
+    EmitDiagnostics diagSplitTopOnly;
+    EmitSystemVerilog emitterSplitTopOnly(&diagSplitTopOnly);
+    EmitOptions splitTopOnlyOptions;
+    splitTopOnlyOptions.outputDir = splitDir.string();
+    splitTopOnlyOptions.topOverrides = {"orphan"};
+    splitTopOnlyOptions.splitModules = true;
+
+    const EmitResult splitTopOnlyResult = emitterSplitTopOnly.emit(design, splitTopOnlyOptions);
+    if (!splitTopOnlyResult.success)
+    {
+        return fail("split-modules re-emit on existing directory failed");
+    }
+    if (diagSplitTopOnly.hasError())
+    {
+        return fail("split-modules re-emit on existing directory reported diagnostics errors");
+    }
+    if (std::filesystem::exists(stalePath))
+    {
+        return fail("split-modules re-emit should remove stale module files from the output directory");
+    }
+    if (std::filesystem::exists(splitDir / "top_a.sv") ||
+        std::filesystem::exists(splitDir / "mid.sv") ||
+        std::filesystem::exists(splitDir / "leaf.sv") ||
+        std::filesystem::exists(splitDir / "bb_leaf.sv"))
+    {
+        return fail("split-modules re-emit should remove stale reachable module files from the previous top set");
+    }
+    if (!verifySingleModuleFile(splitDir / "orphan.sv", "orphan", verifyError))
+    {
+        return fail(verifyError);
+    }
+
     return 0;
 }

@@ -1372,6 +1372,27 @@ void testPartitionPassRejectsSharedCrossDomainLogic()
     expect(sawExpectedDiagnostic, "expected exact supernode-partition cross-domain diagnostic");
 }
 
+void testPartitionPassIsScratchpadOnly()
+{
+    grh::Design design;
+    grh::Graph &graph = design.createGraph("top");
+
+    const auto clk = graph.createValue(graph.internSymbol("clk"), 1, false);
+    const auto data = graph.createValue(graph.internSymbol("data"), 8, false);
+    const auto one = makeConstant(graph, "one_scratchpad_only", "one_const_scratchpad_only", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask_scratchpad_only", "mask_const_scratchpad_only", 8, "8'hff");
+    makeRegisterWrite(graph, "reg_write_scratchpad_only", one, data, mask, clk, "reg_scratchpad_only");
+
+    PassManager manager;
+    manager.addPass(std::make_unique<SuperNodePartitionPass>());
+
+    PassDiagnostics diags;
+    const auto result = manager.run(design, diags);
+    expect(result.success, "scratchpad-only partition pass fixture should succeed");
+    expect(!result.changed, "supernode partition pass should not claim GRH mutation when it only writes scratchpad metadata");
+    expect(!diags.hasError(), "scratchpad-only partition pass fixture should not emit diagnostics errors");
+}
+
 } // namespace
 
 int main()
@@ -1408,6 +1429,7 @@ int main()
         testPartitionerReducesEdgesOnBranchedDagFixture();
         testPartitionPassBuildsTotalGraphScratchpadCoverage();
         testPartitionPassRejectsSharedCrossDomainLogic();
+        testPartitionPassIsScratchpadOnly();
     }
     catch (const std::exception &ex)
     {

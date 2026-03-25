@@ -5809,6 +5809,24 @@ namespace wolvrix::lib::emit
         if (options.splitModules)
         {
             const std::filesystem::path outputDir = resolveOutputDir(options);
+            if (std::filesystem::exists(outputDir))
+            {
+                for (const auto &entry : std::filesystem::directory_iterator(outputDir))
+                {
+                    if (entry.is_regular_file() && entry.path().extension() == ".sv")
+                    {
+                        std::error_code removeEc;
+                        std::filesystem::remove(entry.path(), removeEc);
+                        if (removeEc)
+                        {
+                            reportError("failed to remove stale split-module file: " + entry.path().string(),
+                                        outputDir.string());
+                            result.success = false;
+                            return result;
+                        }
+                    }
+                }
+            }
             for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
             {
                 if (!graph)

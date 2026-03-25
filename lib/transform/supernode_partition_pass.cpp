@@ -182,7 +182,6 @@ PassResult SuperNodePartitionPass::run() {
             }
             setScratchpad(prefix + "cut_edges", cutEdges);
 
-            result.changed = true;
         }
 
         // Write discovery key listing all emitted domains for this graph
@@ -191,6 +190,7 @@ PassResult SuperNodePartitionPass::run() {
         setScratchpad("supernode." + graphSymbol + ".cross_domain_edges", crossDomainEdges);
     }
 
+    result.changed = false;
     return result;
 }
 
