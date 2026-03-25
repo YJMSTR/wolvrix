@@ -318,6 +318,38 @@ int main()
         return fail(verifyError);
     }
 
+    // If regeneration fails after discovering an existing split directory, previously generated
+    // outputs should remain intact instead of being deleted first.
+    const std::filesystem::path failureDir = artifactRoot / "emit_top_split_modules_failure";
+    std::filesystem::remove_all(failureDir, ec);
+    EmitDiagnostics diagFailureSeed;
+    EmitSystemVerilog emitterFailureSeed(&diagFailureSeed);
+    EmitOptions failureSeedOptions;
+    failureSeedOptions.outputDir = failureDir.string();
+    failureSeedOptions.topOverrides = {"top_a"};
+    failureSeedOptions.splitModules = true;
+    const EmitResult failureSeedResult = emitterFailureSeed.emit(design, failureSeedOptions);
+    if (!failureSeedResult.success || diagFailureSeed.hasError())
+    {
+        return fail("failed to seed split-modules failure fixture");
+    }
+    std::filesystem::create_directories(failureDir / ".mid.sv.tmp", ec);
+    ec.clear();
+    EmitDiagnostics diagFailureRetry;
+    EmitSystemVerilog emitterFailureRetry(&diagFailureRetry);
+    const EmitResult failureRetryResult = emitterFailureRetry.emit(design, failureSeedOptions);
+    if (failureRetryResult.success)
+    {
+        return fail("split-modules emit should fail when a temp output path cannot be created");
+    }
+    if (!std::filesystem::exists(failureDir / "top_a.sv") ||
+        !std::filesystem::exists(failureDir / "mid.sv") ||
+        !std::filesystem::exists(failureDir / "leaf.sv") ||
+        !std::filesystem::exists(failureDir / "bb_leaf.sv"))
+    {
+        return fail("failed split-modules regeneration should preserve the previous emitted module set");
+    }
+
     const std::filesystem::path splitAsFile = artifactRoot / "emit_top_split_as_file.sv";
     {
         std::ofstream file(splitAsFile);

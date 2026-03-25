@@ -5814,49 +5814,43 @@ namespace wolvrix::lib::emit
                     result.success = false;
                     return result;
                 }
-                std::unordered_set<std::string> managedModuleFiles;
-                for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
-                {
-                    if (!graph)
-                    {
-                        continue;
-                    }
-                    auto moduleNameIt = emittedModuleNames.find(graph->symbol());
-                    const std::string moduleName =
-                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
-                    managedModuleFiles.insert(moduleName + ".sv");
-                }
+            }
 
-                std::unordered_set<std::string> staleFiles = managedModuleFiles;
-                if (std::ifstream staleManifest(staleManifestPath); staleManifest)
+            std::unordered_set<std::string> managedModuleFiles;
+            for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
+            {
+                if (!graph)
                 {
-                    std::string line;
-                    while (std::getline(staleManifest, line))
-                    {
-                        if (!line.empty())
-                        {
-                            staleFiles.insert(line);
-                        }
-                    }
+                    continue;
                 }
-                for (const auto &entry : std::filesystem::directory_iterator(outputDir))
+                auto moduleNameIt = emittedModuleNames.find(graph->symbol());
+                const std::string moduleName =
+                    moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
+                managedModuleFiles.insert(moduleName + ".sv");
+            }
+
+            std::unordered_set<std::string> staleFiles = managedModuleFiles;
+            if (std::ifstream staleManifest(staleManifestPath); staleManifest)
+            {
+                std::string line;
+                while (std::getline(staleManifest, line))
                 {
-                    if (entry.is_regular_file() &&
-                        entry.path().extension() == ".sv" &&
-                        staleFiles.find(entry.path().filename().string()) != staleFiles.end())
+                    if (!line.empty())
                     {
-                        std::error_code removeEc;
-                        std::filesystem::remove(entry.path(), removeEc);
-                        if (removeEc)
-                        {
-                            reportError("failed to remove stale split-module file: " + entry.path().string(),
-                                        outputDir.string());
-                            result.success = false;
-                            return result;
-                        }
+                        staleFiles.insert(line);
                     }
                 }
             }
+
+            struct PendingWrite
+            {
+                std::filesystem::path tempPath;
+                std::filesystem::path finalPath;
+                std::string artifactPath;
+            };
+            std::vector<PendingWrite> pendingWrites;
+            pendingWrites.reserve(emittedGraphs.size());
+
             for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
             {
                 if (!graph)
@@ -5868,16 +5862,65 @@ namespace wolvrix::lib::emit
                 const std::string &moduleName =
                     moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
                 const std::filesystem::path outputPath = outputDir / (moduleName + ".sv");
-                auto stream = openOutputFile(outputPath);
+                const std::filesystem::path tempPath = outputDir / ("." + moduleName + ".sv.tmp");
+                auto stream = openOutputFile(tempPath);
                 if (!stream)
                 {
+                    for (const auto &pending : pendingWrites)
+                    {
+                        std::error_code cleanupEc;
+                        std::filesystem::remove(pending.tempPath, cleanupEc);
+                    }
                     result.success = false;
                     return result;
                 }
 
                 emitGraph(graph, *stream);
-                result.artifacts.push_back(outputPath.string());
+                pendingWrites.push_back(PendingWrite{tempPath, outputPath, outputPath.string()});
             }
+
+            for (const auto &entry : std::filesystem::directory_iterator(outputDir))
+            {
+                if (entry.is_regular_file() &&
+                    entry.path().extension() == ".sv" &&
+                    staleFiles.find(entry.path().filename().string()) != staleFiles.end())
+                {
+                    std::error_code removeEc;
+                    std::filesystem::remove(entry.path(), removeEc);
+                    if (removeEc)
+                    {
+                        for (const auto &pending : pendingWrites)
+                        {
+                            std::error_code cleanupEc;
+                            std::filesystem::remove(pending.tempPath, cleanupEc);
+                        }
+                        reportError("failed to remove stale split-module file: " + entry.path().string(),
+                                    outputDir.string());
+                        result.success = false;
+                        return result;
+                    }
+                }
+            }
+
+            for (const auto &pending : pendingWrites)
+            {
+                std::error_code renameEc;
+                std::filesystem::rename(pending.tempPath, pending.finalPath, renameEc);
+                if (renameEc)
+                {
+                    for (const auto &cleanup : pendingWrites)
+                    {
+                        std::error_code cleanupEc;
+                        std::filesystem::remove(cleanup.tempPath, cleanupEc);
+                    }
+                    reportError("failed to publish split-module file: " + pending.finalPath.string(),
+                                outputDir.string());
+                    result.success = false;
+                    return result;
+                }
+                result.artifacts.push_back(pending.artifactPath);
+            }
+
             {
                 std::ofstream staleManifest(staleManifestPath, std::ios::trunc);
                 if (!staleManifest)
@@ -5886,16 +5929,9 @@ namespace wolvrix::lib::emit
                     result.success = false;
                     return result;
                 }
-                for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
+                for (const auto &name : managedModuleFiles)
                 {
-                    if (!graph)
-                    {
-                        continue;
-                    }
-                    const auto moduleNameIt = emittedModuleNames.find(graph->symbol());
-                    const std::string moduleName =
-                        moduleNameIt != emittedModuleNames.end() ? moduleNameIt->second : graph->symbol();
-                    staleManifest << moduleName << ".sv\n";
+                    staleManifest << name << "\n";
                 }
             }
             return result;
