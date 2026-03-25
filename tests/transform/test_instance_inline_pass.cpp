@@ -275,5 +275,134 @@ int main()
         }
     }
 
+    {
+        wolvrix::lib::grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &mid = design.createGraph("mid");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+
+        const auto childA = child.createValue(child.internSymbol("a"), 1, false);
+        const auto childY = child.createValue(child.internSymbol("y"), 1, false);
+        child.bindInputPort("a", childA);
+        child.bindOutputPort("y", childY);
+        const auto stateSym = child.internSymbol("state");
+        child.addDeclaredSymbol(stateSym);
+        const auto childState = child.createOperation(wolvrix::lib::grh::OperationKind::kRegister, stateSym);
+        child.setAttr(childState, "width", static_cast<int64_t>(1));
+        child.setAttr(childState, "isSigned", false);
+        const auto childRead = child.createOperation(wolvrix::lib::grh::OperationKind::kRegisterReadPort, child.makeInternalOpSym());
+        child.setAttr(childRead, "regSymbol", std::string("state"));
+        const auto childStateVal = child.createValue(child.internSymbol("state_val"), 1, false);
+        child.addResult(childRead, childStateVal);
+        const auto childAssign = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign, child.makeInternalOpSym());
+        child.addOperand(childAssign, childStateVal);
+        child.addResult(childAssign, childY);
+
+        auto makeMid = [&](std::string_view instName, std::string_view inName, std::string_view outName) {
+            const auto in = mid.createValue(mid.internSymbol(std::string(inName)), 1, false);
+            const auto out = mid.createValue(mid.internSymbol(std::string(outName)), 1, false);
+            const auto inst = mid.createOperation(wolvrix::lib::grh::OperationKind::kInstance, mid.makeInternalOpSym());
+            mid.addOperand(inst, in);
+            mid.addResult(inst, out);
+            mid.setAttr(inst, "moduleName", std::string("child"));
+            mid.setAttr(inst, "instanceName", std::string(instName));
+            mid.setAttr(inst, "inputPortName", std::vector<std::string>{"a"});
+            mid.setAttr(inst, "outputPortName", std::vector<std::string>{"y"});
+            return std::pair{in, out};
+        };
+        const auto [midIn0, midOut0] = makeMid("u_child", "a0", "y0");
+
+        const auto topA0 = top.createValue(top.internSymbol("a0"), 1, false);
+        const auto topY0 = top.createValue(top.internSymbol("y0"), 1, false);
+        const auto topA1 = top.createValue(top.internSymbol("a1"), 1, false);
+        const auto topY1 = top.createValue(top.internSymbol("y1"), 1, false);
+        top.bindInputPort("a0", topA0);
+        top.bindInputPort("a1", topA1);
+        top.bindOutputPort("y0", topY0);
+        top.bindOutputPort("y1", topY1);
+        const auto topMid0 = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topMid0, topA0);
+        top.addResult(topMid0, topY0);
+        top.setAttr(topMid0, "moduleName", std::string("mid"));
+        top.setAttr(topMid0, "instanceName", std::string("u_mid0"));
+        top.setAttr(topMid0, "inputPortName", std::vector<std::string>{"a0"});
+        top.setAttr(topMid0, "outputPortName", std::vector<std::string>{"y0"});
+        const auto topMid1 = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topMid1, topA1);
+        top.addResult(topMid1, topY1);
+        top.setAttr(topMid1, "moduleName", std::string("mid"));
+        top.setAttr(topMid1, "instanceName", std::string("u_mid1"));
+        top.setAttr(topMid1, "inputPortName", std::vector<std::string>{"a1"});
+        top.setAttr(topMid1, "outputPortName", std::vector<std::string>{"y1"});
+
+        PassDiagnostics diags;
+        if (!runInlinePass(design, "top.u_mid0.u_child", diags, true))
+        {
+            return fail("Expected instance-inline to specialize shared parent modules on nested paths");
+        }
+        const auto *specializedMid0 = design.findGraph(getAttrString(top.getOperation(topMid0), "moduleName").value());
+        const auto *sharedMid1 = design.findGraph(getAttrString(top.getOperation(topMid1), "moduleName").value());
+        if (!specializedMid0 || !sharedMid1 || specializedMid0 == sharedMid1)
+        {
+            return fail("Expected only the selected parent module instance to be specialized");
+        }
+        if (findInstanceByName(*sharedMid1, "u_child") == wolvrix::lib::grh::OperationId::invalid())
+        {
+            return fail("Inlining one nested path should not rewrite sibling parent instances");
+        }
+    }
+
+    {
+        wolvrix::lib::grh::Design design;
+        auto &child = design.createGraph("child");
+        auto &mid = design.createGraph("mid");
+        auto &top = design.createGraph("top");
+        design.markAsTop("top");
+
+        const auto childA = child.createValue(child.internSymbol("a"), 1, false);
+        const auto childY = child.createValue(child.internSymbol("y"), 1, false);
+        child.bindInputPort("a", childA);
+        child.bindOutputPort("y", childY);
+        const auto childAssign = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign, child.makeInternalOpSym());
+        child.addOperand(childAssign, childA);
+        child.addResult(childAssign, childY);
+
+        const auto midA = mid.createValue(mid.internSymbol("a"), 1, false);
+        const auto midY = mid.createValue(mid.internSymbol("y"), 1, false);
+        mid.bindInputPort("a", midA);
+        mid.bindOutputPort("y", midY);
+        const auto midInst = mid.createOperation(wolvrix::lib::grh::OperationKind::kInstance, mid.makeInternalOpSym());
+        mid.addOperand(midInst, midA);
+        mid.addResult(midInst, midY);
+        mid.setAttr(midInst, "moduleName", std::string("child"));
+        mid.setAttr(midInst, "instanceName", std::string("u_child"));
+        mid.setAttr(midInst, "inputPortName", std::vector<std::string>{"a"});
+        mid.setAttr(midInst, "outputPortName", std::vector<std::string>{"y"});
+
+        const auto topA = top.createValue(top.internSymbol("a"), 1, false);
+        const auto topY = top.createValue(top.internSymbol("y"), 1, false);
+        top.bindInputPort("a", topA);
+        top.bindOutputPort("y", topY);
+        const auto topMidInst = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topMidInst, topA);
+        top.addResult(topMidInst, topY);
+        top.setAttr(topMidInst, "moduleName", std::string("mid"));
+        top.setAttr(topMidInst, "instanceName", std::string("u_mid"));
+        top.setAttr(topMidInst, "inputPortName", std::vector<std::string>{"a"});
+        top.setAttr(topMidInst, "outputPortName", std::vector<std::string>{"y"});
+
+        const auto xmrVal = top.createValue(top.makeInternalValSym(), 1, false);
+        const auto xmrOp = top.createOperation(wolvrix::lib::grh::OperationKind::kXMRRead, top.makeInternalOpSym());
+        top.addResult(xmrOp, xmrVal);
+        top.setAttr(xmrOp, "xmrPath", std::string("top.u_mid.u_child.state"));
+
+        PassDiagnostics diags;
+        if (!runInlinePass(design, "top.u_mid.u_child", diags, false))
+        {
+            return fail("Expected ancestor-path XMRs to block instance-inline");
+        }
+    }
+
     return 0;
 }
