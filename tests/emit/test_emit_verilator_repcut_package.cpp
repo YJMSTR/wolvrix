@@ -587,5 +587,48 @@ int main()
         }
     }
 
+    {
+        Design design = buildDesign();
+        Graph &unit = design.createGraph("AccessorUnit");
+        const auto in = unit.createValue(unit.internSymbol("sig$in"), 1, false);
+        const auto out = unit.createValue(unit.internSymbol("sig$out"), 1, false);
+        unit.bindInputPort("sig$in", in);
+        unit.bindOutputPort("sig$out", out);
+        const auto assign = unit.createOperation(OperationKind::kAssign, unit.makeInternalOpSym());
+        unit.addOperand(assign, in);
+        unit.addResult(assign, out);
+
+        Graph &top = design.createGraph("AccessorTop");
+        const auto topInA = top.createValue(top.internSymbol("a$b"), 1, false);
+        const auto topInB = top.createValue(top.internSymbol("a_b"), 1, false);
+        const auto topOutA = top.createValue(top.internSymbol("y$b"), 1, false);
+        const auto topOutB = top.createValue(top.internSymbol("y_b"), 1, false);
+        top.bindInputPort("a$b", topInA);
+        top.bindInputPort("a_b", topInB);
+        top.bindOutputPort("y$b", topOutA);
+        top.bindOutputPort("y_b", topOutB);
+        addInstance(top, "u_acc0", "AccessorUnit", {topInA}, {topOutA}, {"sig$in"}, {"sig$out"});
+        addInstance(top, "u_acc1", "AccessorUnit", {topInB}, {topOutB}, {"sig$in"}, {"sig$out"});
+        design.markAsTop("AccessorTop");
+
+        EmitDiagnostics diags;
+        EmitVerilatorRepCutPackage emitter(&diags);
+        EmitOptions opts;
+        opts.outputDir = (artifactRoot / "with_accessor_collisions").string();
+        opts.topOverrides = {"AccessorTop"};
+        const EmitResult res = emitter.emit(design, opts);
+        if (!res.success || diags.hasError())
+        {
+            return fail("package emit should handle accessor-name collisions and Verilator port mangling");
+        }
+        const std::string wrapperHeader2 = readFile(std::filesystem::path(*res.artifacts.rbegin()).parent_path() / "wolvi_repcut_verilator_sim.h");
+        const std::string wrapperSource2 = readFile(std::filesystem::path(*res.artifacts.rbegin()).parent_path() / "wolvi_repcut_verilator_sim.cpp");
+        if (!contains(wrapperHeader2, "void set_a_b(") || !contains(wrapperHeader2, "void set_a_b_1(") ||
+            !contains(wrapperHeader2, "get_y_b() const") || !contains(wrapperHeader2, "get_y_b_1() const"))
+        {
+            return fail("wrapper header should de-duplicate sanitized accessor names");
+        }
+    }
+
     return 0;
 }

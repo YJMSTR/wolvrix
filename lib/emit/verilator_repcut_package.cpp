@@ -321,18 +321,32 @@ namespace wolvrix::lib::emit
 
         std::string verilatorPublicMemberName(std::string_view svIdentifier)
         {
+            auto appendEncoded = [](std::string &out, unsigned char ch)
+            {
+                static constexpr char kHex[] = "0123456789ABCDEF";
+                out += "__";
+                out.push_back(kHex[(ch >> 8) & 0xF]);
+                out.push_back(kHex[(ch >> 4) & 0xF]);
+                out.push_back(kHex[ch & 0xF]);
+            };
+
             std::string out;
             out.reserve(svIdentifier.size());
             for (std::size_t i = 0; i < svIdentifier.size(); ++i)
             {
-                const char ch = svIdentifier[i];
+                const unsigned char ch = static_cast<unsigned char>(svIdentifier[i]);
                 if (ch == '_' && i + 1 < svIdentifier.size() && svIdentifier[i + 1] == '_')
                 {
                     out += "___05F";
                     ++i;
                     continue;
                 }
-                out.push_back(ch);
+                if (std::isalnum(ch) || ch == '_')
+                {
+                    out.push_back(static_cast<char>(ch));
+                    continue;
+                }
+                appendEncoded(out, ch);
             }
             return out;
         }
@@ -1055,10 +1069,11 @@ namespace wolvrix::lib::emit
             if (!topInputs.empty())
             {
                 header << "\n";
+                std::unordered_set<std::string> usedSetterNames;
                 for (const auto &signal : topInputs)
                 {
-                    header << "  void set_" << sanitizeIdentifier(signal.originalName) << "("
-                           << signal.desc.typeName;
+                    const std::string accessorName = makeUniqueIdentifier("set_" + sanitizeIdentifier(signal.originalName), usedSetterNames);
+                    header << "  void " << accessorName << "(" << signal.desc.typeName;
                     if (signal.desc.isWide)
                     {
                         header << " const& value) { " << signal.memberName << " = value; }\n";
@@ -1072,8 +1087,10 @@ namespace wolvrix::lib::emit
             if (!topOutputs.empty())
             {
                 header << "\n";
+                std::unordered_set<std::string> usedGetterNames;
                 for (const auto &signal : topOutputs)
                 {
+                    const std::string accessorName = makeUniqueIdentifier("get_" + sanitizeIdentifier(signal.originalName), usedGetterNames);
                     header << "  ";
                     if (signal.desc.isWide)
                     {
@@ -1083,7 +1100,7 @@ namespace wolvrix::lib::emit
                     {
                         header << signal.desc.typeName << " ";
                     }
-                    header << "get_" << sanitizeIdentifier(signal.originalName) << "() const { return "
+                    header << accessorName << "() const { return "
                            << signal.memberName << "; }\n";
                 }
             }
