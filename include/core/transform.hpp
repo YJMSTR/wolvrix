@@ -66,7 +66,6 @@ namespace wolvrix::lib::transform
         LogLevel logLevel = LogLevel::Warn;
         std::function<void(LogLevel, std::string_view, std::string_view)> logSink;
         bool keepDeclaredSymbols = true;
-        std::unordered_map<std::string, std::unique_ptr<ScratchpadSlot>> scratchpad;
     };
 
     struct PassResult
@@ -111,53 +110,25 @@ namespace wolvrix::lib::transform
         PassVerbosity verbosity() const noexcept { return context_ ? context_->verbosity : PassVerbosity::Error; }
         bool hasScratchpad(std::string_view key) const noexcept
         {
-            if (!context_)
-            {
-                return false;
-            }
-            return context_->scratchpad.find(std::string(key)) != context_->scratchpad.end();
+            return context_ && context_->design.hasScratchpad(key);
         }
-        ScratchpadSlot *getScratchpadSlot(std::string_view key) noexcept
+        wolvrix::lib::grh::Design::ScratchpadSlot *getScratchpadSlot(std::string_view key) noexcept
         {
-            if (!context_)
-            {
-                return nullptr;
-            }
-            auto it = context_->scratchpad.find(std::string(key));
-            return it == context_->scratchpad.end() ? nullptr : it->second.get();
+            return context_ ? context_->design.getScratchpadSlot(key) : nullptr;
         }
-        const ScratchpadSlot *getScratchpadSlot(std::string_view key) const noexcept
+        const wolvrix::lib::grh::Design::ScratchpadSlot *getScratchpadSlot(std::string_view key) const noexcept
         {
-            if (!context_)
-            {
-                return nullptr;
-            }
-            auto it = context_->scratchpad.find(std::string(key));
-            return it == context_->scratchpad.end() ? nullptr : it->second.get();
+            return context_ ? context_->design.getScratchpadSlot(key) : nullptr;
         }
         template <typename T>
         T *getScratchpad(std::string_view key) noexcept
         {
-            if (auto *slot = getScratchpadSlot(key))
-            {
-                if (auto *typed = dynamic_cast<ScratchpadSlotValue<T> *>(slot))
-                {
-                    return &typed->value;
-                }
-            }
-            return nullptr;
+            return context_ ? context_->design.getScratchpad<T>(key) : nullptr;
         }
         template <typename T>
         const T *getScratchpad(std::string_view key) const noexcept
         {
-            if (const auto *slot = getScratchpadSlot(key))
-            {
-                if (const auto *typed = dynamic_cast<const ScratchpadSlotValue<T> *>(slot))
-                {
-                    return &typed->value;
-                }
-            }
-            return nullptr;
+            return context_ ? context_->design.getScratchpad<T>(key) : nullptr;
         }
         template <typename T>
         void setScratchpad(std::string key, T &&value)
@@ -166,9 +137,7 @@ namespace wolvrix::lib::transform
             {
                 return;
             }
-            context_->scratchpad.insert_or_assign(
-                std::move(key),
-                std::make_unique<ScratchpadSlotValue<std::decay_t<T>>>(std::forward<T>(value)));
+            context_->design.setScratchpad(std::move(key), std::forward<T>(value));
         }
         void eraseScratchpad(std::string_view key)
         {
@@ -176,7 +145,7 @@ namespace wolvrix::lib::transform
             {
                 return;
             }
-            context_->scratchpad.erase(std::string(key));
+            context_->design.eraseScratchpad(key);
         }
         void debug(std::string message, std::string context = {});
         void error(std::string message, std::string context = {});
@@ -256,6 +225,54 @@ namespace wolvrix::lib::transform
     std::unique_ptr<Pass> makePass(std::string_view name,
                                    std::span<const std::string_view> args,
                                    std::string &error);
+
+    enum class TargetPathRequirement
+    {
+        GraphOnlyOrInstancePath,
+        InstancePathOnly
+    };
+
+    struct ResolvedTargetPath
+    {
+        wolvrix::lib::grh::Graph *rootGraph = nullptr;
+        wolvrix::lib::grh::Graph *parentGraph = nullptr;
+        wolvrix::lib::grh::Graph *targetGraph = nullptr;
+        wolvrix::lib::grh::OperationId instanceOp = wolvrix::lib::grh::OperationId::invalid();
+        std::vector<std::string> segments;
+        std::string prefix;
+
+        wolvrix::lib::grh::Graph *childGraph() const noexcept { return targetGraph; }
+        bool isGraphOnly() const noexcept { return !instanceOp.valid(); }
+    };
+
+    std::vector<std::string> splitTargetPath(std::string_view path);
+
+    wolvrix::lib::grh::OperationId findUniqueInstanceByName(const wolvrix::lib::grh::Graph &graph,
+                                                            std::string_view instanceName,
+                                                            std::string &error);
+
+    std::string uniqueGraphName(wolvrix::lib::grh::Design &design, std::string_view base);
+
+    bool graphHasSharedUses(wolvrix::lib::grh::Design &design, std::string_view graphSymbol);
+
+    bool validateGraphAnalysisPreconditions(const wolvrix::lib::grh::Graph &graph,
+                                            PassDiagnostics &diags,
+                                            std::string_view passName);
+
+    std::optional<ResolvedTargetPath> resolveTargetPath(wolvrix::lib::grh::Design &design,
+                                                        std::string_view path,
+                                                        TargetPathRequirement requirement,
+                                                        std::string &error);
+
+    std::vector<const wolvrix::lib::grh::Graph *> collectGraphsAlongTargetPath(wolvrix::lib::grh::Design &design,
+                                                                                std::string_view path,
+                                                                                TargetPathRequirement requirement,
+                                                                                std::string &error);
+
+    bool specializeSharedPathAncestors(wolvrix::lib::grh::Design &design,
+                                       std::string_view path,
+                                       std::string_view cloneSuffix,
+                                       std::string &error);
 
 } // namespace wolvrix::lib::transform
 

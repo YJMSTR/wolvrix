@@ -31,16 +31,6 @@ namespace wolvrix::lib::transform
             wolvrix::lib::grh::ValueId target;
         };
 
-        struct ResolvedTarget
-        {
-            wolvrix::lib::grh::Graph *rootGraph = nullptr;
-            wolvrix::lib::grh::Graph *parentGraph = nullptr;
-            wolvrix::lib::grh::Graph *childGraph = nullptr;
-            wolvrix::lib::grh::OperationId instanceOp = wolvrix::lib::grh::OperationId::invalid();
-            std::vector<std::string> segments;
-            std::string prefix;
-        };
-
         struct CloneStats
         {
             std::size_t valuesCloned = 0;
@@ -93,30 +83,6 @@ namespace wolvrix::lib::transform
                 return *values;
             }
             return std::nullopt;
-        }
-
-        std::vector<std::string> splitPath(std::string_view path)
-        {
-            std::vector<std::string> out;
-            std::string current;
-            for (const char ch : path)
-            {
-                if (ch == '.')
-                {
-                    if (!current.empty())
-                    {
-                        out.push_back(current);
-                        current.clear();
-                    }
-                    continue;
-                }
-                current.push_back(ch);
-            }
-            if (!current.empty())
-            {
-                out.push_back(current);
-            }
-            return out;
         }
 
         bool hasXmrOps(const wolvrix::lib::grh::Graph &graph)
@@ -215,200 +181,6 @@ namespace wolvrix::lib::transform
             return true;
         }
 
-        std::string joinPrefix(const std::vector<std::string> &segments)
-        {
-            std::string prefix;
-            for (std::size_t i = 1; i < segments.size(); ++i)
-            {
-                const std::string part = normalizeComponent(segments[i]);
-                if (part.empty())
-                {
-                    continue;
-                }
-                if (!prefix.empty())
-                {
-                    prefix.push_back('$');
-                }
-                prefix.append(part);
-            }
-            return prefix;
-        }
-
-        wolvrix::lib::grh::OperationId findUniqueInstance(const wolvrix::lib::grh::Graph &graph,
-                                                          std::string_view instanceName,
-                                                          std::string &error)
-        {
-            wolvrix::lib::grh::OperationId found = wolvrix::lib::grh::OperationId::invalid();
-            for (const auto opId : graph.operations())
-            {
-                if (!opId.valid())
-                {
-                    continue;
-                }
-                const auto op = graph.getOperation(opId);
-                if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
-                {
-                    continue;
-                }
-                const auto name = getAttrString(op, "instanceName");
-                if (!name || *name != instanceName)
-                {
-                    continue;
-                }
-                if (found.valid())
-                {
-                    error = "duplicate instanceName in graph: " + std::string(instanceName);
-                    return wolvrix::lib::grh::OperationId::invalid();
-                }
-                found = opId;
-            }
-            if (!found.valid())
-            {
-                error = "instance not found: " + std::string(instanceName);
-            }
-            return found;
-        }
-
-        bool graphHasSharedUses(wolvrix::lib::grh::Design &design,
-                                std::string_view graphSymbol)
-        {
-            std::size_t instanceCount = 0;
-            for (const auto &entry : design.graphs())
-            {
-                if (!entry.second)
-                {
-                    continue;
-                }
-                for (const auto opId : entry.second->operations())
-                {
-                    const auto op = entry.second->getOperation(opId);
-                    if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
-                    {
-                        continue;
-                    }
-                    const auto moduleName = getAttrString(op, "moduleName");
-                    if (moduleName && *moduleName == graphSymbol)
-                    {
-                        ++instanceCount;
-                        if (instanceCount > 1)
-                        {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return std::find(design.topGraphs().begin(), design.topGraphs().end(), std::string(graphSymbol)) != design.topGraphs().end() ||
-                   !design.aliasesForGraph(graphSymbol).empty();
-        }
-
-        std::string uniqueGraphName(wolvrix::lib::grh::Design &design, std::string_view base)
-        {
-            std::string candidate = std::string(base);
-            std::size_t suffix = 0;
-            while (design.findGraph(candidate) != nullptr)
-            {
-                candidate = std::string(base) + "_" + std::to_string(++suffix);
-            }
-            return candidate;
-        }
-
-        bool specializePathAncestors(wolvrix::lib::grh::Design &design,
-                                     std::string_view path,
-                                     std::string &error)
-        {
-            std::vector<std::string> segments = splitPath(path);
-            if (segments.size() < 3)
-            {
-                return true;
-            }
-
-            auto *current = design.findGraph(segments.front());
-            if (current == nullptr)
-            {
-                error = "instance-inline root graph not found: " + segments.front();
-                return false;
-            }
-
-            for (std::size_t i = 1; i + 1 < segments.size(); ++i)
-            {
-                std::string hopError;
-                const auto instOp = findUniqueInstance(*current, segments[i], hopError);
-                if (!instOp.valid())
-                {
-                    error = "instance-inline path specialization failed at " + segments[i] + ": " + hopError;
-                    return false;
-                }
-                const auto op = current->getOperation(instOp);
-                const auto moduleName = getAttrString(op, "moduleName");
-                if (!moduleName || moduleName->empty())
-                {
-                    error = "instance-inline instance missing moduleName: " + segments[i];
-                    return false;
-                }
-                auto *child = design.findGraph(*moduleName);
-                if (child == nullptr)
-                {
-                    error = "instance-inline child graph not found: " + *moduleName;
-                    return false;
-                }
-                if (graphHasSharedUses(design, child->symbol()))
-                {
-                    const std::string specializedName = uniqueGraphName(design, child->symbol() + "_inline");
-                    auto &clone = design.cloneGraph(child->symbol(), specializedName);
-                    current->setAttr(instOp, "moduleName", specializedName);
-                    child = &clone;
-                }
-                current = child;
-            }
-            return true;
-        }
-
-        std::vector<const wolvrix::lib::grh::Graph *> collectGraphsAlongPath(wolvrix::lib::grh::Design &design,
-                                                                              std::string_view path,
-                                                                              std::string &error)
-        {
-            std::vector<const wolvrix::lib::grh::Graph *> graphs;
-            std::vector<std::string> segments = splitPath(path);
-            if (segments.size() < 2)
-            {
-                error = "instance-inline path must be <root>.<inst>...";
-                return {};
-            }
-            auto *current = design.findGraph(segments.front());
-            if (current == nullptr)
-            {
-                error = "instance-inline root graph not found: " + segments.front();
-                return {};
-            }
-            graphs.push_back(current);
-            for (std::size_t i = 1; i < segments.size(); ++i)
-            {
-                std::string hopError;
-                const auto instOp = findUniqueInstance(*current, segments[i], hopError);
-                if (!instOp.valid())
-                {
-                    error = "instance-inline path resolution failed at " + segments[i] + ": " + hopError;
-                    return {};
-                }
-                const auto op = current->getOperation(instOp);
-                const auto moduleName = getAttrString(op, "moduleName");
-                if (!moduleName || moduleName->empty())
-                {
-                    error = "instance-inline instance missing moduleName: " + segments[i];
-                    return {};
-                }
-                auto *child = design.findGraph(*moduleName);
-                if (child == nullptr)
-                {
-                    error = "instance-inline child graph not found: " + *moduleName;
-                    return {};
-                }
-                graphs.push_back(child);
-                current = child;
-            }
-            return graphs;
-        }
-
         bool designHasXmrTargetingSubtree(wolvrix::lib::grh::Design &design,
                                           std::string_view path)
         {
@@ -441,59 +213,6 @@ namespace wolvrix::lib::transform
                 }
             }
             return false;
-        }
-
-        std::optional<ResolvedTarget> resolveTargetPath(wolvrix::lib::grh::Design &design,
-                                                        std::string_view path,
-                                                        std::string &error)
-        {
-            std::vector<std::string> segments = splitPath(path);
-            if (segments.size() < 2)
-            {
-                error = "instance-inline path must be <root>.<inst>...";
-                return std::nullopt;
-            }
-
-            wolvrix::lib::grh::Graph *root = design.findGraph(segments.front());
-            if (root == nullptr)
-            {
-                error = "instance-inline root graph not found: " + segments.front();
-                return std::nullopt;
-            }
-
-            wolvrix::lib::grh::Graph *current = root;
-            for (std::size_t i = 1; i < segments.size(); ++i)
-            {
-                std::string hopError;
-                const auto instOp = findUniqueInstance(*current, segments[i], hopError);
-                if (!instOp.valid())
-                {
-                    error = "instance-inline path resolution failed at " + segments[i] + ": " + hopError;
-                    return std::nullopt;
-                }
-                const auto op = current->getOperation(instOp);
-                const auto moduleName = getAttrString(op, "moduleName");
-                if (!moduleName || moduleName->empty())
-                {
-                    error = "instance-inline instance missing moduleName: " + segments[i];
-                    return std::nullopt;
-                }
-                wolvrix::lib::grh::Graph *child = design.findGraph(*moduleName);
-                if (child == nullptr)
-                {
-                    error = "instance-inline child graph not found: " + *moduleName;
-                    return std::nullopt;
-                }
-                if (i + 1 == segments.size())
-                {
-                    const std::string prefix = joinPrefix(segments);
-                    return ResolvedTarget{root, current, child, instOp, std::move(segments), prefix};
-                }
-                current = child;
-            }
-
-            error = "instance-inline internal resolution error";
-            return std::nullopt;
         }
 
         bool addResultChecked(const Reporter &reporter,
@@ -659,14 +378,14 @@ namespace wolvrix::lib::transform
         }
 
         bool cloneChildOneLevel(const Reporter &reporter,
-                                const ResolvedTarget &targetInfo,
+                                const ResolvedTargetPath &targetInfo,
                                 ValueMap &portMap,
                                 const std::vector<AliasOutput> &aliasOutputs,
                                 CloneStats &stats)
         {
-            auto &source = *targetInfo.childGraph;
+            auto &source = *targetInfo.targetGraph;
             auto &target = *targetInfo.parentGraph;
-            if (targetInfo.childGraph == targetInfo.parentGraph)
+            if (targetInfo.targetGraph == targetInfo.parentGraph)
             {
                 reporter.graphError(target, "instance-inline does not support self-inlining into the same graph");
                 return false;
@@ -949,25 +668,29 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
-        if (!specializePathAncestors(design(), options_.path, resolveError))
+        if (!specializeSharedPathAncestors(design(), options_.path, "_inline", resolveError))
         {
-            error(std::move(resolveError));
+            error("instance-inline " + std::move(resolveError));
             result.failed = true;
             return result;
         }
-        auto resolved = resolveTargetPath(design(), options_.path, resolveError);
+        auto resolved = wolvrix::lib::transform::resolveTargetPath(design(), options_.path,
+                                                                    TargetPathRequirement::InstancePathOnly,
+                                                                    resolveError);
         if (!resolved)
         {
-            error(std::move(resolveError));
+            error("instance-inline " + std::move(resolveError));
             result.failed = true;
             return result;
         }
 
         {
-            const auto graphsToCheck = collectGraphsAlongPath(design(), options_.path, resolveError);
+            const auto graphsToCheck = collectGraphsAlongTargetPath(design(), options_.path,
+                                                                    TargetPathRequirement::InstancePathOnly,
+                                                                    resolveError);
             if (graphsToCheck.empty())
             {
-                error(std::move(resolveError));
+                error("instance-inline " + std::move(resolveError));
                 result.failed = true;
                 return result;
             }
@@ -986,7 +709,7 @@ namespace wolvrix::lib::transform
         ValueMap portMap;
         std::vector<AliasOutput> aliasOutputs;
         std::string mapError;
-        if (!buildPortMap(*resolved->childGraph, instOp, portMap, aliasOutputs, mapError))
+        if (!buildPortMap(*resolved->targetGraph, instOp, portMap, aliasOutputs, mapError))
         {
             error(*resolved->parentGraph, instOp, std::move(mapError));
             result.failed = true;
@@ -1008,10 +731,12 @@ namespace wolvrix::lib::transform
         {
             auto trialDesign = design().clone();
             std::string trialResolveError;
-            auto trialResolved = resolveTargetPath(trialDesign, options_.path, trialResolveError);
+            auto trialResolved = wolvrix::lib::transform::resolveTargetPath(trialDesign, options_.path,
+                                                                             TargetPathRequirement::InstancePathOnly,
+                                                                             trialResolveError);
             if (!trialResolved)
             {
-                error(std::move(trialResolveError));
+                error("instance-inline " + std::move(trialResolveError));
                 result.failed = true;
                 return result;
             }
@@ -1020,7 +745,7 @@ namespace wolvrix::lib::transform
             ValueMap trialPortMap;
             std::vector<AliasOutput> trialAliasOutputs;
             std::string trialMapError;
-            if (!buildPortMap(*trialResolved->childGraph, trialInstOp, trialPortMap, trialAliasOutputs, trialMapError))
+            if (!buildPortMap(*trialResolved->targetGraph, trialInstOp, trialPortMap, trialAliasOutputs, trialMapError))
             {
                 error(*trialResolved->parentGraph, trialInstOp, std::move(trialMapError));
                 result.failed = true;
@@ -1053,6 +778,8 @@ namespace wolvrix::lib::transform
             return result;
         }
 
+        design().eraseScratchpadNamespace("gsim.");
+        design().eraseScratchpadNamespace("supernode.");
         result.changed = true;
         logInfo("instance-inline: path=" + options_.path +
                 " values_cloned=" + std::to_string(stats.valuesCloned) +

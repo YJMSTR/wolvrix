@@ -2546,6 +2546,7 @@ namespace wolvrix::lib::grh
             declaredSymbols_ = std::move(other.declaredSymbols_);
             declaredSymbolSet_ = std::move(other.declaredSymbolSet_);
             designSymbols_ = std::move(other.designSymbols_);
+            scratchpad_ = std::move(other.scratchpad_);
             resetGraphOwners();
 
             other.graphAliasBySymbol_.clear();
@@ -2553,8 +2554,54 @@ namespace wolvrix::lib::grh
             other.topGraphs_.clear();
             other.declaredSymbols_.clear();
             other.declaredSymbolSet_.clear();
+            other.scratchpad_.clear();
         }
         return *this;
+    }
+
+    bool Design::hasScratchpad(std::string_view key) const noexcept
+    {
+        return scratchpad_.find(std::string(key)) != scratchpad_.end();
+    }
+
+    Design::ScratchpadSlot *Design::getScratchpadSlot(std::string_view key) noexcept
+    {
+        auto it = scratchpad_.find(std::string(key));
+        return it == scratchpad_.end() ? nullptr : it->second.get();
+    }
+
+    const Design::ScratchpadSlot *Design::getScratchpadSlot(std::string_view key) const noexcept
+    {
+        auto it = scratchpad_.find(std::string(key));
+        return it == scratchpad_.end() ? nullptr : it->second.get();
+    }
+
+    bool Design::eraseScratchpad(std::string_view key)
+    {
+        return scratchpad_.erase(std::string(key)) != 0;
+    }
+
+    std::size_t Design::eraseScratchpadNamespace(std::string_view prefix)
+    {
+        std::size_t erased = 0;
+        for (auto it = scratchpad_.begin(); it != scratchpad_.end();)
+        {
+            if (it->first.rfind(prefix, 0) == 0)
+            {
+                it = scratchpad_.erase(it);
+                ++erased;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        return erased;
+    }
+
+    void Design::clearScratchpad()
+    {
+        scratchpad_.clear();
     }
 
     void Design::resetGraphOwners()

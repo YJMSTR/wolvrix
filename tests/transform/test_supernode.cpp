@@ -1498,6 +1498,67 @@ void testPartitionPassRejectsSharedCrossDomainLogic()
     expect(sawExpectedDiagnostic, "expected exact supernode-partition cross-domain diagnostic");
 }
 
+void testPartitionPassRejectsHierarchyPrerequisiteViolations()
+{
+    {
+        grh::Design design;
+        grh::Graph &top = design.createGraph("top");
+        grh::Graph &child = design.createGraph("child");
+        const auto in = top.createValue(top.internSymbol("in"), 1, false);
+        const auto out = top.createValue(top.internSymbol("out"), 1, false);
+        const auto inst = top.createOperation(grh::OperationKind::kInstance, top.internSymbol("u_child"));
+        top.setAttr(inst, "moduleName", std::string("child"));
+        top.setAttr(inst, "instanceName", std::string("u_child"));
+        top.setAttr(inst, "inputPortName", std::vector<std::string>{"i"});
+        top.setAttr(inst, "outputPortName", std::vector<std::string>{"o"});
+        top.addOperand(inst, in);
+        top.addResult(inst, out);
+        (void)child;
+
+        PassManager manager;
+        manager.addPass(std::make_unique<SuperNodePartitionPass>());
+        PassDiagnostics diags;
+        const auto result = manager.run(design, diags);
+        expect(!result.success, "supernode partition should reject hierarchical graphs before analysis");
+        expect(diags.hasError(), "hierarchy prerequisite failure should emit diagnostics");
+        bool sawExpected = false;
+        for (const auto &diag : diags.messages())
+        {
+            if (diag.passName == "supernode-partition" &&
+                diag.message == "Design contains kInstance operations - must flatten before partitioning")
+            {
+                sawExpected = true;
+                break;
+            }
+        }
+        expect(sawExpected, "expected exact hierarchy prerequisite diagnostic");
+    }
+
+    {
+        grh::Design design;
+        grh::Graph &graph = design.createGraph("top");
+        graph.createOperation(grh::OperationKind::kBlackbox, graph.internSymbol("bb"));
+
+        PassManager manager;
+        manager.addPass(std::make_unique<SuperNodePartitionPass>());
+        PassDiagnostics diags;
+        const auto result = manager.run(design, diags);
+        expect(!result.success, "supernode partition should reject blackbox operations before analysis");
+        expect(diags.hasError(), "blackbox prerequisite failure should emit diagnostics");
+        bool sawExpected = false;
+        for (const auto &diag : diags.messages())
+        {
+            if (diag.passName == "supernode-partition" &&
+                diag.message == "Design contains kBlackbox operations - not supported")
+            {
+                sawExpected = true;
+                break;
+            }
+        }
+        expect(sawExpected, "expected exact blackbox prerequisite diagnostic");
+    }
+}
+
 void testTimingDomainAnalyzerAllowsSharedConstantAcrossDomains()
 {
     // Regression: shared kConstant should NOT be marked as cross_domain.
@@ -1612,6 +1673,7 @@ int main()
         testPartitionerReducesEdgesOnBranchedDagFixture();
         testPartitionPassBuildsTotalGraphScratchpadCoverage();
         testPartitionPassRejectsSharedCrossDomainLogic();
+        testPartitionPassRejectsHierarchyPrerequisiteViolations();
         testTimingDomainAnalyzerAllowsSharedConstantAcrossDomains();
         testPartitionPassIsScratchpadOnly();
     }

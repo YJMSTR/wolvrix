@@ -11,8 +11,10 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -809,6 +811,19 @@ private:
 
 class Design {
 public:
+    struct ScratchpadSlot {
+        virtual ~ScratchpadSlot() = default;
+    };
+
+    template <typename T>
+    struct ScratchpadSlotValue : ScratchpadSlot {
+        template <typename U>
+        explicit ScratchpadSlotValue(U&& v) : value(std::forward<U>(v)) {}
+
+        T value;
+    };
+
+public:
     Design() = default;
     Design(Design&& other) noexcept;
     Design& operator=(Design&& other) noexcept;
@@ -832,6 +847,37 @@ public:
     std::vector<std::string> aliasesForGraph(std::string_view name) const;
     void registerGraphAlias(std::string alias, Graph& graph);
 
+    bool hasScratchpad(std::string_view key) const noexcept;
+    ScratchpadSlot* getScratchpadSlot(std::string_view key) noexcept;
+    const ScratchpadSlot* getScratchpadSlot(std::string_view key) const noexcept;
+    template <typename T>
+    T* getScratchpad(std::string_view key) noexcept {
+        if (auto* slot = getScratchpadSlot(key)) {
+            if (auto* typed = dynamic_cast<ScratchpadSlotValue<T>*>(slot)) {
+                return &typed->value;
+            }
+        }
+        return nullptr;
+    }
+    template <typename T>
+    const T* getScratchpad(std::string_view key) const noexcept {
+        if (const auto* slot = getScratchpadSlot(key)) {
+            if (const auto* typed = dynamic_cast<const ScratchpadSlotValue<T>*>(slot)) {
+                return &typed->value;
+            }
+        }
+        return nullptr;
+    }
+    template <typename T>
+    void setScratchpad(std::string key, T&& value) {
+        scratchpad_.insert_or_assign(
+            std::move(key),
+            std::make_unique<ScratchpadSlotValue<std::decay_t<T>>>(std::forward<T>(value)));
+    }
+    bool eraseScratchpad(std::string_view key);
+    std::size_t eraseScratchpadNamespace(std::string_view prefix);
+    void clearScratchpad();
+
     void markAsTop(std::string_view graphName);
     void unmarkAsTop(std::string_view graphName);
     const std::vector<std::string>& topGraphs() const noexcept { return topGraphs_; }
@@ -852,6 +898,7 @@ private:
     std::vector<std::string> topGraphs_;
     std::vector<SymbolId> declaredSymbols_;
     std::unordered_set<uint32_t> declaredSymbolSet_;
+    std::unordered_map<std::string, std::unique_ptr<ScratchpadSlot>> scratchpad_;
 };
 
 } // namespace wolvrix::lib::grh

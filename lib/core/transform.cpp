@@ -17,9 +17,12 @@
 #include "transform/xmr_resolve.hpp"
 #include "transform/strip_debug.hpp"
 #include "transform/supernode_partition_pass.hpp"
+#include "transform/gsim.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -402,6 +405,321 @@ namespace wolvrix::lib::transform
         return normalized;
     }
 
+    std::vector<std::string> splitTargetPath(std::string_view path)
+    {
+        std::vector<std::string> out;
+        std::string current;
+        for (const char ch : path)
+        {
+            if (ch == '.')
+            {
+                if (!current.empty())
+                {
+                    out.push_back(current);
+                    current.clear();
+                }
+                continue;
+            }
+            current.push_back(ch);
+        }
+        if (!current.empty())
+        {
+            out.push_back(current);
+        }
+        return out;
+    }
+
+    wolvrix::lib::grh::OperationId findUniqueInstanceByName(const wolvrix::lib::grh::Graph &graph,
+                                                            std::string_view instanceName,
+                                                            std::string &error)
+    {
+        wolvrix::lib::grh::OperationId found = wolvrix::lib::grh::OperationId::invalid();
+        for (const auto opId : graph.operations())
+        {
+            if (!opId.valid())
+            {
+                continue;
+            }
+            const auto op = graph.getOperation(opId);
+            if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
+            {
+                continue;
+            }
+            auto attr = op.attr("instanceName");
+            if (!attr)
+            {
+                continue;
+            }
+            const auto *name = std::get_if<std::string>(&*attr);
+            if (name == nullptr || *name != instanceName)
+            {
+                continue;
+            }
+            if (found.valid())
+            {
+                error = "duplicate instanceName in graph: " + std::string(instanceName);
+                return wolvrix::lib::grh::OperationId::invalid();
+            }
+            found = opId;
+        }
+        if (!found.valid())
+        {
+            error = "instance not found: " + std::string(instanceName);
+        }
+        return found;
+    }
+
+    std::string uniqueGraphName(wolvrix::lib::grh::Design &design, std::string_view base)
+    {
+        std::string candidate(base);
+        std::size_t suffix = 0;
+        while (design.findGraph(candidate) != nullptr)
+        {
+            candidate = std::string(base) + "_" + std::to_string(++suffix);
+        }
+        return candidate;
+    }
+
+    bool graphHasSharedUses(wolvrix::lib::grh::Design &design, std::string_view graphSymbol)
+    {
+        std::size_t instanceCount = 0;
+        for (const auto &entry : design.graphs())
+        {
+            if (!entry.second)
+            {
+                continue;
+            }
+            for (const auto opId : entry.second->operations())
+            {
+                const auto op = entry.second->getOperation(opId);
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kInstance)
+                {
+                    continue;
+                }
+                auto attr = op.attr("moduleName");
+                if (!attr)
+                {
+                    continue;
+                }
+                const auto *moduleName = std::get_if<std::string>(&*attr);
+                if (moduleName != nullptr && *moduleName == graphSymbol)
+                {
+                    ++instanceCount;
+                    if (instanceCount > 1)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        return std::find(design.topGraphs().begin(), design.topGraphs().end(), std::string(graphSymbol)) != design.topGraphs().end() ||
+               !design.aliasesForGraph(graphSymbol).empty();
+    }
+
+    bool validateGraphAnalysisPreconditions(const wolvrix::lib::grh::Graph &graph,
+                                            PassDiagnostics &diags,
+                                            std::string_view passName)
+    {
+        for (const auto opId : graph.operations())
+        {
+            const auto op = graph.getOperation(opId);
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kInstance)
+            {
+                diags.error(std::string(passName),
+                            "Design contains kInstance operations - must flatten before partitioning",
+                            "Graph: " + graph.symbol());
+                return false;
+            }
+            if (op.kind() == wolvrix::lib::grh::OperationKind::kBlackbox)
+            {
+                diags.error(std::string(passName),
+                            "Design contains kBlackbox operations - not supported",
+                            "Graph: " + graph.symbol());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::optional<ResolvedTargetPath> resolveTargetPath(wolvrix::lib::grh::Design &design,
+                                                        std::string_view path,
+                                                        TargetPathRequirement requirement,
+                                                        std::string &error)
+    {
+        std::vector<std::string> segments = splitTargetPath(path);
+        if (segments.empty())
+        {
+            error = "target path must not be empty";
+            return std::nullopt;
+        }
+        if (requirement == TargetPathRequirement::InstancePathOnly && segments.size() < 2)
+        {
+            error = "target path must be <root>.<inst>...";
+            return std::nullopt;
+        }
+
+        wolvrix::lib::grh::Graph *root = design.findGraph(segments.front());
+        if (root == nullptr)
+        {
+            error = "root graph not found: " + segments.front();
+            return std::nullopt;
+        }
+        if (segments.size() == 1)
+        {
+            return ResolvedTargetPath{root, nullptr, root, wolvrix::lib::grh::OperationId::invalid(), std::move(segments), {}};
+        }
+
+        wolvrix::lib::grh::Graph *current = root;
+        for (std::size_t i = 1; i < segments.size(); ++i)
+        {
+            std::string hopError;
+            const auto instOp = findUniqueInstanceByName(*current, segments[i], hopError);
+            if (!instOp.valid())
+            {
+                error = "path resolution failed at " + segments[i] + ": " + hopError;
+                return std::nullopt;
+            }
+            const auto op = current->getOperation(instOp);
+            auto attr = op.attr("moduleName");
+            const auto *moduleName = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            if (moduleName == nullptr || moduleName->empty())
+            {
+                error = "instance missing moduleName: " + segments[i];
+                return std::nullopt;
+            }
+            wolvrix::lib::grh::Graph *child = design.findGraph(*moduleName);
+            if (child == nullptr)
+            {
+                error = "child graph not found: " + *moduleName;
+                return std::nullopt;
+            }
+            if (i + 1 == segments.size())
+            {
+                std::string prefix;
+                for (std::size_t segIndex = 1; segIndex < segments.size(); ++segIndex)
+                {
+                    std::string part = wolvrix::lib::grh::Graph::normalizeComponent(segments[segIndex]);
+                    if (part.empty())
+                    {
+                        part = "inst";
+                    }
+                    if (!part.empty() && part.front() >= '0' && part.front() <= '9')
+                    {
+                        part.insert(part.begin(), '_');
+                    }
+                    if (!prefix.empty())
+                    {
+                        prefix.push_back('$');
+                    }
+                    prefix.append(part);
+                }
+                return ResolvedTargetPath{root, current, child, instOp, std::move(segments), std::move(prefix)};
+            }
+            current = child;
+        }
+
+        error = "internal target path resolution error";
+        return std::nullopt;
+    }
+
+    std::vector<const wolvrix::lib::grh::Graph *> collectGraphsAlongTargetPath(wolvrix::lib::grh::Design &design,
+                                                                                std::string_view path,
+                                                                                TargetPathRequirement requirement,
+                                                                                std::string &error)
+    {
+        std::vector<const wolvrix::lib::grh::Graph *> graphs;
+        auto resolved = resolveTargetPath(design, path, requirement, error);
+        if (!resolved)
+        {
+            return graphs;
+        }
+
+        graphs.push_back(resolved->rootGraph);
+        if (resolved->isGraphOnly())
+        {
+            return graphs;
+        }
+
+        wolvrix::lib::grh::Graph *current = resolved->rootGraph;
+        for (std::size_t i = 1; i < resolved->segments.size(); ++i)
+        {
+            std::string hopError;
+            const auto instOp = findUniqueInstanceByName(*current, resolved->segments[i], hopError);
+            if (!instOp.valid())
+            {
+                error = "path resolution failed at " + resolved->segments[i] + ": " + hopError;
+                return {};
+            }
+            const auto op = current->getOperation(instOp);
+            auto attr = op.attr("moduleName");
+            const auto *moduleName = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            if (moduleName == nullptr || moduleName->empty())
+            {
+                error = "instance missing moduleName: " + resolved->segments[i];
+                return {};
+            }
+            current = design.findGraph(*moduleName);
+            if (current == nullptr)
+            {
+                error = "child graph not found: " + *moduleName;
+                return {};
+            }
+            graphs.push_back(current);
+        }
+        return graphs;
+    }
+
+    bool specializeSharedPathAncestors(wolvrix::lib::grh::Design &design,
+                                       std::string_view path,
+                                       std::string_view cloneSuffix,
+                                       std::string &error)
+    {
+        auto resolved = resolveTargetPath(design, path, TargetPathRequirement::InstancePathOnly, error);
+        if (!resolved)
+        {
+            return false;
+        }
+        if (resolved->segments.size() < 3)
+        {
+            return true;
+        }
+
+        auto *current = resolved->rootGraph;
+        for (std::size_t i = 1; i + 1 < resolved->segments.size(); ++i)
+        {
+            std::string hopError;
+            const auto instOp = findUniqueInstanceByName(*current, resolved->segments[i], hopError);
+            if (!instOp.valid())
+            {
+                error = "path specialization failed at " + resolved->segments[i] + ": " + hopError;
+                return false;
+            }
+            const auto op = current->getOperation(instOp);
+            auto attr = op.attr("moduleName");
+            const auto *moduleName = attr ? std::get_if<std::string>(&*attr) : nullptr;
+            if (moduleName == nullptr || moduleName->empty())
+            {
+                error = "instance missing moduleName: " + resolved->segments[i];
+                return false;
+            }
+            auto *child = design.findGraph(*moduleName);
+            if (child == nullptr)
+            {
+                error = "child graph not found: " + *moduleName;
+                return false;
+            }
+            if (graphHasSharedUses(design, child->symbol()))
+            {
+                const std::string specializedName = uniqueGraphName(design, child->symbol() + std::string(cloneSuffix));
+                auto &clone = design.cloneGraph(child->symbol(), specializedName);
+                current->setAttr(instOp, "moduleName", specializedName);
+                child = &clone;
+            }
+            current = child;
+        }
+        return true;
+    }
+
     std::vector<std::string> availableTransformPasses()
     {
         return {
@@ -422,6 +740,7 @@ namespace wolvrix::lib::transform
             "hrbcut",
             "repcut",
             "supernode-partition",
+            "gsim",
         };
     }
 
@@ -553,6 +872,33 @@ namespace wolvrix::lib::transform
                 return nullptr;
             }
             return std::make_unique<InstanceInlinePass>(options);
+        }
+        if (normalized == "gsim")
+        {
+            GsimOptions options;
+            for (std::size_t i = 0; i < args.size(); ++i)
+            {
+                const std::string_view arg = args[i];
+                if (arg == "-path")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-path expects a value";
+                        return nullptr;
+                    }
+                    options.path = std::string(args[++i]);
+                }
+                else if (arg.starts_with("-path="))
+                {
+                    options.path = std::string(arg.substr(std::string_view("-path=").size()));
+                }
+                else
+                {
+                    error = "unknown gsim option";
+                    return nullptr;
+                }
+            }
+            return std::make_unique<GsimPass>(options);
         }
         if (normalized == "simplify")
         {

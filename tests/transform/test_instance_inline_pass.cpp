@@ -406,53 +406,81 @@ int main()
 
     {
         wolvrix::lib::grh::Design design;
-        auto &child = design.createGraph("child");
+        auto &leaf = design.createGraph("leaf");
         auto &mid = design.createGraph("mid");
         auto &top = design.createGraph("top");
-        auto &helper = design.createGraph("helper");
         design.markAsTop("top");
 
-        const auto childA = child.createValue(child.internSymbol("a"), 1, false);
-        const auto childY = child.createValue(child.internSymbol("y"), 1, false);
-        child.bindInputPort("a", childA);
-        child.bindOutputPort("y", childY);
-        const auto childAssign = child.createOperation(wolvrix::lib::grh::OperationKind::kAssign, child.makeInternalOpSym());
-        child.addOperand(childAssign, childA);
-        child.addResult(childAssign, childY);
+        const auto leafIn = leaf.createValue(leaf.internSymbol("a"), 1, false);
+        const auto leafOut = leaf.createValue(leaf.internSymbol("y"), 1, false);
+        leaf.bindInputPort("a", leafIn);
+        leaf.bindOutputPort("y", leafOut);
+        const auto leafAssign = leaf.createOperation(wolvrix::lib::grh::OperationKind::kAssign, leaf.makeInternalOpSym());
+        leaf.addOperand(leafAssign, leafIn);
+        leaf.addResult(leafAssign, leafOut);
 
-        const auto midA = mid.createValue(mid.internSymbol("a"), 1, false);
-        const auto midY = mid.createValue(mid.internSymbol("y"), 1, false);
-        mid.bindInputPort("a", midA);
-        mid.bindOutputPort("y", midY);
+        const auto midIn = mid.createValue(mid.internSymbol("a"), 1, false);
+        const auto midOut = mid.createValue(mid.internSymbol("y"), 1, false);
+        mid.bindInputPort("a", midIn);
+        mid.bindOutputPort("y", midOut);
         const auto midInst = mid.createOperation(wolvrix::lib::grh::OperationKind::kInstance, mid.makeInternalOpSym());
-        mid.addOperand(midInst, midA);
-        mid.addResult(midInst, midY);
-        mid.setAttr(midInst, "moduleName", std::string("child"));
-        mid.setAttr(midInst, "instanceName", std::string("u_child"));
+        mid.addOperand(midInst, midIn);
+        mid.addResult(midInst, midOut);
+        mid.setAttr(midInst, "moduleName", std::string("leaf"));
+        mid.setAttr(midInst, "instanceName", std::string("u_leaf"));
         mid.setAttr(midInst, "inputPortName", std::vector<std::string>{"a"});
         mid.setAttr(midInst, "outputPortName", std::vector<std::string>{"y"});
 
-        const auto topA = top.createValue(top.internSymbol("a"), 1, false);
-        const auto topY = top.createValue(top.internSymbol("y"), 1, false);
-        top.bindInputPort("a", topA);
-        top.bindOutputPort("y", topY);
-        const auto topMidInst = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
-        top.addOperand(topMidInst, topA);
-        top.addResult(topMidInst, topY);
-        top.setAttr(topMidInst, "moduleName", std::string("mid"));
-        top.setAttr(topMidInst, "instanceName", std::string("u_mid"));
-        top.setAttr(topMidInst, "inputPortName", std::vector<std::string>{"a"});
-        top.setAttr(topMidInst, "outputPortName", std::vector<std::string>{"y"});
+        const auto topIn0 = top.createValue(top.internSymbol("a0"), 1, false);
+        const auto topOut0 = top.createValue(top.internSymbol("y0"), 1, false);
+        const auto topIn1 = top.createValue(top.internSymbol("a1"), 1, false);
+        const auto topOut1 = top.createValue(top.internSymbol("y1"), 1, false);
+        top.bindInputPort("a0", topIn0);
+        top.bindInputPort("a1", topIn1);
+        top.bindOutputPort("y0", topOut0);
+        top.bindOutputPort("y1", topOut1);
 
-        const auto helperVal = helper.createValue(helper.makeInternalValSym(), 1, false);
-        const auto helperXmr = helper.createOperation(wolvrix::lib::grh::OperationKind::kXMRRead, helper.makeInternalOpSym());
-        helper.addResult(helperXmr, helperVal);
-        helper.setAttr(helperXmr, "xmrPath", std::string("top.u_mid.u_child.state"));
+        const auto topMid0 = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topMid0, topIn0);
+        top.addResult(topMid0, topOut0);
+        top.setAttr(topMid0, "moduleName", std::string("mid"));
+        top.setAttr(topMid0, "instanceName", std::string("u_mid0"));
+        top.setAttr(topMid0, "inputPortName", std::vector<std::string>{"a"});
+        top.setAttr(topMid0, "outputPortName", std::vector<std::string>{"y"});
+
+        const auto topMid1 = top.createOperation(wolvrix::lib::grh::OperationKind::kInstance, top.makeInternalOpSym());
+        top.addOperand(topMid1, topIn1);
+        top.addResult(topMid1, topOut1);
+        top.setAttr(topMid1, "moduleName", std::string("mid"));
+        top.setAttr(topMid1, "instanceName", std::string("u_mid1"));
+        top.setAttr(topMid1, "inputPortName", std::vector<std::string>{"a"});
+        top.setAttr(topMid1, "outputPortName", std::vector<std::string>{"y"});
 
         PassDiagnostics diags;
-        if (!runInlinePass(design, "top.u_mid.u_child", diags, false))
+        if (!runInlinePass(design, "top.u_mid0.u_leaf", diags, true))
         {
-            return fail("Expected external graphs with XMRs into the selected subtree to block instance-inline");
+            return fail("Expected instance-inline to resolve multi-hop paths after shared-parent specialization");
+        }
+
+        const auto topMid0Module = getAttrString(top.getOperation(topMid0), "moduleName");
+        const auto topMid1Module = getAttrString(top.getOperation(topMid1), "moduleName");
+        if (!topMid0Module || !topMid1Module || *topMid0Module == *topMid1Module)
+        {
+            return fail("Expected top.u_mid0 to use a specialized mid graph while top.u_mid1 stays shared");
+        }
+        auto *specializedMid = design.findGraph(*topMid0Module);
+        auto *sharedMid = design.findGraph(*topMid1Module);
+        if (!specializedMid || !sharedMid)
+        {
+            return fail("Expected specialized and shared mid graphs to exist");
+        }
+        if (findInstanceByName(*specializedMid, "u_leaf").valid())
+        {
+            return fail("Expected selected nested leaf instance to be inlined only in the specialized parent graph");
+        }
+        if (!findInstanceByName(*sharedMid, "u_leaf").valid())
+        {
+            return fail("Expected sibling mid graph to retain its leaf instance");
         }
     }
 

@@ -1,5 +1,6 @@
 #include <Python.h>
 
+#include "emit/gsim_cpp.hpp"
 #include "emit/system_verilog.hpp"
 #include "emit/verilator_repcut_package.hpp"
 #include "core/grh.hpp"
@@ -1118,6 +1119,24 @@ namespace
         return PyUnicode_FromStringAndSize(text->data(), static_cast<Py_ssize_t>(text->size()));
     }
 
+    PyObject *py_clone_design(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
+    {
+        PyObject *design_obj = nullptr;
+        static const char *kwlist[] = {"design", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O", const_cast<char **>(kwlist), &design_obj))
+        {
+            return nullptr;
+        }
+
+        auto *handle = getDesignHandle(design_obj);
+        if (!handle)
+        {
+            return nullptr;
+        }
+
+        return makeDesignCapsule(handle->design.clone(), handle->compilation);
+    }
+
     PyObject *py_write_sv(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
     {
         PyObject *design_obj = nullptr;
@@ -1231,6 +1250,104 @@ namespace
         }
         options.outputDir = out_path.string();
         options.topOverrides = std::move(top_names);
+
+        wolvrix::lib::emit::EmitResult result;
+        try
+        {
+            result = emitter.emit(*design, options);
+        }
+        catch (const std::exception &ex)
+        {
+            PyErr_SetString(PyExc_RuntimeError, ex.what());
+            return nullptr;
+        }
+        if (diagnostics.hasError() || !result.success)
+        {
+            const std::string diagText =
+                formatDiagnostics(diagnostics.messages(), getDesignSourceManager(design_obj));
+            PyErr_SetString(PyExc_RuntimeError, diagText.c_str());
+            return nullptr;
+        }
+
+        Py_RETURN_NONE;
+    }
+
+    PyObject *py_write_gsim_cpp(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
+    {
+        PyObject *design_obj = nullptr;
+        const char *output = nullptr;
+        PyObject *top_list_obj = Py_None;
+        PyObject *target_path_obj = Py_None;
+        static const char *kwlist[] = {"design", "output", "top", "target_path", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OO", const_cast<char **>(kwlist),
+                                         &design_obj, &output, &top_list_obj, &target_path_obj))
+        {
+            return nullptr;
+        }
+        auto *design = getDesign(design_obj);
+        if (!design)
+        {
+            return nullptr;
+        }
+
+        std::vector<std::string> top_names;
+        std::string error;
+        if (!parseStringList(top_list_obj, top_names, error))
+        {
+            PyErr_SetString(PyExc_ValueError, error.c_str());
+            return nullptr;
+        }
+
+        const char *target_path = nullptr;
+        if (target_path_obj == Py_None)
+        {
+            target_path = nullptr;
+        }
+        else if (PyUnicode_Check(target_path_obj))
+        {
+            target_path = PyUnicode_AsUTF8(target_path_obj);
+            if (!target_path)
+            {
+                return nullptr;
+            }
+            if (target_path[0] == '\0')
+            {
+                PyErr_SetString(PyExc_ValueError, "target_path must be a non-empty string or None");
+                return nullptr;
+            }
+        }
+        else
+        {
+            PyErr_SetString(PyExc_ValueError, "target_path must be a string or None");
+            return nullptr;
+        }
+
+        const std::filesystem::path out_path(output);
+        if (out_path.empty())
+        {
+            PyErr_SetString(PyExc_ValueError, "write_gsim_cpp(...) expects an output path");
+            return nullptr;
+        }
+        const auto filename = out_path.filename().string();
+        if (filename.empty())
+        {
+            PyErr_SetString(PyExc_ValueError, "write_gsim_cpp(...) expects an output file path");
+            return nullptr;
+        }
+
+        wolvrix::lib::emit::EmitDiagnostics diagnostics;
+        wolvrix::lib::emit::EmitGsimCpp emitter(&diagnostics);
+        wolvrix::lib::emit::EmitOptions options;
+        options.outputFilename = filename;
+        if (!out_path.parent_path().empty())
+        {
+            options.outputDir = out_path.parent_path().string();
+        }
+        options.topOverrides = std::move(top_names);
+        if (target_path)
+        {
+            options.attributes["path"] = target_path;
+        }
 
         wolvrix::lib::emit::EmitResult result;
         try
@@ -1509,12 +1626,16 @@ static PyMethodDef WolvrixMethods[] = {
      "load_json_string(text) -> Design capsule"},
     {"store_json_string", reinterpret_cast<PyCFunction>(py_store_json_string), METH_VARARGS | METH_KEYWORDS,
      "store_json_string(design, mode='pretty-compact', top=None) -> str"},
+    {"clone_design", reinterpret_cast<PyCFunction>(py_clone_design), METH_VARARGS | METH_KEYWORDS,
+     "clone_design(design) -> Design capsule"},
     {"write_sv", reinterpret_cast<PyCFunction>(py_write_sv), METH_VARARGS | METH_KEYWORDS,
      "write_sv(design, output, top=None, split_modules=False)"},
     {"write_verilator_repcut_package",
      reinterpret_cast<PyCFunction>(py_write_verilator_repcut_package),
      METH_VARARGS | METH_KEYWORDS,
      "write_verilator_repcut_package(design, output, top=None)"},
+    {"write_gsim_cpp", reinterpret_cast<PyCFunction>(py_write_gsim_cpp), METH_VARARGS | METH_KEYWORDS,
+     "write_gsim_cpp(design, output, top=None, target_path=None)"},
     {"run_pass", reinterpret_cast<PyCFunction>(py_run_pass), METH_VARARGS | METH_KEYWORDS,
      "run_pass(design, name, args=None, dryrun=False, diagnostics='warn', log_level='warn') -> (changed, ok, diagnostics)"},
     {"run_pipeline", reinterpret_cast<PyCFunction>(py_run_pipeline), METH_VARARGS | METH_KEYWORDS,

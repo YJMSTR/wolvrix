@@ -23,6 +23,7 @@ Transform passes 用于对 GRH（Graph RTL Hierarchy）中间表示进行各种�
 | [`xmr-resolve`](xmr-resolve.md) | 解析跨模块引用 | 处理 XMR 路径 |
 | [`memory-init-check`](memory-init-check.md) | 验证存储器初始化一致性 | 存储器合并检查 |
 | [`repcut`](repcut.md) | 按路径对单个模块做 RepCut 分区 | 大模块切分、后续 inline |
+| [`scratchpad-lifecycle`](scratchpad-lifecycle.md) | Design 级 scratchpad 生命周期与失效规则 | analysis / emit metadata contract |
 | [`simplify`](simplify.md) | 综合优化（常量折叠、冗余消除、死代码消除） | 一般优化 |
 | [`stats`](stats.md) | 统计设计规模 | 设计分析 |
 

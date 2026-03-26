@@ -110,6 +110,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/core/grh.cpp
     lib/core/load.cpp
     lib/core/emit.cpp
+    lib/emit/gsim_cpp.cpp
     lib/emit/system_verilog.cpp
     lib/emit/verilator_repcut_package.cpp
     lib/core/store.cpp
@@ -140,6 +141,7 @@ set(WOLVRIX_LIB_SOURCES
     lib/transform/supernode_coarsener.cpp
     lib/transform/supernode_partitioner.cpp
     lib/transform/supernode_partition_pass.cpp
+    lib/transform/gsim.cpp
 )
 
 add_library(wolvrix-lib SHARED ${WOLVRIX_LIB_SOURCES})
@@ -400,6 +402,32 @@ target_compile_definitions(emit-verilator-repcut-package
 
 register_test_exe(emit-verilator-repcut-package)
 
+add_executable(emit-gsim-cpp
+    tests/emit/test_emit_gsim_cpp.cpp
+)
+
+target_link_libraries(emit-gsim-cpp
+    PRIVATE
+        wolvrix-lib
+)
+
+target_compile_definitions(emit-gsim-cpp
+    PRIVATE
+        WOLF_SV_EMIT_ARTIFACT_DIR="${EMIT_ARTIFACT_DIR}"
+)
+
+register_test_exe(emit-gsim-cpp)
+
+if (WOLVRIX_BUILD_PYTHON)
+    add_test(
+        NAME pybind-gsim
+        COMMAND ${Python_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tests/pybind_gsim_python_test.py"
+    )
+    set_tests_properties(pybind-gsim PROPERTIES
+        ENVIRONMENT "PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
+endif()
+
 add_executable(json-emit-verilator-repcut-package
     app/json_emit_verilator_repcut_package.cpp
 )
@@ -562,6 +590,18 @@ target_link_libraries(transform-supernode
 )
 
 register_test_exe(transform-supernode)
+
+# transform: gsim
+add_executable(transform-gsim
+    tests/transform/test_gsim_pass.cpp
+)
+
+target_link_libraries(transform-gsim
+    PRIVATE
+        wolvrix-lib
+)
+
+register_test_exe(transform-gsim)
 
 add_executable(transform-repcut-partition-count
     tests/transform/test_repcut_partition_count.cpp

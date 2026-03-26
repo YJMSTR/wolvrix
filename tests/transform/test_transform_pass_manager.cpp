@@ -1,4 +1,5 @@
 #include "core/grh.hpp"
+#include "core/store.hpp"
 #include "core/transform.hpp"
 #include "transform/demo_stats.hpp"
 
@@ -52,27 +53,28 @@ namespace
         std::vector<std::string> &order_;
     };
 
-    class ScratchpadCheckEmpty : public Pass
+    class ScratchpadCheckAbsent : public Pass
     {
     public:
-        ScratchpadCheckEmpty(std::string id, bool &reuseFlag)
-            : Pass(std::move(id), "scratchpad-check"), reuseFlag_(reuseFlag)
+        ScratchpadCheckAbsent(std::string id, std::string key, bool &foundFlag)
+            : Pass(std::move(id), "scratchpad-check-absent"), key_(std::move(key)), foundFlag_(foundFlag)
         {
         }
 
         PassResult run() override
         {
-            if (hasScratchpad("count"))
+            if (hasScratchpad(key_))
             {
-                reuseFlag_ = true;
-                diags().error(id(), "scratchpad was not cleared between runs");
+                foundFlag_ = true;
+                diags().error(id(), "scratchpad unexpectedly present");
                 return PassResult{false, true, {}};
             }
             return {};
         }
 
     private:
-        bool &reuseFlag_;
+        std::string key_;
+        bool &foundFlag_;
     };
 
     class ScratchpadWriter : public Pass
@@ -136,6 +138,7 @@ int main()
 {
     wolvrix::lib::grh::Design design;
     design.createGraph("top");
+    design.markAsTop("top");
 
     // Case 1: pipeline order and aggregated changed flag
     {
@@ -247,30 +250,90 @@ int main()
         }
     }
 
-    // Case 4: scratchpad allows cross-pass data and resets per run
+    // Case 4: scratchpad persists across PassManager runs on the same Design and dry-run stays isolated
     {
-        PassManager manager;
-        bool scratchpadReused = false;
-
-        manager.addPass(std::make_unique<ScratchpadCheckEmpty>("check", scratchpadReused));
-        manager.addPass(std::make_unique<ScratchpadWriter>("write", 7));
-        manager.addPass(std::make_unique<ScratchpadReader>("read", 7));
+        PassManager writer;
+        writer.addPass(std::make_unique<ScratchpadWriter>("write", 7));
 
         PassDiagnostics diags;
-        PassManagerResult result = manager.run(design, diags);
+        PassManagerResult result = writer.run(design, diags);
         if (!result.success || diags.hasError())
         {
-            return fail("Expected scratchpad pipeline to succeed on first run");
+            return fail("Expected scratchpad writer to succeed on first run");
         }
+
+        PassManager reader;
+        reader.addPass(std::make_unique<ScratchpadReader>("read-persisted", 7));
         diags.clear();
-        result = manager.run(design, diags);
+        result = reader.run(design, diags);
         if (!result.success || diags.hasError())
         {
-            return fail("Expected scratchpad pipeline to succeed on second run");
+            return fail("Expected scratchpad value to persist across PassManager runs on the same design");
         }
-        if (scratchpadReused)
+
+        PassManager overwrite;
+        overwrite.addPass(std::make_unique<ScratchpadWriter>("overwrite", 11));
+        overwrite.addPass(std::make_unique<ScratchpadReader>("read-overwritten", 11));
+        diags.clear();
+        result = overwrite.run(design, diags);
+        if (!result.success || diags.hasError())
         {
-            return fail("Scratchpad should be cleared between PassManager runs");
+            return fail("Expected scratchpad rerun to deterministically overwrite the same key");
+        }
+
+        PassManager dryrun;
+        dryrun.addPass(std::make_unique<ScratchpadWriter>("dryrun-overwrite", 23));
+        wolvrix::lib::grh::Design dryrunClone = design.clone();
+        diags.clear();
+        result = dryrun.run(dryrunClone, diags);
+        if (!result.success || diags.hasError())
+        {
+            return fail("Expected dry-run clone pipeline to succeed");
+        }
+
+        PassManager verifyOriginal;
+        verifyOriginal.addPass(std::make_unique<ScratchpadReader>("read-after-dryrun", 11));
+        diags.clear();
+        result = verifyOriginal.run(design, diags);
+        if (!result.success || diags.hasError())
+        {
+            return fail("Dry-run execution should not pollute scratchpad on the original design");
+        }
+
+        bool cloneSawOriginalScratchpad = false;
+        PassManager cloneCheck;
+        cloneCheck.addPass(std::make_unique<ScratchpadCheckAbsent>("clone-absent", "count", cloneSawOriginalScratchpad));
+        wolvrix::lib::grh::Design cleanClone = design.clone();
+        diags.clear();
+        result = cloneCheck.run(cleanClone, diags);
+        if (!result.success || diags.hasError())
+        {
+            return fail("Cloned design should not inherit scratchpad state");
+        }
+        if (cloneSawOriginalScratchpad)
+        {
+            return fail("Scratchpad leaked across Design::clone()");
+        }
+
+        wolvrix::lib::store::StoreJson store;
+        auto json = store.storeToString(design);
+        if (!json)
+        {
+            return fail("Expected JSON serialization to succeed");
+        }
+        wolvrix::lib::grh::Design reparsed = wolvrix::lib::grh::Design::fromJsonString(*json);
+        bool jsonSawScratchpad = false;
+        PassManager jsonCheck;
+        jsonCheck.addPass(std::make_unique<ScratchpadCheckAbsent>("json-absent", "count", jsonSawScratchpad));
+        diags.clear();
+        result = jsonCheck.run(reparsed, diags);
+        if (!result.success || diags.hasError())
+        {
+            return fail("JSON roundtrip should drop scratchpad state");
+        }
+        if (jsonSawScratchpad)
+        {
+            return fail("Scratchpad unexpectedly survived JSON roundtrip");
         }
     }
 

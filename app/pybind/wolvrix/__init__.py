@@ -11,6 +11,7 @@ __all__ = [
     "read_json",
     "read_sv",
     "run_pipeline",
+    "write_gsim_cpp",
 ]
 
 
@@ -79,6 +80,22 @@ class Design:
     ) -> None:
         _native.write_verilator_repcut_package(self._capsule, output, top or [])
 
+    def write_gsim_cpp(
+        self,
+        output: str,
+        top: list[str] | None = None,
+        target_path: str | None = None,
+        dryrun: bool = False,
+    ) -> None:
+        if dryrun:
+            raise ValueError(
+                "write_gsim_cpp(..., dryrun=True) is not supported because GSim metadata lives in Design scratchpad and is not cloned"
+            )
+        _native.write_gsim_cpp(self._capsule, output, top or [], target_path)
+
+    def clone(self) -> "Design":
+        return Design(_native.clone_design(self._capsule))
+
     def to_json(self, mode: str = "pretty-compact", top: list[str] | None = None) -> str:
         return _native.store_json_string(self._capsule, mode, top or [])
 
@@ -135,6 +152,16 @@ def run_pipeline(
         print_diagnostics_level=print_diagnostics_level,
         raise_diagnostics_level=raise_diagnostics_level,
     )
+
+
+def write_gsim_cpp(
+    design: Design,
+    output: str,
+    top: list[str] | None = None,
+    target_path: str | None = None,
+    dryrun: bool = False,
+) -> None:
+    design.write_gsim_cpp(output=output, top=top, target_path=target_path, dryrun=dryrun)
 
 
 def _level_rank(level: str) -> int | None:

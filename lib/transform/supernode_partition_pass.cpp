@@ -20,23 +20,10 @@ PassResult SuperNodePartitionPass::run() {
         auto& graph = *entry.second;
         auto graphSymbol = entry.first;
 
-        // Check preconditions: design must be flattened (no kInstance ops)
-        for (const auto& opId : graph.operations()) {
-            auto op = graph.getOperation(opId);
-            if (op.kind() == wolvrix::lib::grh::OperationKind::kInstance) {
-                diags().error("supernode-partition",
-                    "Design contains kInstance operations - must flatten before partitioning",
-                    "Graph: " + graphSymbol);
-                result.failed = true;
-                return result;
-            }
-            if (op.kind() == wolvrix::lib::grh::OperationKind::kBlackbox) {
-                diags().error("supernode-partition",
-                    "Design contains kBlackbox operations - not supported",
-                    "Graph: " + graphSymbol);
-                result.failed = true;
-                return result;
-            }
+        // Check preconditions: design must be flattened and analysis-compatible.
+        if (!validateGraphAnalysisPreconditions(graph, diags(), id())) {
+            result.failed = true;
+            return result;
         }
 
         // Analyze timing domains

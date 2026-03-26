@@ -512,6 +512,91 @@ int main()
         return fail("expected child_repcut_part0 graph after path-mode repcut");
     }
 
+    // Graph-only path regression: resolving "child" should still partition the graph directly.
+    wolvrix::lib::grh::Design graphOnlyDesign;
+    wolvrix::lib::grh::Graph &graphOnly = graphOnlyDesign.createGraph("child");
+    graphOnlyDesign.markAsTop("child");
+
+    const auto goA = makeValue(graphOnly, "a", 8, false);
+    const auto goB = makeValue(graphOnly, "b", 8, false);
+    const auto goEn = makeValue(graphOnly, "en", 1, false);
+    graphOnly.bindInputPort("a", goA);
+    graphOnly.bindInputPort("b", goB);
+    graphOnly.bindInputPort("en", goEn);
+
+    const auto goShared = makeValue(graphOnly, "shared", 8, false);
+    makeBinaryOp(graphOnly, wolvrix::lib::grh::OperationKind::kAdd, "shared_add", goA, goB, goShared);
+    for (int i = 0; i < 4; ++i)
+    {
+        const std::string suffix = std::to_string(i);
+        const auto data = makeValue(graphOnly, "wr_data_" + suffix, 8, false);
+        makeBinaryOp(graphOnly,
+                     (i % 2 == 0) ? wolvrix::lib::grh::OperationKind::kAdd : wolvrix::lib::grh::OperationKind::kSub,
+                     "sink_op_" + suffix,
+                     goShared,
+                     (i % 2 == 0) ? goA : goB,
+                     data);
+        const std::string latchName = "lat_" + suffix;
+        const auto latchDecl = graphOnly.createOperation(wolvrix::lib::grh::OperationKind::kLatch,
+                                                         graphOnly.internSymbol(latchName));
+        graphOnly.setAttr(latchDecl, "width", static_cast<int64_t>(8));
+        graphOnly.setAttr(latchDecl, "isSigned", false);
+        const auto latchWrite = graphOnly.createOperation(wolvrix::lib::grh::OperationKind::kLatchWritePort,
+                                                          graphOnly.internSymbol(latchName + "_wr"));
+        graphOnly.addOperand(latchWrite, goEn);
+        graphOnly.addOperand(latchWrite, data);
+        graphOnly.setAttr(latchWrite, "latchSymbol", latchName);
+    }
+
+    const std::filesystem::path graphOnlyOutDir =
+        std::filesystem::path(WOLF_SV_TEST_ARTIFACT_DIR) / "repcut_test_graph_only_path";
+    std::filesystem::create_directories(graphOnlyOutDir, ec);
+    if (ec)
+    {
+        return fail("failed to create output directory: " + graphOnlyOutDir.string());
+    }
+
+    PassManager graphOnlyManager;
+    graphOnlyManager.options().verbosity = PassVerbosity::Info;
+    RepcutOptions graphOnlyOptions;
+    graphOnlyOptions.path = "child";
+    graphOnlyOptions.partitionCount = 2;
+    graphOnlyOptions.imbalanceFactor = 1.0;
+    graphOnlyOptions.workDir = graphOnlyOutDir.string();
+    graphOnlyOptions.partitioner = "mt-kahypar";
+    graphOnlyOptions.mtKaHyParPreset = "quality";
+    graphOnlyOptions.mtKaHyParThreads = 0;
+    graphOnlyOptions.keepIntermediateFiles = true;
+    graphOnlyManager.addPass(std::make_unique<RepcutPass>(graphOnlyOptions));
+
+    PassDiagnostics graphOnlyDiags;
+    PassManagerResult graphOnlyResult{};
+    try
+    {
+        graphOnlyResult = graphOnlyManager.run(graphOnlyDesign, graphOnlyDiags);
+    }
+    catch (const std::exception &ex)
+    {
+        return fail(std::string("graph-only repcut exception: ") + ex.what());
+    }
+
+    if (!graphOnlyResult.success || graphOnlyDiags.hasError())
+    {
+        return fail("graph-only repcut failed unexpectedly");
+    }
+    if (!graphOnlyResult.changed)
+    {
+        return fail("graph-only repcut expected graph changes");
+    }
+    if (graphOnlyDesign.findGraph("child") == nullptr)
+    {
+        return fail("graph-only child graph missing after repcut");
+    }
+    if (!hasGraphWithPrefix(graphOnlyDesign, "child_repcut_part0"))
+    {
+        return fail("expected child_repcut_part0 graph after graph-only repcut");
+    }
+
     return 0;
 #endif
 }
