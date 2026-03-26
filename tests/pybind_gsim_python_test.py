@@ -88,6 +88,11 @@ def test_same_design_pipeline_flow() -> None:
     expect('metadata.graph_symbol = "top";' in source_text, "source should embed graph metadata")
     expect('metadata.scratchpad_namespace = "gsim.top";' in source_text, "source should preserve scratchpad namespace")
 
+    expect_runtime_error_contains(
+        lambda: design.write_gsim_cpp(str(out_dir / "bad_path"), top=["top"], target_path="top..bad"),
+        "failed to resolve gsim emit target path",
+    )
+
     dryrun_base = out_dir / "dryrun_metadata"
     dryrun_design = wolvrix.from_json_string(design.to_json())
     expect_runtime_error_contains(

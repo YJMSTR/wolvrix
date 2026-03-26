@@ -409,11 +409,18 @@ namespace wolvrix::lib::transform
     {
         std::vector<std::string> out;
         std::string current;
+        bool sawSeparator = false;
+        bool sawEmptySegment = false;
         for (const char ch : path)
         {
             if (ch == '.')
             {
-                if (!current.empty())
+                sawSeparator = true;
+                if (current.empty())
+                {
+                    sawEmptySegment = true;
+                }
+                else
                 {
                     out.push_back(current);
                     current.clear();
@@ -422,9 +429,20 @@ namespace wolvrix::lib::transform
             }
             current.push_back(ch);
         }
-        if (!current.empty())
+        if (current.empty())
+        {
+            if (sawSeparator)
+            {
+                sawEmptySegment = true;
+            }
+        }
+        else
         {
             out.push_back(current);
+        }
+        if (sawEmptySegment)
+        {
+            out.clear();
         }
         return out;
     }
@@ -549,7 +567,7 @@ namespace wolvrix::lib::transform
         std::vector<std::string> segments = splitTargetPath(path);
         if (segments.empty())
         {
-            error = "target path must not be empty";
+            error = path.empty() ? "target path must not be empty" : "target path contains empty path segments";
             return std::nullopt;
         }
         if (requirement == TargetPathRequirement::InstancePathOnly && segments.size() < 2)
@@ -566,7 +584,13 @@ namespace wolvrix::lib::transform
         }
         if (segments.size() == 1)
         {
-            return ResolvedTargetPath{root, nullptr, root, wolvrix::lib::grh::OperationId::invalid(), std::move(segments), {}};
+            return ResolvedTargetPath{root,
+                                      nullptr,
+                                      root,
+                                      wolvrix::lib::grh::OperationId::invalid(),
+                                      std::move(segments),
+                                      {},
+                                      "gsim." + root->symbol()};
         }
 
         wolvrix::lib::grh::Graph *current = root;
@@ -613,7 +637,8 @@ namespace wolvrix::lib::transform
                     }
                     prefix.append(part);
                 }
-                return ResolvedTargetPath{root, current, child, instOp, std::move(segments), std::move(prefix)};
+                const std::string scratchpadNamespace = "gsim." + child->symbol() + ".path." + prefix;
+                return ResolvedTargetPath{root, current, child, instOp, std::move(segments), std::move(prefix), std::move(scratchpadNamespace)};
             }
             current = child;
         }

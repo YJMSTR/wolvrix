@@ -647,6 +647,7 @@ public:
     const std::string& symbol() const noexcept { return symbol_; }
     const GraphId& id() const noexcept { return graphId_; }
     Design& owner() const noexcept { return *owner_; }
+    uint64_t revision() const noexcept { return revision_; }
 
     GraphSymbolTable& symbols() noexcept { return symbols_; }
     const GraphSymbolTable& symbols() const noexcept { return symbols_; }
@@ -773,6 +774,7 @@ private:
     friend class Design;
     friend class Value;
 
+    void touchRevision() noexcept { ++revision_; }
     void invalidateCaches() const;
     void invalidateValuesCache() const;
     void invalidateOperationsCache() const;
@@ -805,6 +807,7 @@ private:
     mutable bool valuesCacheDirty_ = true;
     mutable bool operationsCacheDirty_ = true;
     mutable bool portsCacheDirty_ = true;
+    uint64_t revision_ = 0;
     uint32_t nextInternalOpSym_ = 0;
     uint32_t nextInternalValSym_ = 0;
 };

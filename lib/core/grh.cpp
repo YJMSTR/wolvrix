@@ -3187,6 +3187,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         ValueId id = builder.addValue(symbol, width, isSigned, type);
+        touchRevision();
         // Incremental update: directly append to cache without full rebuild
         if (!valuesCacheDirty_)
         {
@@ -3204,6 +3205,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         OperationId id = builder.addOp(kind, symbol);
+        touchRevision();
         // Incremental update: directly append to cache without full rebuild
         if (!operationsCacheDirty_)
         {
@@ -3657,6 +3659,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.bindInputPort(name, value);
+        touchRevision();
         // Incremental update: sync cache directly
         if (!portsCacheDirty_)
         {
@@ -3669,6 +3672,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.bindOutputPort(name, value);
+        touchRevision();
         // Incremental update: sync cache directly
         if (!portsCacheDirty_)
         {
@@ -3681,6 +3685,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.bindInoutPort(name, in, out, oe);
+        touchRevision();
         // Incremental update: sync cache directly
         if (!portsCacheDirty_)
         {
@@ -3693,6 +3698,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.bindInputPorts(ports);
+        touchRevision();
         if (!portsCacheDirty_)
         {
             inputPortsCache_.clear();
@@ -3704,6 +3710,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.bindOutputPorts(ports);
+        touchRevision();
         if (!portsCacheDirty_)
         {
             outputPortsCache_.clear();
@@ -3715,6 +3722,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.bindInoutPorts(ports);
+        touchRevision();
         if (!portsCacheDirty_)
         {
             inoutPortsCache_.clear();
@@ -3792,6 +3800,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.addOperand(op, value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3799,6 +3808,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.addResult(op, value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3806,6 +3816,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.insertOperand(op, index, value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3813,6 +3824,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.insertResult(op, index, value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3820,6 +3832,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.replaceOperand(op, index, value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3827,6 +3840,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.replaceResult(op, index, value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3834,20 +3848,31 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.replaceAllUses(from, to);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     bool Graph::eraseOperand(OperationId op, std::size_t index)
     {
         GraphBuilder &builder = ensureBuilder();
-        return builder.eraseOperand(op, index);
+        const bool removed = builder.eraseOperand(op, index);
+        if (removed)
+        {
+            touchRevision();
+        }
+        return removed;
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     bool Graph::eraseResult(OperationId op, std::size_t index)
     {
         GraphBuilder &builder = ensureBuilder();
-        return builder.eraseResult(op, index);
+        const bool removed = builder.eraseResult(op, index);
+        if (removed)
+        {
+            touchRevision();
+        }
+        return removed;
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3960,6 +3985,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.setAttr(op, key, std::move(value));
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3967,13 +3993,19 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.setOpKind(op, kind);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
     bool Graph::eraseAttr(OperationId op, std::string_view key)
     {
         GraphBuilder &builder = ensureBuilder();
-        return builder.eraseAttr(op, key);
+        const bool erased = builder.eraseAttr(op, key);
+        if (erased)
+        {
+            touchRevision();
+        }
+        return erased;
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -3995,6 +4027,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.setOpSymbol(op, sym);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -4002,6 +4035,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.setValueSymbol(value, sym);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -4009,6 +4043,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.clearOpSymbol(op);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 
@@ -4016,6 +4051,7 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         builder.clearValueSymbol(value);
+        touchRevision();
         // No cache invalidation needed - doesn't affect value/op/port lists
     }
 

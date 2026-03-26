@@ -240,6 +240,7 @@ namespace wolvrix::lib::transform
         wolvrix::lib::grh::OperationId instanceOp = wolvrix::lib::grh::OperationId::invalid();
         std::vector<std::string> segments;
         std::string prefix;
+        std::string scratchpadNamespace;
 
         wolvrix::lib::grh::Graph *childGraph() const noexcept { return targetGraph; }
         bool isGraphOnly() const noexcept { return !instanceOp.valid(); }

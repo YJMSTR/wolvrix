@@ -273,6 +273,10 @@ void testHappyPathAfterRunningGsim()
     expect(contains(header, "struct GsimMetadata_top"), "header should declare graph-specific metadata struct");
     expect(contains(source, "metadata.graph_symbol = \"top\";"), "source should embed graph symbol from scratchpad metadata");
     expect(contains(source, "metadata.scratchpad_namespace = \"gsim.top\";"), "source should embed scratchpad namespace");
+    expect(contains(source, "metadata.schedule_kind = \"activity-v1\";"), "source should emit concrete schedule contract kind");
+    expect(contains(source, "metadata.hypergraph_kind = \"activity-connectivity-v1\";"), "source should emit concrete hypergraph contract kind");
+    expect(contains(source, "metadata.schedule_activity_order = {"), "source should serialize schedule activity ordering");
+    expect(contains(source, "metadata.hypergraph_edge_sinks = {"), "source should serialize hypergraph sink metadata");
     expect(contains(source, "bool validate_top_metadata"), "source should emit validation helper");
 }
 
@@ -295,6 +299,27 @@ void testFailureWithoutPriorMetadata()
     expectDiagnosticsContain(diags, "missing required gsim scratchpad metadata");
 }
 
+void testFailureOnPlaceholderContract()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+    design.setScratchpad(std::string("gsim.top.schedule.kind"), std::string("placeholder"));
+
+    const auto dir = artifactRoot() / "placeholder_contract";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "EmitGsimCpp should reject placeholder schedule metadata");
+    expect(diags.hasError(), "placeholder schedule metadata should produce diagnostics");
+    expectDiagnosticsContain(diags, "schedule metadata contract mismatch");
+}
+
 void testFailureOnNamespacePathMismatch()
 {
     Design design = buildSingleGraphDesign();
@@ -314,6 +339,34 @@ void testFailureOnNamespacePathMismatch()
     expect(!result.success, "EmitGsimCpp should fail on namespace/path mismatch");
     expect(diags.hasError(), "EmitGsimCpp should emit diagnostics for namespace/path mismatch");
     expectDiagnosticsContain(diags, "gsim scratchpad namespace/path mismatch");
+}
+
+void testFailureOnStaleMetadataAfterMutation()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    auto *graph = design.findGraph("top");
+    expect(graph != nullptr, "stale metadata fixture should resolve top graph");
+    const auto staleInput = makeValue(*graph, "stale_added_in", 8, false);
+    const auto staleOutput = makeValue(*graph, "stale_added_out", 8, false);
+    const auto staleOp = graph->createOperation(OperationKind::kNot, graph->internSymbol("stale_not"));
+    graph->addOperand(staleOp, staleInput);
+    graph->addResult(staleOp, staleOutput);
+
+    const auto dir = artifactRoot() / "stale_metadata";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "EmitGsimCpp should reject stale metadata after graph mutation");
+    expect(diags.hasError(), "stale metadata should produce diagnostics");
+    expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
 }
 
 void testGraphOnlyAndMultiHopTargetSelectionConsistency()
@@ -361,7 +414,7 @@ void testGraphOnlyAndMultiHopTargetSelectionConsistency()
 
         const std::string source = readFile(dir / "gsim_leaf.cpp");
         expect(contains(source, "metadata.selection_path = \"top.u_mid.u_leaf\";"), "multi-hop selection should preserve instance path");
-        expect(contains(source, "metadata.scratchpad_namespace = \"gsim.leaf\";"), "multi-hop selection should resolve to leaf namespace");
+        expect(contains(source, "metadata.scratchpad_namespace = \"gsim.leaf.path.u_mid$u_leaf\";"), "multi-hop selection should keep instance-scoped namespace");
         expect(contains(source, "metadata.graph_symbol = \"leaf\";"), "multi-hop selection should resolve to leaf graph metadata");
     }
 }
@@ -374,7 +427,9 @@ int main()
     {
         testHappyPathAfterRunningGsim();
         testFailureWithoutPriorMetadata();
+        testFailureOnPlaceholderContract();
         testFailureOnNamespacePathMismatch();
+        testFailureOnStaleMetadataAfterMutation();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
     }
     catch (const std::exception &ex)
