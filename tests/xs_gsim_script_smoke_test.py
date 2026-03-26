@@ -86,7 +86,12 @@ def main() -> int:
         expect(header.exists(), f"missing header artifact: {header}")
         expect(source.exists(), f"missing source artifact: {source}")
 
+        header_text = header.read_text(encoding="utf-8")
         source_text = source.read_text(encoding="utf-8")
+        expect('class SSimTop' in header_text, 'missing downstream simulator-facing SSimTop API')
+        expect('void set_reset(unsigned reset)' in header_text, 'missing set_reset API')
+        expect('void step()' in header_text, 'missing step API')
+        expect('get_difftest__DOT__exit()' in header_text, 'missing difftest exit accessor')
         expect('metadata.graph_symbol = "SimTop";' in source_text, "missing graph symbol metadata")
         expect('metadata.scratchpad_namespace = "gsim.SimTop";' in source_text, "missing scratchpad namespace metadata")
     except Exception as ex:
