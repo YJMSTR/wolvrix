@@ -9,28 +9,26 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 ARTIFACT_ROOT = REPO_ROOT / "build" / "artifacts" / "pybind_gsim"
+BUILD_PYTHON_DIR = REPO_ROOT / "build" / "python"
 
 
 def load_wolvrix_from_build() -> object:
-    pythonpath = os.environ.get("PYTHONPATH", "")
-    for entry in pythonpath.split(os.pathsep):
-        if not entry:
-            continue
-        entry_path = pathlib.Path(entry)
-        candidate = entry_path / "wolvrix" / "__init__.py"
-        native = entry_path / "wolvrix" / "_wolvrix.so"
-        if candidate.exists() and native.exists():
-            spec = importlib.util.spec_from_file_location(
-                "wolvrix", candidate, submodule_search_locations=[str(candidate.parent)]
-            )
-            if spec is None or spec.loader is None:
-                raise RuntimeError(f"failed to load wolvrix module spec from {candidate}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules.pop("wolvrix", None)
-            sys.modules["wolvrix"] = module
-            spec.loader.exec_module(module)
-            return module
-    raise RuntimeError(f"could not locate build-tree wolvrix in PYTHONPATH={pythonpath!r}")
+    candidate = BUILD_PYTHON_DIR / "wolvrix" / "__init__.py"
+    native = BUILD_PYTHON_DIR / "wolvrix" / "_wolvrix.so"
+    if not candidate.exists() or not native.exists():
+        raise RuntimeError(
+            f"could not locate build-tree wolvrix package at {candidate} / {native}"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "wolvrix", candidate, submodule_search_locations=[str(candidate.parent)]
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load wolvrix module spec from {candidate}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.pop("wolvrix", None)
+    sys.modules["wolvrix"] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 wolvrix = load_wolvrix_from_build()

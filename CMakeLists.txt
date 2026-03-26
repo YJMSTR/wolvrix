@@ -421,10 +421,10 @@ register_test_exe(emit-gsim-cpp)
 if (WOLVRIX_BUILD_PYTHON)
     add_test(
         NAME pybind-gsim
-        COMMAND ${Python_EXECUTABLE} "${CMAKE_SOURCE_DIR}/tests/pybind_gsim_python_test.py"
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/pybind_gsim_python_test.py"
     )
     set_tests_properties(pybind-gsim PROPERTIES
-        ENVIRONMENT "PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR}"
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR}"
     )
 endif()
 
