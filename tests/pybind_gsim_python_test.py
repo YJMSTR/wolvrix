@@ -9,7 +9,9 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 ARTIFACT_ROOT = REPO_ROOT / "build" / "artifacts" / "pybind_gsim"
-BUILD_PYTHON_DIR = REPO_ROOT / "build" / "python"
+BUILD_PYTHON_DIR = pathlib.Path(
+    os.environ.get("WOLVRIX_PYTHON_BUILD_DIR", str(REPO_ROOT / "build" / "python"))
+)
 
 
 def load_wolvrix_from_build() -> object:
@@ -28,6 +30,13 @@ def load_wolvrix_from_build() -> object:
     sys.modules.pop("wolvrix", None)
     sys.modules["wolvrix"] = module
     spec.loader.exec_module(module)
+    native_module = getattr(module, "_native", None)
+    expect(native_module is not None, "build-tree wolvrix should expose a native module")
+    native_path = pathlib.Path(native_module.__file__).resolve()
+    expect(str(candidate.resolve()).startswith(str(BUILD_PYTHON_DIR.resolve())),
+           "build-tree wolvrix __init__ should live under the configured build dir")
+    expect(str(native_path).startswith(str(BUILD_PYTHON_DIR.resolve())),
+           "build-tree wolvrix native module should live under the configured build dir")
     return module
 
 
