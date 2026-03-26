@@ -97,6 +97,7 @@ int testGraphAssemblyRegisterInit(const std::filesystem::path& sourcePath) {
     bool foundURandomDecl = false;
     bool foundWideDecl = false;
     bool foundXDecl = false;
+    bool foundConflictDecl = false;
 
     for (wolvrix::lib::grh::OperationId opId : graph->operations()) {
         wolvrix::lib::grh::Operation op = graph->getOperation(opId);
@@ -130,6 +131,12 @@ int testGraphAssemblyRegisterInit(const std::filesystem::path& sourcePath) {
                 }
                 foundXDecl = true;
             }
+            else if (op.symbolText() == "conflict_reg") {
+                if (initValue) {
+                    return fail("conflicting declaration/initial initializer should not collapse to a single initValue: " + *initValue);
+                }
+                foundConflictDecl = true;
+            }
             break;
         }
         case wolvrix::lib::grh::OperationKind::kRegisterReadPort: {
@@ -160,10 +167,13 @@ int testGraphAssemblyRegisterInit(const std::filesystem::path& sourcePath) {
     if (!foundXDecl) {
         return fail("Expected kRegister declaration for x_init");
     }
+    if (!foundConflictDecl) {
+        return fail("Expected kRegister declaration for conflict_reg");
+    }
     if (!foundRandomRead) {
         return fail("Expected kRegisterReadPort for random_bits");
     }
-    if (regDecls != 4 || regReads != 4) {
+    if (regDecls != 5 || regReads != 5) {
         return fail("Unexpected kRegister/kRegisterReadPort count");
     }
     if (regWrites != 0) {

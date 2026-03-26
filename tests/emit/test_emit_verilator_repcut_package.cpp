@@ -504,7 +504,7 @@ int main()
         const EmitResult res = emitter.emit(design, opts);
         if (res.success || !diags.hasError())
         {
-            return fail("package emit should reject non-logic ports instead of silently mis-modeling them");
+            return fail("package emit should still reject unsupported non-logic ports after shim parsing");
         }
     }
 

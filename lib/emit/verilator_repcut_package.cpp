@@ -364,13 +364,12 @@ namespace wolvrix::lib::emit
 
             const int64_t msb = match[4].matched ? std::stoll(match[4].str()) : 0;
             const int64_t lsb = match[5].matched ? std::stoll(match[5].str()) : 0;
-            return ManifestPort{
-                match[6].str(),
-                match[1].str(),
-                match[4].matched ? (msb - lsb + 1) : 1,
-                match[3].matched,
-                (match[2].matched && (match[2].str() == "real" || match[2].str() == "string")) ? match[2].str() : std::string("logic"),
-            };
+            const std::string valueType =
+                (match[2].matched && (match[2].str() == "real" || match[2].str() == "string"))
+                    ? match[2].str()
+                    : std::string("logic");
+            const int64_t width = valueType == "logic" && match[4].matched ? (msb - lsb + 1) : 1;
+            return ManifestPort{match[6].str(), match[1].str(), width, match[3].matched, valueType};
         }
 
         std::vector<ManifestPort> parseEmittedSvPorts(const std::filesystem::path &svPath,
@@ -426,14 +425,22 @@ namespace wolvrix::lib::emit
         std::string formatShimPortDecl(const ManifestPort &port)
         {
             std::ostringstream out;
-            out << port.direction << " wire ";
-            if (port.isSigned)
+            out << port.direction << ' ';
+            if (port.valueType == "real" || port.valueType == "string")
             {
-                out << "signed ";
+                out << port.valueType << ' ';
             }
-            if (port.width > 1)
+            else
             {
-                out << "[" << (port.width - 1) << ":0] ";
+                out << "wire ";
+                if (port.isSigned)
+                {
+                    out << "signed ";
+                }
+                if (port.width > 1)
+                {
+                    out << "[" << (port.width - 1) << ":0] ";
+                }
             }
             out << port.name;
             return out.str();
@@ -522,6 +529,7 @@ namespace wolvrix::lib::emit
                 wrapperPort.direction = emittedPort.direction;
                 wrapperPort.width = emittedPort.width;
                 wrapperPort.isSigned = emittedPort.isSigned;
+                wrapperPort.valueType = emittedPort.valueType;
 
                 if (emittedPort.direction == "input")
                 {
@@ -538,8 +546,14 @@ namespace wolvrix::lib::emit
                         throw std::runtime_error("Duplicate input port mapping while building shim for module " +
                                                  unitGraph.symbol() + ": " + graphPort.name);
                     }
-                    if (unitGraph.valueWidth(graphPort.value) != emittedPort.width ||
-                        unitGraph.valueSigned(graphPort.value) != emittedPort.isSigned)
+                    const bool typeMismatch = unitGraph.valueType(graphPort.value) !=
+                        (emittedPort.valueType == "real" ? wolvrix::lib::grh::ValueType::Real :
+                         emittedPort.valueType == "string" ? wolvrix::lib::grh::ValueType::String :
+                         wolvrix::lib::grh::ValueType::Logic);
+                    const bool shapeMismatch = emittedPort.valueType == "logic" &&
+                        (unitGraph.valueWidth(graphPort.value) != emittedPort.width ||
+                         unitGraph.valueSigned(graphPort.value) != emittedPort.isSigned);
+                    if (typeMismatch || shapeMismatch)
                     {
                         throw std::runtime_error("Input port shape mismatch while building shim for module " +
                                                  unitGraph.symbol() + ": " + graphPort.name);
@@ -561,8 +575,14 @@ namespace wolvrix::lib::emit
                         throw std::runtime_error("Duplicate output port mapping while building shim for module " +
                                                  unitGraph.symbol() + ": " + graphPort.name);
                     }
-                    if (unitGraph.valueWidth(graphPort.value) != emittedPort.width ||
-                        unitGraph.valueSigned(graphPort.value) != emittedPort.isSigned)
+                    const bool typeMismatch = unitGraph.valueType(graphPort.value) !=
+                        (emittedPort.valueType == "real" ? wolvrix::lib::grh::ValueType::Real :
+                         emittedPort.valueType == "string" ? wolvrix::lib::grh::ValueType::String :
+                         wolvrix::lib::grh::ValueType::Logic);
+                    const bool shapeMismatch = emittedPort.valueType == "logic" &&
+                        (unitGraph.valueWidth(graphPort.value) != emittedPort.width ||
+                         unitGraph.valueSigned(graphPort.value) != emittedPort.isSigned);
+                    if (typeMismatch || shapeMismatch)
                     {
                         throw std::runtime_error("Output port shape mismatch while building shim for module " +
                                                  unitGraph.symbol() + ": " + graphPort.name);
@@ -584,8 +604,14 @@ namespace wolvrix::lib::emit
                         throw std::runtime_error("Duplicate inout port mapping while building shim for module " +
                                                  unitGraph.symbol() + ": " + graphPort.name);
                     }
-                    if (unitGraph.valueWidth(graphPort.out) != emittedPort.width ||
-                        unitGraph.valueSigned(graphPort.out) != emittedPort.isSigned)
+                    const bool typeMismatch = unitGraph.valueType(graphPort.out) !=
+                        (emittedPort.valueType == "real" ? wolvrix::lib::grh::ValueType::Real :
+                         emittedPort.valueType == "string" ? wolvrix::lib::grh::ValueType::String :
+                         wolvrix::lib::grh::ValueType::Logic);
+                    const bool shapeMismatch = emittedPort.valueType == "logic" &&
+                        (unitGraph.valueWidth(graphPort.out) != emittedPort.width ||
+                         unitGraph.valueSigned(graphPort.out) != emittedPort.isSigned);
+                    if (typeMismatch || shapeMismatch)
                     {
                         throw std::runtime_error("Inout port shape mismatch while building shim for module " +
                                                  unitGraph.symbol() + ": " + graphPort.name);

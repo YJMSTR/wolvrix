@@ -408,5 +408,33 @@ int main()
         }
     }
 
+    {
+        Design escapedDesign;
+        Graph &escaped = escapedDesign.createGraph("\\foo/bar ");
+        escapedDesign.markAsTop("\\foo/bar ");
+        EmitDiagnostics escapedDiags;
+        EmitSystemVerilog escapedEmitter(&escapedDiags);
+        EmitOptions escapedOptions;
+        const std::filesystem::path escapedDir = artifactRoot / "emit_top_split_modules_escaped";
+        std::filesystem::remove_all(escapedDir, ec);
+        escapedOptions.outputDir = escapedDir.string();
+        escapedOptions.topOverrides = {"\\foo/bar "};
+        escapedOptions.splitModules = true;
+        const EmitResult escapedResult = escapedEmitter.emit(escapedDesign, escapedOptions);
+        if (!escapedResult.success || escapedDiags.hasError())
+        {
+            return fail("split-modules emit should sanitize escaped module names into safe filenames");
+        }
+        if (escapedResult.artifacts.size() != 1)
+        {
+            return fail("escaped split-modules emit should produce one artifact");
+        }
+        const std::filesystem::path escapedArtifact(escapedResult.artifacts.front());
+        if (escapedArtifact.filename() != "_foo_bar_.sv")
+        {
+            return fail("escaped module filename was not sanitized as expected");
+        }
+    }
+
     return 0;
 }

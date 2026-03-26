@@ -2135,6 +2135,31 @@ struct StmtLowererState {
         domain = saved;
     }
 
+    bool recordRegisterInit(RegisterInit init, slang::SourceLocation conflictLocation)
+    {
+        for (auto& existing : lowering.registerInits)
+        {
+            if (existing.reg.index != init.reg.index)
+            {
+                continue;
+            }
+            if (existing.initValue == init.initValue)
+            {
+                return true;
+            }
+            if (diagnostics)
+            {
+                diagnostics->warn(
+                    conflictLocation.valid() ? conflictLocation : init.location,
+                    "Conflicting register initializers on the same target are not representable; dropping initValue");
+            }
+            existing.initValue = "__conflicting_register_init__";
+            return false;
+        }
+        lowering.registerInits.push_back(std::move(init));
+        return true;
+    }
+
     void handleVariableInitializer(const slang::ast::VariableSymbol& variable)
     {
         const slang::ast::Expression* init = variable.getInitializer();
@@ -2174,7 +2199,7 @@ struct StmtLowererState {
         regInit.reg = target;
         regInit.initValue = std::move(initValue);
         regInit.location = init->sourceRange.start();
-        lowering.registerInits.push_back(std::move(regInit));
+        (void)recordRegisterInit(std::move(regInit), init->sourceRange.start());
     }
 
     void handleAssignment(const slang::ast::AssignmentExpression& expr)
@@ -8413,9 +8438,7 @@ private:
         init.initValue = std::move(initValue);
         init.location = expr.sourceRange.start();
 
-        lowering.registerInits.push_back(std::move(init));
-
-        return true;
+        return recordRegisterInit(std::move(init), expr.sourceRange.start());
     }
 
     std::optional<slang::ConstantValue> buildUnknownValue(const slang::ast::Type& type) const
@@ -8674,9 +8697,10 @@ public:
 
         if (!regInits.empty())
         {
-            lowering.registerInits.insert(lowering.registerInits.end(),
-                                          std::make_move_iterator(regInits.begin()),
-                                          std::make_move_iterator(regInits.end()));
+            for (auto &init : regInits)
+            {
+                (void)recordRegisterInit(std::move(init), block.location);
+            }
         }
         if (!memInits.empty())
         {
@@ -13465,7 +13489,7 @@ private:
             }
             finalInit = &init;
         }
-        if (!finalInit)
+        if (!finalInit || finalInit->initValue == "__conflicting_register_init__")
         {
             return;
         }

@@ -1254,6 +1254,30 @@ namespace wolvrix::lib::emit
 
         std::unordered_map<std::string, std::string> emittedModuleNames;
         std::unordered_set<std::string> usedModuleNames;
+        auto sanitizeSplitModuleFilename = [](std::string_view rawName) {
+            std::string sanitized;
+            sanitized.reserve(rawName.size());
+            for (unsigned char ch : rawName)
+            {
+                if (std::isalnum(ch) || ch == '_' || ch == '$')
+                {
+                    sanitized.push_back(static_cast<char>(ch));
+                }
+                else
+                {
+                    sanitized.push_back('_');
+                }
+            }
+            while (sanitized.find("..") != std::string::npos)
+            {
+                sanitized.replace(sanitized.find(".."), 2, "__");
+            }
+            if (sanitized.empty())
+            {
+                sanitized = "module";
+            }
+            return sanitized;
+        };
         for (const wolvrix::lib::grh::Graph *graph : emittedGraphs)
         {
             if (!graph)
@@ -1262,7 +1286,23 @@ namespace wolvrix::lib::emit
             }
             const std::string &graphSymbol = graph->symbol();
             std::string emittedName = graphSymbol;
-            usedModuleNames.insert(emittedName);
+            if (options.splitModules)
+            {
+                emittedName = sanitizeSplitModuleFilename(emittedName);
+                if (!usedModuleNames.insert(emittedName).second)
+                {
+                    std::string base = emittedName;
+                    std::size_t suffix = 1;
+                    do
+                    {
+                        emittedName = base + "_" + std::to_string(suffix++);
+                    } while (!usedModuleNames.insert(emittedName).second);
+                }
+            }
+            else
+            {
+                usedModuleNames.insert(emittedName);
+            }
             emittedModuleNames.emplace(graphSymbol, std::move(emittedName));
         }
 
@@ -5869,6 +5909,7 @@ namespace wolvrix::lib::emit
                 std::filesystem::path backupPath;
                 std::string artifactPath;
                 bool hadExistingFile = false;
+                bool published = false;
             };
             std::vector<PendingWrite> pendingWrites;
             pendingWrites.reserve(emittedGraphs.size());
@@ -5911,6 +5952,11 @@ namespace wolvrix::lib::emit
                 {
                     if (!pending.hadExistingFile)
                     {
+                        if (pending.published)
+                        {
+                            std::error_code cleanupEc;
+                            std::filesystem::remove(pending.finalPath, cleanupEc);
+                        }
                         continue;
                     }
                     if (!std::filesystem::exists(pending.backupPath))
@@ -5924,7 +5970,7 @@ namespace wolvrix::lib::emit
                 }
             };
 
-            for (const auto &pending : pendingWrites)
+            for (auto &pending : pendingWrites)
             {
                 if (pending.hadExistingFile)
                 {
@@ -5964,6 +6010,7 @@ namespace wolvrix::lib::emit
                     result.success = false;
                     return result;
                 }
+                pending.published = true;
                 std::error_code cleanupEc;
                 std::filesystem::remove(pending.tempPath, cleanupEc);
                 if (pending.hadExistingFile)
