@@ -620,12 +620,12 @@ namespace wolvrix::lib::transform
             if (i + 1 == segments.size())
             {
                 std::string prefix;
-                for (std::size_t segIndex = 1; segIndex < segments.size(); ++segIndex)
+                for (std::size_t segIndex = 0; segIndex < segments.size(); ++segIndex)
                 {
                     std::string part = wolvrix::lib::grh::Graph::normalizeComponent(segments[segIndex]);
                     if (part.empty())
                     {
-                        part = "inst";
+                        part = segIndex == 0 ? "root" : "inst";
                     }
                     if (!part.empty() && part.front() >= '0' && part.front() <= '9')
                     {

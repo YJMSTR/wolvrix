@@ -131,10 +131,16 @@ Design buildSingleGraphDesign()
     graph.bindInputPort("clk", clk);
 
     const auto addOut = makeValue(graph, "sum", 8, false);
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
     const auto add = graph.createOperation(OperationKind::kAdd, graph.internSymbol("add"));
     graph.addOperand(add, inA);
     graph.addOperand(add, inB);
     graph.addResult(add, addOut);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, addOut);
+    graph.addResult(assign, outY);
 
     const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
     const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
@@ -201,6 +207,57 @@ Design buildHierDesign()
                 {topY},
                 {"a", "b", "clk"},
                 {"y"});
+
+    return design;
+}
+
+Design buildCrossRootSharedLeafDesign()
+{
+    Design design;
+    auto &leaf = design.createGraph("leaf");
+    auto &top0 = design.createGraph("top0");
+    auto &top1 = design.createGraph("top1");
+    design.markAsTop("top0");
+    design.markAsTop("top1");
+
+    const auto leafA = makeValue(leaf, "a", 8, false);
+    const auto leafB = makeValue(leaf, "b", 8, false);
+    const auto leafClk = makeValue(leaf, "clk", 1, false);
+    const auto leafY = makeValue(leaf, "y", 8, false);
+    leaf.bindInputPort("a", leafA);
+    leaf.bindInputPort("b", leafB);
+    leaf.bindInputPort("clk", leafClk);
+    leaf.bindOutputPort("y", leafY);
+    const auto leafSum = makeValue(leaf, "sum", 8, false);
+    const auto leafAdd = leaf.createOperation(OperationKind::kAdd, leaf.internSymbol("leaf_add"));
+    leaf.addOperand(leafAdd, leafA);
+    leaf.addOperand(leafAdd, leafB);
+    leaf.addResult(leafAdd, leafSum);
+    const auto leafAssign = leaf.createOperation(OperationKind::kAssign, leaf.internSymbol("leaf_assign_y"));
+    leaf.addOperand(leafAssign, leafSum);
+    leaf.addResult(leafAssign, leafY);
+    const auto one = makeConstant(leaf, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(leaf, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(leaf, "leaf_reg_write", one, leafSum, mask, leafClk, "state");
+
+    for (auto *top : {&top0, &top1})
+    {
+        const auto a = makeValue(*top, "a", 8, false);
+        const auto b = makeValue(*top, "b", 8, false);
+        const auto clk = makeValue(*top, "clk", 1, false);
+        const auto y = makeValue(*top, "y", 8, false);
+        top->bindInputPort("a", a);
+        top->bindInputPort("b", b);
+        top->bindInputPort("clk", clk);
+        top->bindOutputPort("y", y);
+        addInstance(*top,
+                    "u_leaf",
+                    "leaf",
+                    {a, b, clk},
+                    {y},
+                    {"a", "b", "clk"},
+                    {"y"});
+    }
 
     return design;
 }
@@ -369,6 +426,33 @@ void testFailureOnStaleMetadataAfterMutation()
     expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
 }
 
+void testFailureOnStaleMetadataAfterDestructiveMutation()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    auto *graph = design.findGraph("top");
+    expect(graph != nullptr, "destructive stale metadata fixture should resolve top graph");
+    const auto assignOp = graph->findOperation("assign_y");
+    expect(assignOp.valid(), "destructive stale metadata fixture should find output assign op");
+    expect(graph->removeOutputPort("y"), "destructive stale metadata fixture should remove output port");
+    expect(graph->eraseOpUnchecked(assignOp), "destructive stale metadata fixture should erase the output assign op");
+
+    const auto dir = artifactRoot() / "stale_metadata_destructive";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "EmitGsimCpp should reject stale metadata after destructive graph mutation");
+    expect(diags.hasError(), "destructive stale metadata should produce diagnostics");
+    expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
+}
+
 void testGraphOnlyAndMultiHopTargetSelectionConsistency()
 {
     {
@@ -414,8 +498,47 @@ void testGraphOnlyAndMultiHopTargetSelectionConsistency()
 
         const std::string source = readFile(dir / "gsim_leaf.cpp");
         expect(contains(source, "metadata.selection_path = \"top.u_mid.u_leaf\";"), "multi-hop selection should preserve instance path");
-        expect(contains(source, "metadata.scratchpad_namespace = \"gsim.leaf.path.u_mid$u_leaf\";"), "multi-hop selection should keep instance-scoped namespace");
+        expect(contains(source, "metadata.scratchpad_namespace = \"gsim.leaf.path.top$u_mid$u_leaf\";"), "multi-hop selection should keep instance-scoped namespace");
         expect(contains(source, "metadata.graph_symbol = \"leaf\";"), "multi-hop selection should resolve to leaf graph metadata");
+    }
+}
+
+void testCrossRootInstancePathsStayDistinct()
+{
+    Design design = buildCrossRootSharedLeafDesign();
+    runGsim(design, "top0.u_leaf");
+    runGsim(design, "top1.u_leaf");
+
+    {
+        const auto dir = artifactRoot() / "cross_root_top0";
+        cleanDir(dir);
+        EmitDiagnostics diags;
+        EmitGsimCpp emitter(&diags);
+        EmitOptions options;
+        options.outputDir = dir.string();
+        options.attributes["path"] = "top0.u_leaf";
+        options.topOverrides = {"top0", "top1"};
+        const EmitResult result = emitter.emit(design, options);
+        expect(result.success, "EmitGsimCpp should succeed for top0 shared-leaf path");
+        const std::string source = readFile(dir / "gsim_leaf.cpp");
+        expect(contains(source, "metadata.scratchpad_namespace = \"gsim.leaf.path.top0$u_leaf\";"),
+               "top0 shared-leaf path should use root-qualified namespace");
+    }
+
+    {
+        const auto dir = artifactRoot() / "cross_root_top1";
+        cleanDir(dir);
+        EmitDiagnostics diags;
+        EmitGsimCpp emitter(&diags);
+        EmitOptions options;
+        options.outputDir = dir.string();
+        options.attributes["path"] = "top1.u_leaf";
+        options.topOverrides = {"top0", "top1"};
+        const EmitResult result = emitter.emit(design, options);
+        expect(result.success, "EmitGsimCpp should succeed for top1 shared-leaf path");
+        const std::string source = readFile(dir / "gsim_leaf.cpp");
+        expect(contains(source, "metadata.scratchpad_namespace = \"gsim.leaf.path.top1$u_leaf\";"),
+               "top1 shared-leaf path should use distinct root-qualified namespace");
     }
 }
 
@@ -430,7 +553,9 @@ int main()
         testFailureOnPlaceholderContract();
         testFailureOnNamespacePathMismatch();
         testFailureOnStaleMetadataAfterMutation();
+        testFailureOnStaleMetadataAfterDestructiveMutation();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
+        testCrossRootInstancePathsStayDistinct();
     }
     catch (const std::exception &ex)
     {

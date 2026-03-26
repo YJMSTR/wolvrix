@@ -181,6 +181,26 @@ namespace wolvrix::lib::transform
             return true;
         }
 
+        std::string pathRenamePrefix(std::string_view path)
+        {
+            const auto segments = splitTargetPath(path);
+            std::string prefix;
+            for (std::size_t i = 1; i < segments.size(); ++i)
+            {
+                const std::string part = normalizeComponent(segments[i]);
+                if (part.empty())
+                {
+                    continue;
+                }
+                if (!prefix.empty())
+                {
+                    prefix.push_back('$');
+                }
+                prefix.append(part);
+            }
+            return prefix;
+        }
+
         bool designHasXmrTargetingSubtree(wolvrix::lib::grh::Design &design,
                                           std::string_view path)
         {
@@ -683,6 +703,8 @@ namespace wolvrix::lib::transform
             result.failed = true;
             return result;
         }
+        const std::string renamePrefix = pathRenamePrefix(options_.path);
+        resolved->prefix = renamePrefix;
 
         {
             const auto graphsToCheck = collectGraphsAlongTargetPath(design(), options_.path,
@@ -740,6 +762,7 @@ namespace wolvrix::lib::transform
                 result.failed = true;
                 return result;
             }
+            trialResolved->prefix = renamePrefix;
 
             const auto trialInstOp = trialResolved->parentGraph->getOperation(trialResolved->instanceOp);
             ValueMap trialPortMap;

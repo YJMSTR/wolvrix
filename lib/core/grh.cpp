@@ -3734,6 +3734,10 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         bool removed = builder.removeInputPort(name);
+        if (removed)
+        {
+            touchRevision();
+        }
         if (removed && !portsCacheDirty_)
         {
             inputPortsCache_.clear();
@@ -3746,6 +3750,10 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         bool removed = builder.removeOutputPort(name);
+        if (removed)
+        {
+            touchRevision();
+        }
         if (removed && !portsCacheDirty_)
         {
             outputPortsCache_.clear();
@@ -3758,6 +3766,10 @@ namespace wolvrix::lib::grh
     {
         GraphBuilder &builder = ensureBuilder();
         bool removed = builder.removeInoutPort(name);
+        if (removed)
+        {
+            touchRevision();
+        }
         if (removed && !portsCacheDirty_)
         {
             inoutPortsCache_.clear();
@@ -3888,6 +3900,7 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOp(op);
         if (result)
         {
+            touchRevision();
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -3909,6 +3922,7 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOp(op, replacementResults);
         if (result)
         {
+            touchRevision();
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -3930,6 +3944,7 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseOpUnchecked(op);
         if (result)
         {
+            touchRevision();
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -3951,6 +3966,7 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseValue(value);
         if (result)
         {
+            touchRevision();
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);
@@ -3972,6 +3988,7 @@ namespace wolvrix::lib::grh
         bool result = builder.eraseValueUnchecked(value);
         if (result)
         {
+            touchRevision();
             if (declaredSymbol.valid() && isDeclaredSymbol(declaredSymbol))
             {
                 removeDeclaredSymbol(declaredSymbol);

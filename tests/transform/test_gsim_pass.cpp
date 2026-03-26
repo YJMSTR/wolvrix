@@ -379,6 +379,39 @@ grh::Design buildRetimableMemoryFixture(bool addSecondWrite = false)
     return design;
 }
 
+grh::Design buildCrossRootSharedLeafFixture()
+{
+    grh::Design design;
+    auto &leaf = design.createGraph("leaf");
+    auto &top0 = design.createGraph("top0");
+    auto &top1 = design.createGraph("top1");
+    design.markAsTop("top0");
+    design.markAsTop("top1");
+
+    buildLeafStatefulGraph(leaf);
+
+    for (auto *top : {&top0, &top1})
+    {
+        const auto a = makeValue(*top, "a", 8, false);
+        const auto b = makeValue(*top, "b", 8, false);
+        const auto clk = makeValue(*top, "clk", 1, false);
+        const auto y = makeValue(*top, "y", 8, false);
+        top->bindInputPort("a", a);
+        top->bindInputPort("b", b);
+        top->bindInputPort("clk", clk);
+        top->bindOutputPort("y", y);
+        addInstance(*top,
+                    "u_leaf",
+                    "leaf",
+                    {a, b, clk},
+                    {y},
+                    {"a", "b", "clk"},
+                    {"y"});
+    }
+
+    return design;
+}
+
 void testPassRegistration()
 {
     const auto names = availableTransformPasses();
@@ -552,12 +585,30 @@ void testMultiHopInstancePathUsesSharedResolver()
 
     expect(result.success, "gsim multi-hop target path should succeed");
     expect(!diags.hasError(), "gsim multi-hop target path should not emit errors");
-    expect(design.hasScratchpad("gsim.leaf.path.u_mid$u_leaf.topology.order"),
+    expect(design.hasScratchpad("gsim.leaf.path.top$u_mid$u_leaf.topology.order"),
            "gsim should keep multi-hop metadata instance-scoped when the target graph is shared");
     expect(!design.hasScratchpad("gsim.leaf.topology.order"),
            "gsim instance path should not collapse shared-module metadata into the graph-only namespace");
     expect(!design.hasScratchpad("gsim.mid.topology.order"),
            "gsim instance path should not analyze unrelated intermediate graph metadata");
+}
+
+void testCrossRootInstancePathsStayDistinct()
+{
+    grh::Design design = buildCrossRootSharedLeafFixture();
+
+    PassDiagnostics diags0;
+    const auto result0 = runGsim(design, "top0.u_leaf", diags0);
+    expectGsimSuccess(result0, diags0, "gsim should succeed for top0 shared-leaf path");
+
+    PassDiagnostics diags1;
+    const auto result1 = runGsim(design, "top1.u_leaf", diags1);
+    expectGsimSuccess(result1, diags1, "gsim should succeed for top1 shared-leaf path");
+
+    expect(design.hasScratchpad("gsim.leaf.path.top0$u_leaf.topology.order"),
+           "top0 instance path should use a root-qualified namespace");
+    expect(design.hasScratchpad("gsim.leaf.path.top1$u_leaf.topology.order"),
+           "top1 instance path should use a distinct root-qualified namespace");
 }
 
 void testMetadataOrderIsDeterministic()
@@ -813,6 +864,7 @@ int main()
         testPassRegistration();
         testGraphOnlyPathWritesMetadata();
         testMultiHopInstancePathUsesSharedResolver();
+        testCrossRootInstancePathsStayDistinct();
         testMetadataOrderIsDeterministic();
         testPrerequisiteAuditPipelineCoverage();
         testFailuresAreClear();

@@ -17,24 +17,40 @@ scratchpad 的目标是承载**可复用但非 JSON 持久化**的派生 metadat
 - emitter 或后续 pass 在同一 `Design` 上继续消费 metadata
 - 同一 namespace 在重复运行时被确定性覆盖
 
-### 2. key 级覆盖
+### 2. key 级覆盖与命名空间
 
 `setScratchpad(key, value)` 会直接替换同名 key 的旧值。
 
 约定上，pass 应使用稳定且带 namespace 的 key，例如：
 - `supernode.<graph>.count`
-- `gsim.<graph>.roots`
+- graph-only GSim target：`gsim.<graph>.*`
+- instance-path GSim target：`gsim.<graph>.path.<root$inst$...>.*`
 
-### 3. 显式清理
+其中 GSim 的 canonical namespace 规则是：
+- graph-only 选择按目标 graph 符号命名
+- instance-path 选择按 **root-qualified** 实例链命名，避免不同 root 下相同局部实例链发生别名冲突
+
+### 3. revision 驱动的 freshness 合同
+
+每个 `grh::Graph` 都维护单调递增的 `revision()`。
+
+任何会改变 graph 结构、端口绑定、连接关系、符号绑定或影响派生分析结果的 mutator，都必须推进 revision。`gsim` 在写出 scratchpad metadata 时会同时记录目标 graph 的 `graph_revision`，而 `EmitGsimCpp` 在消费 metadata 时会把记录值与当前 graph revision 比对：
+
+- revision 一致：metadata 视为仍然新鲜，可继续消费
+- revision 不一致：metadata 视为 stale，emit 必须显式失败
+
+这条 revision 检查是 stale-metadata 的主防线；显式 namespace 清理仍然保留，但只作为 hygiene，而不是唯一保护。
+
+### 4. 显式清理
 
 `Design` 提供三种清理方式：
 - `eraseScratchpad(key)`：删除单个 key
 - `eraseScratchpadNamespace(prefix)`：删除某个前缀 namespace 下的所有 key
 - `clearScratchpad()`：清空整个 scratchpad
 
-会修改图结构并可能使旧 metadata 失效的 mutating transforms，必须在自身语义下显式失效相关 namespace，而不是依赖 `PassManager` 自动清空。
+会修改图结构并可能使旧 metadata 失效的 mutating transforms，应该在自身语义下显式失效相关 namespace；但 consumer 仍必须依赖 revision 合同拒绝 stale metadata，而不是假设所有 mutator 都做了完美清理。
 
-### 4. clone / dryrun 隔离
+### 5. clone / dryrun 隔离
 
 `Design::clone()` 不复制 scratchpad。
 
@@ -61,7 +77,12 @@ scratchpad 不参与 GRH JSON 序列化。
 
 当前回归测试已经覆盖：
 - 同一 `Design` 上跨 `PassManager::run(...)` 持久化
-- 同一 key 的确定性覆盖
+- 同一 key / namespace 的确定性覆盖
+- graph-only 与 instance-path `gsim` namespace 的区分
+- cross-root instance-path namespace 不会互相别名
+- malformed target path 会显式失败，而不是被静默归一化
 - dryrun clone 不污染原始 `Design`
 - `Design::clone()` 不继承 scratchpad
 - JSON roundtrip 后 scratchpad 丢失
+- `EmitGsimCpp` 会拒绝缺失、结构不匹配、placeholder、namespace/path 不匹配、以及 revision 不匹配的 stale metadata
+- destructive graph mutation（例如 remove/erase 路径）之后，旧 `gsim` metadata 会因 revision 变化而被拒绝
