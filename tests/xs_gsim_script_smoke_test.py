@@ -63,6 +63,10 @@ def main() -> int:
         filelist_path.write_text(f"{sv_path}\n", encoding="utf-8")
         read_args_path.write_text("\n", encoding="utf-8")
 
+        env = dict(os.environ)
+        env["PYTHONNOUSERSITE"] = "1"
+        env["WOLVRIX_PYTHON_BUILD_DIR"] = str(REPO_ROOT / "wolvrix" / "build" / "python")
+        env["PYTHONPATH"] = str(REPO_ROOT / "wolvrix" / "build" / "python")
         result = subprocess.run(
             [
                 sys.executable,
@@ -77,6 +81,7 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
             check=False,
         )
         expect(result.returncode == 0, f"script failed: {result.stderr.strip() or result.stdout.strip()}")
