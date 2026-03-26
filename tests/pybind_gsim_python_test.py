@@ -14,6 +14,16 @@ BUILD_PYTHON_DIR = pathlib.Path(
 )
 
 
+def fail(message: str) -> int:
+    print(f"[pybind-gsim] {message}", file=sys.stderr)
+    return 1
+
+
+def expect(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
 def load_wolvrix_from_build() -> object:
     candidate = BUILD_PYTHON_DIR / "wolvrix" / "__init__.py"
     native = BUILD_PYTHON_DIR / "wolvrix" / "_wolvrix.so"
@@ -90,16 +100,6 @@ module top1(
     leaf u_leaf(.a(a), .b(b), .clk(clk), .y(y));
 endmodule
 """
-
-
-def fail(message: str) -> int:
-    print(f"[pybind-gsim] {message}", file=sys.stderr)
-    return 1
-
-
-def expect(condition: bool, message: str) -> None:
-    if not condition:
-        raise RuntimeError(message)
 
 
 def reset_dir(path: pathlib.Path) -> None:
