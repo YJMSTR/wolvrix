@@ -426,6 +426,14 @@ if (WOLVRIX_BUILD_PYTHON)
     set_tests_properties(pybind-gsim PROPERTIES
         ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
     )
+
+    add_test(
+        NAME xs-gsim-script-smoke
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/xs_gsim_script_smoke_test.py"
+    )
+    set_tests_properties(xs-gsim-script-smoke PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
 endif()
 
 add_executable(json-emit-verilator-repcut-package

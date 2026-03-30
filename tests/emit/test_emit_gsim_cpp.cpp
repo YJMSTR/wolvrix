@@ -336,6 +336,7 @@ void testHappyPathAfterRunningGsim()
     expect(contains(header, "set_difftest__DOT__uart__DOT__in__DOT__ch"), "header should expose downstream UART input mutator");
     expect(contains(header, "get_difftest__DOT__exit()"), "header should expose difftest exit accessor");
     expect(contains(header, "get_difftest__DOT__step()"), "header should expose difftest step accessor");
+    expect(!contains(header, "difftest_exit_ = 1;"), "generated downstream step should not force difftest exit on every non-reset step");
     expect(contains(header, "set_difftest__DOT__perfCtrl__DOT__clean"), "header should expose perf clean mutator");
     expect(contains(header, "set_difftest__DOT__perfCtrl__DOT__dump"), "header should expose perf dump mutator");
     expect(contains(header, "set_difftest__DOT__logCtrl__DOT__begin"), "header should expose log begin mutator");

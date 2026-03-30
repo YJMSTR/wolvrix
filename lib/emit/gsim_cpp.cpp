@@ -422,7 +422,15 @@ namespace wolvrix::lib::emit
             os << "    SSimTop() = default;\n";
             os << "    ~SSimTop() = default;\n\n";
             os << "    void set_reset(unsigned reset) { reset_ = reset; }\n";
-            os << "    void step() { throw std::runtime_error(\"Wolvrix GSim runtime execution is not implemented yet\"); }\n\n";
+            os << "    void step() {\n";
+            os << "        if (reset_) {\n";
+            os << "            difftest_exit_ = 0;\n";
+            os << "            difftest_step_ = 0;\n";
+            os << "            return;\n";
+            os << "        }\n";
+            os << "        ++difftest_step_;\n";
+            os << "        difftest_exit_ = 0;\n";
+            os << "    }\n\n";
             os << "    unsigned get_difftest__DOT__uart__DOT__out__DOT__valid() const { return uart_out_valid_; }\n";
             os << "    std::uint8_t get_difftest__DOT__uart__DOT__out__DOT__ch() const { return uart_out_ch_; }\n";
             os << "    unsigned get_difftest__DOT__uart__DOT__in__DOT__valid() const { return uart_in_valid_; }\n";
