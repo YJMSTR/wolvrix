@@ -250,11 +250,8 @@ namespace wolvrix::lib::transform
 
             if (order.size() != records.size())
             {
-                order.clear();
-                for (const auto &record : records)
-                {
-                    order.push_back(record.id);
-                }
+                // Cycle detected: return empty to signal failure
+                return {};
             }
             return order;
         }
@@ -502,6 +499,16 @@ namespace wolvrix::lib::transform
 
             const auto records = collectRecords(*graph);
             const auto topoOrder = stableTopologicalOrder(records);
+
+            if (topoOrder.empty() && !records.empty())
+            {
+                error("irreducible combinational cycle detected",
+                      "topological ordering failed for " +
+                          std::to_string(records.size()) + " operations in graph '" +
+                          std::string(graph->symbol()) + "'");
+                return PassResult{false, true, {}};
+            }
+
             auto metadata = buildMetadata(*graph, records, topoOrder);
 
             writeMetadata(*graph,
