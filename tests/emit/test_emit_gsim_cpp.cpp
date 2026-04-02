@@ -638,6 +638,15 @@ void testPortOrderDecl()
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "port_order=decl should succeed");
+
+    // Verify declaration order: a, b, clk (as registered in buildSingleGraphDesign)
+    const std::string header = readFile(dir / "po_decl.hpp");
+    auto posA = header.find("set_a(");
+    auto posB = header.find("set_b(");
+    auto posClk = header.find("set_clk(");
+    expect(posA != std::string::npos && posB != std::string::npos && posClk != std::string::npos,
+           "decl-ordered header should contain all input port setters");
+    expect(posA < posB && posB < posClk, "decl ordering should preserve a < b < clk registration order");
 }
 
 void testPortOrderAlpha()
@@ -721,6 +730,155 @@ void testPortOrderInvalidName()
     expect(diags.hasError(), "should emit error for nonexistent port name");
 }
 
+void testPortOrderDuplicateName()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "port_order_dup";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("po_dup");
+    options.topOverrides = {"top"};
+    options.portOrderStrategy = PortOrderStrategy::Custom;
+    options.portOrderNames = {"clk", "b", "b", "a"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "port_order=custom with duplicate name should fail");
+    expect(diags.hasError(), "should emit error for duplicate port name");
+}
+
+void testVersionMismatchRejection()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    // Mutate schedule version to 2
+    design.setScratchpad<int64_t>("gsim.top.schedule.version", 2);
+
+    const auto dir = artifactRoot() / "version_mismatch";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("vm_test");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "emit should reject schedule.version != 1");
+    expect(diags.hasError(), "should emit version mismatch diagnostic");
+}
+
+void testHypergraphVersionMismatchRejection()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    // Mutate hypergraph version to 99
+    design.setScratchpad<int64_t>("gsim.top.hypergraph.version", 99);
+
+    const auto dir = artifactRoot() / "hg_version_mismatch";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("hgvm_test");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "emit should reject hypergraph.version != 1");
+    expect(diags.hasError(), "should emit version mismatch diagnostic");
+}
+
+void testRegisterLatencyBehavior()
+{
+    // Build a design where output is driven through a register
+    Design design;
+    auto &graph = design.createGraph("reg_top");
+    design.markAsTop("reg_top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inClk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("clk", inClk);
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    // Register: stores 'a' on clock edge
+    const auto regOut = makeValue(graph, "reg_state_out", 8, false);
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.addResult(regOp, regOut);
+
+    // Register read port -> output
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    graph.addResult(readOp, readVal);
+
+    const auto assignY = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assignY, readVal);
+    graph.addResult(assignY, outY);
+
+    // Register write port: always write 'a'
+    const auto one = makeConstant(graph, "one", "one_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 8, "8'hff");
+    makeRegisterWrite(graph, "state_wp", one, inA, mask, inClk, "state");
+
+    // Run gsim
+    runGsim(design, "reg_top");
+
+    const auto dir = artifactRoot() / "reg_latency";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reg_sim");
+    options.topOverrides = {"reg_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "register latency emit should succeed");
+
+    // Write driver that checks 1-cycle latency
+    const std::filesystem::path driverPath = dir / "reg_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"reg_sim.hpp\"\n";
+        driver << "#include \"reg_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    // After reset, output should be 0\n";
+        driver << "    if (sim.get_y() != 0) { printf(\"FAIL: after reset y=%d expected 0\\n\", sim.get_y()); return 1; }\n";
+        driver << "    sim.set_a(42); sim.step();\n";
+        driver << "    // Register captures 42, but output shows old value (0) due to 1-cycle latency\n";
+        driver << "    if (sim.get_y() != 0) { printf(\"FAIL: step1 y=%d expected 0\\n\", sim.get_y()); return 1; }\n";
+        driver << "    sim.step();\n";
+        driver << "    // Now output should show captured value (42)\n";
+        driver << "    if (sim.get_y() != 42) { printf(\"FAIL: step2 y=%d expected 42\\n\", sim.get_y()); return 1; }\n";
+        driver << "    printf(\"REGISTER LATENCY PASS\\n\");\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "reg_driver_exe").string();
+    const std::string compileCmd = "g++ -std=c++17 -Wall -Wextra -I " +
+        dir.string() + " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "register latency driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "register latency driver should pass");
+}
+
 int main()
 {
     try
@@ -738,6 +896,10 @@ int main()
         testPortOrderAlpha();
         testPortOrderCustom();
         testPortOrderInvalidName();
+        testPortOrderDuplicateName();
+        testVersionMismatchRejection();
+        testHypergraphVersionMismatchRejection();
+        testRegisterLatencyBehavior();
     }
     catch (const std::exception &ex)
     {

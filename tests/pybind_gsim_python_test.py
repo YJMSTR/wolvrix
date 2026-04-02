@@ -224,12 +224,104 @@ def test_cross_root_target_paths_stay_distinct() -> None:
            "top1 cross-root emit should preserve its root-qualified namespace")
 
 
+def test_port_order_alpha() -> None:
+    root = ARTIFACT_ROOT / "port_order_alpha"
+    source_dir = root / "src"
+    out_dir = root / "out"
+    reset_dir(source_dir)
+    reset_dir(out_dir)
+
+    design = create_design(source_dir)
+    design.run_pipeline([["gsim", ["-path", "top"]]], print_diagnostics_level="off")
+    base = out_dir / "alpha_test"
+    wolvrix.write_gsim_cpp(design, str(base), top=["top"], port_order="alpha")
+    header = base.with_suffix(".hpp").read_text(encoding="utf-8")
+    pos_a = header.find("set_a(")
+    pos_b = header.find("set_b(")
+    pos_clk = header.find("set_clk(")
+    expect(pos_a < pos_b < pos_clk, "alpha order should put a < b < clk")
+
+
+def test_port_order_custom() -> None:
+    root = ARTIFACT_ROOT / "port_order_custom"
+    source_dir = root / "src"
+    out_dir = root / "out"
+    reset_dir(source_dir)
+    reset_dir(out_dir)
+
+    design = create_design(source_dir)
+    design.run_pipeline([["gsim", ["-path", "top"]]], print_diagnostics_level="off")
+    base = out_dir / "custom_test"
+    wolvrix.write_gsim_cpp(design, str(base), top=["top"],
+                           port_order="custom", port_order_names=["clk", "b", "a", "y"])
+    header = base.with_suffix(".hpp").read_text(encoding="utf-8")
+    pos_clk = header.find("set_clk(")
+    pos_b = header.find("set_b(")
+    pos_a = header.find("set_a(")
+    expect(pos_clk < pos_b < pos_a, "custom order should put clk < b < a")
+
+
+def test_port_order_invalid_strategy() -> None:
+    root = ARTIFACT_ROOT / "port_order_invalid"
+    source_dir = root / "src"
+    out_dir = root / "out"
+    reset_dir(source_dir)
+    reset_dir(out_dir)
+
+    design = create_design(source_dir)
+    design.run_pipeline([["gsim", ["-path", "top"]]], print_diagnostics_level="off")
+    base = out_dir / "invalid_test"
+    try:
+        wolvrix.write_gsim_cpp(design, str(base), top=["top"], port_order="bogus")
+        raise RuntimeError("expected error for invalid strategy")
+    except (ValueError, RuntimeError) as ex:
+        expect("port_order must be one of" in str(ex),
+               f"expected port_order error, got: {ex}")
+
+
+def test_port_order_nonexistent_name() -> None:
+    root = ARTIFACT_ROOT / "port_order_noname"
+    source_dir = root / "src"
+    out_dir = root / "out"
+    reset_dir(source_dir)
+    reset_dir(out_dir)
+
+    design = create_design(source_dir)
+    design.run_pipeline([["gsim", ["-path", "top"]]], print_diagnostics_level="off")
+    base = out_dir / "noname_test"
+    expect_runtime_error_contains(
+        lambda: wolvrix.write_gsim_cpp(design, str(base), top=["top"],
+                                       port_order="custom", port_order_names=["fake_port"]),
+        "nonexistent port")
+
+
+def test_port_order_duplicate_name() -> None:
+    root = ARTIFACT_ROOT / "port_order_dup"
+    source_dir = root / "src"
+    out_dir = root / "out"
+    reset_dir(source_dir)
+    reset_dir(out_dir)
+
+    design = create_design(source_dir)
+    design.run_pipeline([["gsim", ["-path", "top"]]], print_diagnostics_level="off")
+    base = out_dir / "dup_test"
+    expect_runtime_error_contains(
+        lambda: wolvrix.write_gsim_cpp(design, str(base), top=["top"],
+                                       port_order="custom", port_order_names=["clk", "b", "b", "a"]),
+        "duplicate port")
+
+
 def main() -> int:
     try:
         test_same_design_pipeline_flow()
         test_failure_without_prior_gsim_metadata()
         test_failure_after_json_roundtrip()
         test_cross_root_target_paths_stay_distinct()
+        test_port_order_alpha()
+        test_port_order_custom()
+        test_port_order_invalid_strategy()
+        test_port_order_nonexistent_name()
+        test_port_order_duplicate_name()
     except Exception as ex:
         return fail(str(ex))
     return 0

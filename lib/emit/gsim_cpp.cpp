@@ -1420,9 +1420,15 @@ namespace wolvrix::lib::emit
             std::set<std::string> allPortNames;
             for (const auto& [name, type] : state.inputPorts) allPortNames.insert(name);
             for (const auto& [name, type] : state.outputPorts) allPortNames.insert(name);
+            std::set<std::string> seenNames;
             for (const auto& name : options.portOrderNames) {
                 if (allPortNames.find(name) == allPortNames.end()) {
                     reportError("port_order_names contains nonexistent port", name);
+                    result.success = false;
+                    return result;
+                }
+                if (!seenNames.insert(name).second) {
+                    reportError("port_order_names contains duplicate port", name);
                     result.success = false;
                     return result;
                 }
