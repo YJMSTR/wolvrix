@@ -392,6 +392,7 @@ namespace wolvrix::lib::emit
                 case OperationKind::kReplicate: {
                     auto countAttr = op.attr("replicateCount");
                     if (!countAttr) countAttr = op.attr("count");
+                    if (!countAttr) countAttr = op.attr("rep");
                     int64_t count = 1;
                     if (countAttr) {
                         if (auto* intVal = std::get_if<int64_t>(&*countAttr)) {

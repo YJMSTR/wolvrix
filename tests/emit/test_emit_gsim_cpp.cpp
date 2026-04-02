@@ -262,6 +262,43 @@ Design buildCrossRootSharedLeafDesign()
     return design;
 }
 
+Design buildReplicateSignExtendDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("signext_top");
+    design.markAsTop("signext_top");
+
+    const auto in = makeValue(graph, "in", 8, false);
+    const auto out = makeValue(graph, "out", 32, false);
+    graph.bindInputPort("in", in);
+    graph.bindOutputPort("out", out);
+
+    const auto signBit = makeValue(graph, "sign_bit", 1, false);
+    const auto slice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("slice_sign"));
+    graph.addOperand(slice, in);
+    graph.addResult(slice, signBit);
+    graph.setAttr(slice, "sliceStart", static_cast<int64_t>(7));
+    graph.setAttr(slice, "sliceEnd", static_cast<int64_t>(7));
+
+    const auto replicated = makeValue(graph, "replicated_sign", 24, false);
+    const auto replicate = graph.createOperation(OperationKind::kReplicate, graph.internSymbol("replicate_sign"));
+    graph.addOperand(replicate, signBit);
+    graph.addResult(replicate, replicated);
+    graph.setAttr(replicate, "rep", static_cast<int64_t>(24));
+
+    const auto concatValue = makeValue(graph, "concat_out", 32, false);
+    const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("concat_signext"));
+    graph.addOperand(concat, replicated);
+    graph.addOperand(concat, in);
+    graph.addResult(concat, concatValue);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_out"));
+    graph.addOperand(assign, concatValue);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
 void runGsim(Design &design, const std::string &path)
 {
     PassManager manager;
@@ -879,6 +916,56 @@ void testRegisterLatencyBehavior()
     expect(std::system(exePath.c_str()) == 0, "register latency driver should pass");
 }
 
+void testReplicateSignExtendBehavior()
+{
+    Design design = buildReplicateSignExtendDesign();
+    runGsim(design, "signext_top");
+
+    const auto dir = artifactRoot() / "replicate_signext";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("signext_sim");
+    options.topOverrides = {"signext_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "replicate sign-extend emit should succeed");
+    expect(!diags.hasError(), "replicate sign-extend emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "signext_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"signext_sim.hpp\"\n";
+        driver << "#include \"signext_sim.cpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_in(static_cast<std::uint8_t>(0x7f)); sim.step();\n";
+        driver << "    if (sim.get_out() != static_cast<std::uint32_t>(0x0000007fU)) {\n";
+        driver << "        std::printf(\"FAIL: pos out=%u expected=%u\\n\", sim.get_out(), static_cast<std::uint32_t>(0x0000007fU));\n";
+        driver << "        return 1;\n";
+        driver << "    }\n";
+        driver << "    sim.set_in(static_cast<std::uint8_t>(0x80)); sim.step();\n";
+        driver << "    if (sim.get_out() != static_cast<std::uint32_t>(0xffffff80U)) {\n";
+        driver << "        std::printf(\"FAIL: neg out=%u expected=%u\\n\", sim.get_out(), static_cast<std::uint32_t>(0xffffff80U));\n";
+        driver << "        return 1;\n";
+        driver << "    }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "signext_driver_exe").string();
+    const std::string compileCmd = "g++ -std=c++17 -Wall -Wextra -Werror -I " +
+        dir.string() + " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "replicate sign-extend driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "replicate sign-extend driver should pass");
+}
+
 int main()
 {
     try
@@ -900,6 +987,7 @@ int main()
         testVersionMismatchRejection();
         testHypergraphVersionMismatchRejection();
         testRegisterLatencyBehavior();
+        testReplicateSignExtendBehavior();
     }
     catch (const std::exception &ex)
     {

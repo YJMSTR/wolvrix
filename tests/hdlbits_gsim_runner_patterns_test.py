@@ -63,8 +63,24 @@ def main() -> int:
     try:
         reset_dir(ARTIFACT_ROOT)
         expect(SCRIPT_PATH.exists(), f"missing runtime helper: {SCRIPT_PATH}")
-        run_dut("001")
-        run_dut("006")
+        for dut_id in (
+            "001",
+            "002",
+            "004",
+            "005",
+            "008",
+            "011",
+            "014",
+            "018",
+            "021",
+            "025",
+            "029",
+            "031",
+            "033",
+            "038",
+            "030",
+        ):
+            run_dut(dut_id)
     except Exception as ex:
         return fail(str(ex))
     return 0
