@@ -858,9 +858,12 @@ namespace wolvrix::lib::emit
                 reportError("gsim scratchpad metadata is malformed", scratchPrefix + ".graph_revision must be non-negative");
                 return std::nullopt;
             }
-            if (metadata.scheduleVersion <= 0 || metadata.hypergraphVersion <= 0)
+            if (metadata.scheduleVersion != 1 || metadata.hypergraphVersion != 1)
             {
-                reportError("gsim scratchpad metadata is malformed", scratchPrefix + " metadata version must be positive");
+                reportError("gsim scratchpad metadata version mismatch",
+                            scratchPrefix + " requires schedule.version=1 and hypergraph.version=1, got " +
+                            std::to_string(metadata.scheduleVersion) + " and " +
+                            std::to_string(metadata.hypergraphVersion));
                 return std::nullopt;
             }
             if (metadata.scheduleKind != "activity-v1" || metadata.scheduleContract != "gsim.activity.schedule.v1")
@@ -1327,7 +1330,7 @@ namespace wolvrix::lib::emit
             os << "    if (metadata.schedule_contract != \"gsim.activity.schedule.v1\") return false;\n";
             os << "    if (metadata.hypergraph_kind != \"activity-connectivity-v1\") return false;\n";
             os << "    if (metadata.hypergraph_contract != \"gsim.activity.hypergraph.v1\") return false;\n";
-            os << "    if (metadata.schedule_version <= 0 || metadata.hypergraph_version <= 0) return false;\n";
+            os << "    if (metadata.schedule_version != 1 || metadata.hypergraph_version != 1) return false;\n";
             os << "    if (metadata.topo_order.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
             os << "    if (metadata.classifications.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
             os << "    if (metadata.predecessors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";

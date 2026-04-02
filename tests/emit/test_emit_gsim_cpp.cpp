@@ -574,6 +574,153 @@ void testCrossRootInstancePathsStayDistinct()
 
 } // namespace
 
+void testBehavioralCompileAndRun()
+{
+    // Build a simple combinational design: y = a & b
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "behavioral";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("sim_test");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "behavioral test emit should succeed");
+
+    // Write test driver
+    const std::filesystem::path driverPath = dir / "driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"sim_test.hpp\"\n";
+        driver << "#include \"sim_test.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_a(3); sim.set_b(5); sim.step();\n";
+        driver << "    if (sim.get_y() != 8) { printf(\"FAIL: y=%d expected 8\\n\", sim.get_y()); return 1; }\n";
+        driver << "    printf(\"BEHAVIORAL PASS\\n\");\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    // Compile and run
+    const std::string exePath = (dir / "driver").string();
+    const std::string compileCmd = "g++ -std=c++17 -Wall -Wextra -Werror -I " +
+        dir.string() + " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "behavioral driver should compile");
+
+    const std::string runCmd = exePath + " 2>&1";
+    expect(std::system(runCmd.c_str()) == 0, "behavioral driver should run and pass");
+}
+
+void testPortOrderDecl()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "port_order_decl";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("po_decl");
+    options.topOverrides = {"top"};
+    options.portOrderStrategy = PortOrderStrategy::Decl;
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "port_order=decl should succeed");
+}
+
+void testPortOrderAlpha()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "port_order_alpha";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("po_alpha");
+    options.topOverrides = {"top"};
+    options.portOrderStrategy = PortOrderStrategy::Alpha;
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "port_order=alpha should succeed");
+
+    // Verify alpha ordering: ports should appear in alphabetical order in the header
+    const std::string header = readFile(dir / "po_alpha.hpp");
+    auto posA = header.find("set_a(");
+    auto posB = header.find("set_b(");
+    auto posClk = header.find("set_clk(");
+    expect(posA != std::string::npos && posB != std::string::npos && posClk != std::string::npos,
+           "alpha-ordered header should contain all input port setters");
+    expect(posA < posB && posB < posClk, "alpha ordering should put a < b < clk");
+}
+
+void testPortOrderCustom()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "port_order_custom";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("po_custom");
+    options.topOverrides = {"top"};
+    options.portOrderStrategy = PortOrderStrategy::Custom;
+    options.portOrderNames = {"clk", "b", "a", "y"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "port_order=custom should succeed");
+
+    // Verify custom ordering: clk, b, a in header
+    const std::string header = readFile(dir / "po_custom.hpp");
+    auto posClk = header.find("set_clk(");
+    auto posB = header.find("set_b(");
+    auto posA = header.find("set_a(");
+    expect(posClk != std::string::npos && posB != std::string::npos && posA != std::string::npos,
+           "custom-ordered header should contain all input port setters");
+    expect(posClk < posB && posB < posA, "custom ordering should put clk < b < a");
+}
+
+void testPortOrderInvalidName()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "port_order_invalid";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("po_invalid");
+    options.topOverrides = {"top"};
+    options.portOrderStrategy = PortOrderStrategy::Custom;
+    options.portOrderNames = {"nonexistent_port"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "port_order=custom with nonexistent name should fail");
+    expect(diags.hasError(), "should emit error for nonexistent port name");
+}
+
 int main()
 {
     try
@@ -586,6 +733,11 @@ int main()
         testFailureOnStaleMetadataAfterDestructiveMutation();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
+        testBehavioralCompileAndRun();
+        testPortOrderDecl();
+        testPortOrderAlpha();
+        testPortOrderCustom();
+        testPortOrderInvalidName();
     }
     catch (const std::exception &ex)
     {

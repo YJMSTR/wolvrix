@@ -855,6 +855,49 @@ void testFailuresAreClear()
     }
 }
 
+void testCombinationalCycleRejection()
+{
+    grh::Design design;
+    auto &graph = design.createGraph("cycle_test");
+    design.markAsTop("cycle_test");
+
+    // Create a combinational cycle: val_a -> add -> val_b -> xor -> val_a
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto valA = makeValue(graph, "val_a", 8, false);
+    const auto valB = makeValue(graph, "val_b", 8, false);
+
+    // op1: add(valA, const) -> valB
+    const auto one = makeConstant(graph, "one", "one_const", 8, "8'h01");
+    const auto add = graph.createOperation(grh::OperationKind::kAdd, graph.internSymbol("cycle_add"));
+    graph.addOperand(add, valA);
+    graph.addOperand(add, one);
+    graph.addResult(add, valB);
+
+    // op2: xor(valB, const) -> valA (creates cycle)
+    const auto two = makeConstant(graph, "two", "two_const", 8, "8'h02");
+    const auto xorOp = graph.createOperation(grh::OperationKind::kXor, graph.internSymbol("cycle_xor"));
+    graph.addOperand(xorOp, valB);
+    graph.addOperand(xorOp, two);
+    graph.addResult(xorOp, valA);
+
+    // assign output
+    const auto assign = graph.createOperation(grh::OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, valA);
+    graph.addResult(assign, outY);
+
+    transform::TransformDiagnostics diags;
+    transform::PassManager manager;
+    manager.addPass(std::make_unique<GsimPass>(GsimOptions{"cycle_test"}));
+    const auto result = manager.run(design, diags);
+
+    expect(!result.success, "gsim should reject irreducible combinational cycles");
+    expect(diags.hasError(), "gsim should emit error diagnostic for cycles");
+}
+
 } // namespace
 
 int main()
@@ -868,6 +911,7 @@ int main()
         testMetadataOrderIsDeterministic();
         testPrerequisiteAuditPipelineCoverage();
         testFailuresAreClear();
+        testCombinationalCycleRejection();
     }
     catch (const std::exception &ex)
     {
