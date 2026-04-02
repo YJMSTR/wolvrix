@@ -18,6 +18,264 @@ namespace wolvrix::lib::emit
 
     namespace
     {
+        // Comparator for ValueId to use in std::map
+        struct ValueIdCompare {
+            bool operator()(const wolvrix::lib::grh::ValueId& lhs, const wolvrix::lib::grh::ValueId& rhs) const {
+                if (lhs.index != rhs.index) return lhs.index < rhs.index;
+                if (lhs.generation != rhs.generation) return lhs.generation < rhs.generation;
+                if (lhs.graph.index != rhs.graph.index) return lhs.graph.index < rhs.graph.index;
+                return lhs.graph.generation < rhs.graph.generation;
+            }
+        };
+
+        // Forward declaration
+        std::string sanitizeIdentifier(std::string_view text);
+
+        // Code generation state for lowering GRH operations to C++
+        struct CodegenState
+        {
+            // Value expressions: maps ValueId to C++ expression string
+            std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
+
+            // Storage declarations: register/memory state variables
+            std::vector<std::string> storageDecls;
+
+            // Combinational evaluation statements (in topo order)
+            std::vector<std::string> combinationalStmts;
+
+            // Sequential update statements (grouped by clock domain)
+            std::map<std::string, std::vector<std::string>> sequentialStmts;
+
+            // Port declarations and accessors
+            std::vector<std::pair<std::string, std::string>> inputPorts;  // (name, type)
+            std::vector<std::pair<std::string, std::string>> outputPorts; // (name, type)
+
+            // Track unsupported operations for error reporting
+            std::vector<std::string> unsupportedOps;
+        };
+
+        // Get C++ type for a value based on its width
+        std::string getCppTypeForWidth(int32_t width)
+        {
+            if (width <= 8)
+                return "std::uint8_t";
+            if (width <= 16)
+                return "std::uint16_t";
+            if (width <= 32)
+                return "std::uint32_t";
+            if (width <= 64)
+                return "std::uint64_t";
+            return "std::vector<std::uint64_t>"; // For very wide values
+        }
+
+        // Generate mask for given bit width
+        std::string generateMask(int32_t width)
+        {
+            if (width >= 64)
+                return "~0ULL";
+            return std::to_string((1ULL << width) - 1);
+        }
+
+        // Forward declaration
+        struct GsimScratchpadMetadata;
+
+        // Lower a single operation to C++
+        void lowerOperation(
+            const wolvrix::lib::grh::Graph& graph,
+            const wolvrix::lib::grh::Operation& op,
+            const GsimScratchpadMetadata& /*metadata*/,
+            CodegenState& state,
+            EmitDiagnostics* /*diagnostics*/)
+        {
+            using namespace wolvrix::lib::grh;
+
+            const auto kind = op.kind();
+            const auto opId = op.id();
+
+            // Helper to get operand expression
+            auto getOperandExpr = [&](size_t idx) -> std::string {
+                if (idx >= op.operands().size()) {
+                    return "0";
+                }
+                auto it = state.valueExprs.find(op.operands()[idx]);
+                if (it != state.valueExprs.end()) {
+                    return it->second;
+                }
+                return "0";
+            };
+
+            // Helper to set result expression
+            auto setResultExpr = [&](size_t idx, const std::string& expr) {
+                if (idx < op.results().size()) {
+                    state.valueExprs[op.results()[idx]] = expr;
+                }
+            };
+
+            switch (kind) {
+                case OperationKind::kConstant: {
+                    auto valueAttr = op.attr("value");
+                    if (valueAttr) {
+                        if (auto* intVal = std::get_if<int64_t>(&*valueAttr)) {
+                            setResultExpr(0, std::to_string(*intVal));
+                        } else {
+                            setResultExpr(0, "0");
+                        }
+                    } else {
+                        setResultExpr(0, "0");
+                    }
+                    break;
+                }
+
+                case OperationKind::kAssign: {
+                    setResultExpr(0, getOperandExpr(0));
+                    break;
+                }
+
+                case OperationKind::kAdd: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " + " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kSub: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " - " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kMul: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " * " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kDiv: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " / " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kAnd: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " & " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kOr: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " | " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kXor: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kNot: {
+                    setResultExpr(0, "(~" + getOperandExpr(0) + ")");
+                    break;
+                }
+
+                case OperationKind::kLogicNot: {
+                    setResultExpr(0, "(!" + getOperandExpr(0) + ")");
+                    break;
+                }
+
+                case OperationKind::kMux: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " ? " + getOperandExpr(1) + " : " + getOperandExpr(2) + ")");
+                    break;
+                }
+
+                case OperationKind::kRegister: {
+                    // Register defines storage - handled in port collection
+                    break;
+                }
+
+                case OperationKind::kRegisterReadPort: {
+                    auto regSymAttr = op.attr("regSymbol");
+                    if (regSymAttr) {
+                        if (auto* sym = std::get_if<std::string>(&*regSymAttr)) {
+                            std::string regName = "reg_" + sanitizeIdentifier(*sym);
+                            setResultExpr(0, regName);
+                        }
+                    }
+                    break;
+                }
+
+                case OperationKind::kRegisterWritePort: {
+                    auto regSymAttr = op.attr("regSymbol");
+                    if (regSymAttr) {
+                        if (auto* sym = std::get_if<std::string>(&*regSymAttr)) {
+                            std::string regName = "reg_" + sanitizeIdentifier(*sym);
+                            std::string nextValue = getOperandExpr(1);
+                            std::string condition = getOperandExpr(0); // updateCond
+                            auto maskAttr = op.attr("mask");
+                            if (maskAttr) {
+                                state.sequentialStmts["posedge_clock"].push_back(
+                                    "        if (" + condition + ") { " + regName + " = (" + regName + " & ~" + nextValue + ") | (" + nextValue + " & " + nextValue + "); }");
+                            } else {
+                                state.sequentialStmts["posedge_clock"].push_back(
+                                    "        if (" + condition + ") { " + regName + " = " + nextValue + "; }");
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                case OperationKind::kSystemTask:
+                case OperationKind::kSystemFunction: {
+                    // System tasks/functions are debug/diagnostic constructs
+                    // They don't generate simulation logic in the generated C++
+                    break;
+                }
+
+                default: {
+                    std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                    state.unsupportedOps.push_back(
+                        std::string(toString(kind)) + " (" + opName + ")");
+                    break;
+                }
+            }
+        }
+
+        // Collect port information from graph
+        void collectPorts(
+            const wolvrix::lib::grh::Graph& graph,
+            CodegenState& state)
+        {
+            for (const auto& port : graph.inputPorts()) {
+                auto value = graph.getValue(port.value);
+                std::string type = getCppTypeForWidth(value.width());
+                state.inputPorts.push_back({port.name, type});
+            }
+
+            for (const auto& port : graph.outputPorts()) {
+                auto value = graph.getValue(port.value);
+                std::string type = getCppTypeForWidth(value.width());
+                state.outputPorts.push_back({port.name, type});
+            }
+        }
+
+        // Collect register storage declarations
+        void collectRegisters(
+            const wolvrix::lib::grh::Graph& graph,
+            CodegenState& state)
+        {
+            for (const auto& opId : graph.operations()) {
+                auto op = graph.getOperation(opId);
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
+                    auto symAttr = op.attr("symbol");
+                    if (symAttr) {
+                        if (auto* sym = std::get_if<std::string>(&*symAttr)) {
+                            std::string regName = "reg_" + sanitizeIdentifier(*sym);
+                            int32_t width = 32; // Default width
+                            if (!op.results().empty()) {
+                                auto val = graph.getValue(op.results()[0]);
+                                width = val.width();
+                            }
+                            std::string type = getCppTypeForWidth(width);
+                            state.storageDecls.push_back("    " + type + " " + regName + " = 0;");
+                        }
+                    }
+                }
+            }
+        }
+
         struct GsimScratchpadMetadata
         {
             std::vector<int64_t> roots;
@@ -407,53 +665,109 @@ namespace wolvrix::lib::emit
 
         void writeHeader(std::ostream &os,
                          const EmitTarget &target,
-                         const GsimScratchpadMetadata &metadata)
+                         const GsimScratchpadMetadata &metadata,
+                         const CodegenState& state)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
+            const std::string className = "SSimTop_" + ns;
+
             os << "#pragma once\n\n";
             os << "#include <cstdint>\n";
             os << "#include <map>\n";
             os << "#include <stdexcept>\n";
             os << "#include <string>\n";
             os << "#include <vector>\n\n";
+
+            // Generated Simulator Class (use SSimTop for compatibility)
             os << "class SSimTop {\n";
             os << "public:\n";
-            os << "    SSimTop() = default;\n";
+            os << "    SSimTop() { reset(); }\n";
             os << "    ~SSimTop() = default;\n\n";
-            os << "    void set_reset(unsigned reset) { reset_ = reset; }\n";
+
+            // Reset and set_reset (for compatibility)
+            os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
+            os << "    void reset() {\n";
+            os << "        reset_ = true;\n";
+            for (const auto& decl : state.storageDecls) {
+                os << "        " << decl << "\n";
+            }
+            os << "    }\n\n";
+
+            // Step method
             os << "    void step() {\n";
-            os << "        if (reset_) {\n";
-            os << "            difftest_exit_ = 0;\n";
-            os << "            difftest_step_ = 0;\n";
-            os << "            return;\n";
-            os << "        }\n";
             os << "        ++difftest_step_;\n";
+            if (!state.sequentialStmts.empty()) {
+                os << "        if (reset_) {\n";
+                os << "            reset_ = false;\n";
+                os << "            difftest_exit_ = 0;\n";
+                os << "            return;\n";
+                os << "        }\n";
+                for (const auto& [domain, stmts] : state.sequentialStmts) {
+                    (void)domain;
+                    for (const auto& stmt : stmts) {
+                        os << stmt << "\n";
+                    }
+                }
+            }
             os << "        difftest_exit_ = 0;\n";
             os << "    }\n\n";
-            os << "    unsigned get_difftest__DOT__uart__DOT__out__DOT__valid() const { return uart_out_valid_; }\n";
-            os << "    std::uint8_t get_difftest__DOT__uart__DOT__out__DOT__ch() const { return uart_out_ch_; }\n";
-            os << "    unsigned get_difftest__DOT__uart__DOT__in__DOT__valid() const { return uart_in_valid_; }\n";
-            os << "    void set_difftest__DOT__uart__DOT__in__DOT__ch(std::uint8_t ch) { uart_in_ch_ = ch; }\n";
+
+            // Input port setters
+            for (const auto& [name, type] : state.inputPorts) {
+                std::string methodName = "set_" + sanitizeIdentifier(name);
+                os << "    void " << methodName << "(" << type << " value) { input_" << sanitizeIdentifier(name) << "_ = value; }\n";
+            }
+            if (!state.inputPorts.empty()) os << "\n";
+
+            // Output port getters
+            for (const auto& [name, type] : state.outputPorts) {
+                std::string methodName = "get_" + sanitizeIdentifier(name);
+                os << "    " << type << " " << methodName << "() const { return output_" << sanitizeIdentifier(name) << "_; }\n";
+            }
+            if (!state.outputPorts.empty()) os << "\n";
+
+            // Difftest stub accessors (for compatibility)
+            os << "    unsigned get_difftest__DOT__uart__DOT__out__DOT__valid() const { return 0; }\n";
+            os << "    std::uint8_t get_difftest__DOT__uart__DOT__out__DOT__ch() const { return 0; }\n";
+            os << "    unsigned get_difftest__DOT__uart__DOT__in__DOT__valid() const { return 0; }\n";
+            os << "    void set_difftest__DOT__uart__DOT__in__DOT__ch(std::uint8_t) { }\n";
             os << "    std::uint64_t get_difftest__DOT__exit() const { return difftest_exit_; }\n";
             os << "    std::uint64_t get_difftest__DOT__step() const { return difftest_step_; }\n";
             os << "    void set_difftest__DOT__perfCtrl__DOT__clean(unsigned clean) { perf_clean_ = clean; }\n";
             os << "    void set_difftest__DOT__perfCtrl__DOT__dump(unsigned dump) { perf_dump_ = dump; }\n";
             os << "    void set_difftest__DOT__logCtrl__DOT__begin(std::uint64_t begin) { log_begin_ = begin; }\n";
             os << "    void set_difftest__DOT__logCtrl__DOT__end(std::uint64_t end) { log_end_ = end; }\n\n";
+
             os << "private:\n";
-            os << "    unsigned reset_ = 0;\n";
-            os << "    unsigned uart_out_valid_ = 0;\n";
-            os << "    std::uint8_t uart_out_ch_ = 0;\n";
-            os << "    unsigned uart_in_valid_ = 0;\n";
-            os << "    std::uint8_t uart_in_ch_ = 0;\n";
+            os << "    bool reset_ = false;\n";
+
+            // Input port storage
+            for (const auto& [name, type] : state.inputPorts) {
+                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = 0;\n";
+            }
+
+            // Output port storage
+            for (const auto& [name, type] : state.outputPorts) {
+                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = 0;\n";
+            }
+
+            // Register storage
+            for (const auto& decl : state.storageDecls) {
+                os << "    " << decl << "\n";
+            }
+
+            // Difftest state (for compatibility)
             os << "    std::uint64_t difftest_exit_ = 0;\n";
             os << "    std::uint64_t difftest_step_ = 0;\n";
             os << "    unsigned perf_clean_ = 0;\n";
             os << "    unsigned perf_dump_ = 0;\n";
             os << "    std::uint64_t log_begin_ = 0;\n";
             os << "    std::uint64_t log_end_ = 0;\n";
+
             os << "};\n\n";
+
+            // Metadata struct (kept for compatibility)
             os << "namespace wolvrix::gsim {\n\n";
             os << "struct " << structName << " {\n";
             os << "    std::string graph_symbol;\n";
@@ -464,26 +778,6 @@ namespace wolvrix::lib::emit
             os << "    std::vector<std::int64_t> roots;\n";
             os << "    std::vector<std::int64_t> topo_order;\n";
             os << "    std::vector<std::string> event_group_names;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> event_groups;\n";
-            os << "    std::vector<std::string> schedule_activity_order;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> schedule_activity_members;\n";
-            os << "    std::map<std::string, std::string> schedule_activity_classes;\n";
-            os << "    std::vector<std::string> hypergraph_node_names;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_node_members;\n";
-            os << "    std::vector<std::string> hypergraph_edge_names;\n";
-            os << "    std::map<std::string, std::string> hypergraph_edge_sources;\n";
-            os << "    std::map<std::string, std::string> hypergraph_edge_targets;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_edge_sinks;\n";
-            os << "    std::map<std::int64_t, std::string> classifications;\n";
-            os << "    std::map<std::int64_t, std::vector<std::int64_t>> predecessors;\n";
-            os << "    std::map<std::int64_t, std::vector<std::int64_t>> successors;\n";
-            os << "    std::vector<std::string> op_descriptors;\n";
-            os << "    std::string schedule_kind;\n";
-            os << "    std::int64_t schedule_version = 0;\n";
-            os << "    std::string schedule_contract;\n";
-            os << "    std::string hypergraph_kind;\n";
-            os << "    std::int64_t hypergraph_version = 0;\n";
-            os << "    std::string hypergraph_contract;\n";
             os << "};\n\n";
             os << structName << " make_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata();\n";
             os << "bool validate_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata(const " << structName << "& metadata);\n\n";
@@ -736,6 +1030,36 @@ namespace wolvrix::lib::emit
         const std::filesystem::path headerPath = outputDir / (baseName + ".hpp");
         const std::filesystem::path sourcePath = outputDir / (baseName + ".cpp");
 
+        // Generate code from GRH operations
+        CodegenState state;
+        collectPorts(*target->graph, state);
+        collectRegisters(*target->graph, state);
+
+        // Traverse operations in topo order
+        for (int64_t opIdx : metadata->topoOrder) {
+            auto opIdIt = std::find_if(target->graph->operations().begin(), target->graph->operations().end(),
+                [&](const wolvrix::lib::grh::OperationId& id) { return static_cast<int64_t>(id.index) == opIdx; });
+            if (opIdIt != target->graph->operations().end()) {
+                auto op = target->graph->getOperation(*opIdIt);
+                lowerOperation(*target->graph, op, *metadata, state, diagnostics());
+            }
+        }
+
+        // Check for unsupported operations
+        if (!state.unsupportedOps.empty()) {
+            std::string msg = "unsupported operations encountered: ";
+            for (size_t i = 0; i < state.unsupportedOps.size() && i < 5; ++i) {
+                if (i > 0) msg += ", ";
+                msg += state.unsupportedOps[i];
+            }
+            if (state.unsupportedOps.size() > 5) {
+                msg += " and " + std::to_string(state.unsupportedOps.size() - 5) + " more";
+            }
+            reportError(msg, target->graph->symbol());
+            result.success = false;
+            return result;
+        }
+
         auto header = openOutputFile(headerPath);
         auto source = openOutputFile(sourcePath);
         if (!header || !source)
@@ -744,7 +1068,7 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        writeHeader(*header, *target, *metadata);
+        writeHeader(*header, *target, *metadata, state);
         writeSource(*source, *target, *metadata, headerPath.filename().string());
 
         result.artifacts.push_back(headerPath.string());
