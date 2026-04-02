@@ -234,6 +234,232 @@ namespace wolvrix::lib::emit
                     setResultExpr(0, "(" + getOperandExpr(0) + " ? " + getOperandExpr(1) + " : " + getOperandExpr(2) + ")");
                     break;
                 }
+                // Comparison operations
+                case OperationKind::kEq: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kNe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kLt: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " < " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kLe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " <= " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kGt: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " > " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kGe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " >= " + getOperandExpr(1) + ")");
+                    break;
+                }
+                // Logical operations
+                case OperationKind::kLogicAnd: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " && " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kLogicOr: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " || " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kXnor: {
+                    setResultExpr(0, "(~(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + "))");
+                    break;
+                }
+                // Arithmetic
+                case OperationKind::kMod: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " % " + getOperandExpr(1) + ")");
+                    break;
+                }
+                // Shift operations
+                case OperationKind::kShl: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " << " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kLShr: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kAShr: {
+                    setResultExpr(0, "(static_cast<std::make_signed_t<decltype(" + getOperandExpr(0) + ")>>(" + getOperandExpr(0) + ") >> " + getOperandExpr(1) + ")");
+                    break;
+                }
+                // Reduce operations
+                case OperationKind::kReduceAnd: {
+                    int64_t w = graph.valueWidth(op.operands()[0]);
+                    if (w > 0 && w <= 64) {
+                        uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                        setResultExpr(0, "((" + getOperandExpr(0) + " & 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL) == 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL ? 1 : 0)");
+                    } else {
+                        setResultExpr(0, "0");
+                    }
+                    break;
+                }
+                case OperationKind::kReduceOr: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " != 0 ? 1 : 0)");
+                    break;
+                }
+                case OperationKind::kReduceXor: {
+                    // XOR reduction: count set bits, result is parity
+                    setResultExpr(0, "(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + ")))");
+                    break;
+                }
+                case OperationKind::kReduceNand: {
+                    int64_t w = graph.valueWidth(op.operands()[0]);
+                    if (w > 0 && w <= 64) {
+                        uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
+                        setResultExpr(0, "((" + getOperandExpr(0) + " & 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL) == 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL ? 0 : 1)");
+                    } else {
+                        setResultExpr(0, "1");
+                    }
+                    break;
+                }
+                case OperationKind::kReduceNor: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " == 0 ? 1 : 0)");
+                    break;
+                }
+                case OperationKind::kReduceXnor: {
+                    setResultExpr(0, "(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + ")) ^ 1)");
+                    break;
+                }
+                // Concat: shift operands and OR together
+                case OperationKind::kConcat: {
+                    if (op.operands().empty()) {
+                        setResultExpr(0, "0");
+                    } else if (op.operands().size() == 1) {
+                        setResultExpr(0, getOperandExpr(0));
+                    } else {
+                        // Concat: first operand is MSB, operands go high-to-low
+                        // result = (op0 << (w1+w2+...)) | (op1 << (w2+w3+...)) | ... | opN
+                        std::string expr;
+                        // Calculate total shift for each operand
+                        std::vector<int64_t> widths;
+                        for (size_t i = 0; i < op.operands().size(); ++i) {
+                            widths.push_back(graph.valueWidth(op.operands()[i]));
+                        }
+                        for (size_t i = 0; i < op.operands().size(); ++i) {
+                            int64_t shift = 0;
+                            for (size_t j = i + 1; j < op.operands().size(); ++j) {
+                                shift += widths[j];
+                            }
+                            std::string part = getOperandExpr(i);
+                            if (shift > 0) {
+                                part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
+                            }
+                            if (expr.empty()) {
+                                expr = part;
+                            } else {
+                                expr = "(" + expr + " | " + part + ")";
+                            }
+                        }
+                        setResultExpr(0, expr);
+                    }
+                    break;
+                }
+                // Replicate: repeat bits N times
+                case OperationKind::kReplicate: {
+                    auto countAttr = op.attr("replicateCount");
+                    if (!countAttr) countAttr = op.attr("count");
+                    int64_t count = 1;
+                    if (countAttr) {
+                        if (auto* intVal = std::get_if<int64_t>(&*countAttr)) {
+                            count = *intVal;
+                        }
+                    }
+                    if (count <= 1) {
+                        setResultExpr(0, getOperandExpr(0));
+                    } else {
+                        int64_t opWidth = graph.valueWidth(op.operands()[0]);
+                        std::string expr;
+                        for (int64_t i = 0; i < count; ++i) {
+                            std::string part = getOperandExpr(0);
+                            int64_t shift = (count - 1 - i) * opWidth;
+                            if (shift > 0) {
+                                part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
+                            }
+                            if (expr.empty()) {
+                                expr = part;
+                            } else {
+                                expr = "(" + expr + " | " + part + ")";
+                            }
+                        }
+                        setResultExpr(0, expr);
+                    }
+                    break;
+                }
+                // Static slice: extract bits [sliceEnd:sliceStart]
+                case OperationKind::kSliceStatic: {
+                    auto startAttr = op.attr("sliceStart");
+                    auto endAttr = op.attr("sliceEnd");
+                    int64_t start = 0, end = 0;
+                    if (startAttr) {
+                        if (auto* intVal = std::get_if<int64_t>(&*startAttr)) start = *intVal;
+                    }
+                    if (endAttr) {
+                        if (auto* intVal = std::get_if<int64_t>(&*endAttr)) end = *intVal;
+                    }
+                    int64_t width = end - start + 1;
+                    if (width <= 0) width = 1;
+                    if (start == 0 && width >= 64) {
+                        setResultExpr(0, getOperandExpr(0));
+                    } else {
+                        uint64_t mask = (width >= 64) ? ~uint64_t(0) : ((uint64_t(1) << width) - 1);
+                        std::string maskStr = ([&]{ std::ostringstream ss; ss << "0x" << std::hex << mask << "ULL"; return ss.str(); })();
+                        if (start == 0) {
+                            setResultExpr(0, "(" + getOperandExpr(0) + " & " + maskStr + ")");
+                        } else {
+                            setResultExpr(0, "((" + getOperandExpr(0) + " >> " + std::to_string(start) + ") & " + maskStr + ")");
+                        }
+                    }
+                    break;
+                }
+                // Dynamic slice: extract sliceWidth bits starting at dynamic index
+                case OperationKind::kSliceDynamic: {
+                    auto widthAttr = op.attr("sliceWidth");
+                    int64_t width = 1;
+                    if (widthAttr) {
+                        if (auto* intVal = std::get_if<int64_t>(&*widthAttr)) width = *intVal;
+                    }
+                    if (width >= 64) {
+                        setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ")");
+                    } else {
+                        uint64_t mask = (uint64_t(1) << width) - 1;
+                        std::string maskStr = ([&]{ std::ostringstream ss; ss << "0x" << std::hex << mask << "ULL"; return ss.str(); })();
+                        setResultExpr(0, "((" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ") & " + maskStr + ")");
+                    }
+                    break;
+                }
+                // Latch (level-sensitive storage)
+                case OperationKind::kLatch: {
+                    // Latch defines storage - handled similarly to register
+                    break;
+                }
+                case OperationKind::kLatchReadPort: {
+                    std::string sym = std::string(op.symbolText());
+                    if (!sym.empty()) {
+                        std::string latchName = "latch_" + sanitizeIdentifier(sym);
+                        setResultExpr(0, latchName);
+                    }
+                    break;
+                }
+                case OperationKind::kLatchWritePort: {
+                    std::string condition = getOperandExpr(0);
+                    std::string nextValue = getOperandExpr(1);
+                    std::string sym = std::string(op.symbolText());
+                    if (!sym.empty()) {
+                        std::string latchName = "latch_" + sanitizeIdentifier(sym);
+                        // Latch is transparent when enable is high
+                        state.sequentialStmts["combinational"].push_back(
+                            "        if (" + condition + ") { " + latchName + " = " + nextValue + "; }");
+                    }
+                    break;
+                }
                 case OperationKind::kRegister: {
                     // Register defines storage - handled in collectRegisters
                     break;
@@ -356,6 +582,24 @@ namespace wolvrix::lib::emit
 
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = regName;
+                    }
+                }
+                // Collect latches similarly to registers
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kLatch) {
+                    std::string sym = std::string(op.symbolText());
+                    if (sym.empty()) sym = "unnamed_latch_" + std::to_string(opId.index);
+                    std::string latchName = "latch_" + sanitizeIdentifier(sym);
+
+                    int32_t width = 32;
+                    if (!op.results().empty()) {
+                        auto val = graph.getValue(op.results()[0]);
+                        width = val.width();
+                    }
+                    std::string type = getCppTypeForWidth(width);
+                    state.storageDecls.push_back(type + " " + latchName + " = 0;");
+
+                    if (!op.results().empty()) {
+                        state.valueExprs[op.results()[0]] = latchName;
                     }
                 }
             }
