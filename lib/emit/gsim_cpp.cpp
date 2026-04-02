@@ -63,6 +63,23 @@ namespace wolvrix::lib::emit
         // Code generation state for lowering GRH operations to C++
         struct CodegenState
         {
+            struct DpiImportArg
+            {
+                std::string direction;
+                std::string name;
+                std::string typeName;
+                std::string cppType;
+            };
+
+            struct DpiImportSignature
+            {
+                std::string symbol;
+                std::vector<DpiImportArg> args;
+                bool hasReturn = false;
+                std::string returnTypeName;
+                std::string returnCppType;
+            };
+
             // Value expressions: maps ValueId to C++ expression string
             std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
             // Storage declarations for registers/latches
@@ -83,6 +100,13 @@ namespace wolvrix::lib::emit
             // Memory symbol -> storage name and row count
             std::map<std::string, std::string> memoryStorageNames;
             std::map<std::string, int64_t> memoryRows;
+            // DPI imports collected from the graph for declaration / lowering.
+            std::map<std::string, DpiImportSignature> dpiImports;
+            std::vector<std::string> dpiForwardDecls;
+            // When behavior is sharded, materialized temporaries live in shared storage.
+            bool persistentTemps = false;
+            std::size_t nextPersistentTempSlot = 0;
+            std::size_t persistentTempCount = 0;
             // Track unsupported operations
             std::vector<std::string> unsupportedOps;
         };
@@ -99,26 +123,117 @@ namespace wolvrix::lib::emit
         // Convert Verilog-style constant to C++ constant
         std::string convertVerilogConstant(const std::string& verilogConst)
         {
+            auto lowerHexLiteral = [](std::uint64_t value) -> std::string {
+                std::ostringstream ss;
+                ss << "0x" << std::hex << value << "ULL";
+                return ss.str();
+            };
+
+            auto parseUnknownTolerantUnsigned = [](std::string_view digits, unsigned base) -> std::optional<std::uint64_t> {
+                std::uint64_t value = 0;
+                for (char ch : digits)
+                {
+                    if (ch == '_')
+                    {
+                        continue;
+                    }
+
+                    const char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    unsigned digit = 0;
+                    if (lower == 'x' || lower == 'z' || lower == '?')
+                    {
+                        digit = 0;
+                    }
+                    else if (lower >= '0' && lower <= '9')
+                    {
+                        digit = static_cast<unsigned>(lower - '0');
+                    }
+                    else if (lower >= 'a' && lower <= 'f')
+                    {
+                        digit = static_cast<unsigned>(10 + (lower - 'a'));
+                    }
+                    else
+                    {
+                        return std::nullopt;
+                    }
+
+                    if (digit >= base)
+                    {
+                        return std::nullopt;
+                    }
+
+                    value = value * base + digit;
+                }
+                return value;
+            };
+
             size_t apostrophe = verilogConst.find('\'');
             if (apostrophe == std::string::npos) return verilogConst;
             if (apostrophe + 2 >= verilogConst.size()) return "0";
 
-            char base = verilogConst[apostrophe + 1];
-            std::string value = verilogConst.substr(apostrophe + 2);
+            std::size_t basePos = apostrophe + 1;
+            if (basePos < verilogConst.size() &&
+                (verilogConst[basePos] == 's' || verilogConst[basePos] == 'S'))
+            {
+                ++basePos;
+            }
+            if (basePos >= verilogConst.size())
+            {
+                return "0";
+            }
+
+            char base = static_cast<char>(std::tolower(static_cast<unsigned char>(verilogConst[basePos])));
+            std::string value = verilogConst.substr(basePos + 1);
 
             switch (base) {
-                case 'h': return "0x" + value;
+                case 'h': {
+                    const auto parsed = parseUnknownTolerantUnsigned(value, 16);
+                    return parsed ? lowerHexLiteral(*parsed) : "0";
+                }
                 case 'b': {
-                    try { return std::to_string(std::stoul(value, nullptr, 2)); }
-                    catch (...) { return "0"; }
+                    const auto parsed = parseUnknownTolerantUnsigned(value, 2);
+                    return parsed ? lowerHexLiteral(*parsed) : "0";
                 }
                 case 'd': return value;
                 case 'o': {
-                    try { return std::to_string(std::stoul(value, nullptr, 8)); }
-                    catch (...) { return "0"; }
+                    const auto parsed = parseUnknownTolerantUnsigned(value, 8);
+                    return parsed ? lowerHexLiteral(*parsed) : "0";
                 }
                 default: return "0";
             }
+        }
+
+        std::string cppStringLiteral(std::string_view text)
+        {
+            std::string out;
+            out.reserve(text.size() + 2);
+            out.push_back('"');
+            for (char ch : text)
+            {
+                switch (ch)
+                {
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '"':
+                    out.append("\\\"");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                case '\t':
+                    out.append("\\t");
+                    break;
+                default:
+                    out.push_back(ch);
+                    break;
+                }
+            }
+            out.push_back('"');
+            return out;
         }
 
         std::optional<std::string> attrValue(const EmitOptions &options, std::string_view key)
@@ -169,6 +284,219 @@ namespace wolvrix::lib::emit
             return name;
         }
 
+        std::string dpiScratchValueName(std::string_view prefix, const wolvrix::lib::grh::ValueId &valueId)
+        {
+            std::string name(prefix);
+            name.push_back('_');
+            name.append(materializedValueName(valueId));
+            return name;
+        }
+
+        std::string lowercase(std::string_view text)
+        {
+            std::string out;
+            out.reserve(text.size());
+            for (unsigned char ch : text)
+            {
+                out.push_back(static_cast<char>(std::tolower(ch)));
+            }
+            return out;
+        }
+
+        std::optional<std::string> mapDpiScalarCppType(std::string_view typeName,
+                                                       int64_t width,
+                                                       bool isSigned)
+        {
+            const std::string lowered = lowercase(typeName);
+            if (lowered == "bit" || lowered == "logic")
+            {
+                if (width <= 0 || width > 64)
+                {
+                    return std::nullopt;
+                }
+                if (width <= 8)
+                {
+                    return isSigned ? "std::int8_t" : "std::uint8_t";
+                }
+                if (width <= 16)
+                {
+                    return isSigned ? "std::int16_t" : "std::uint16_t";
+                }
+                if (width <= 32)
+                {
+                    return isSigned ? "std::int32_t" : "std::uint32_t";
+                }
+                return isSigned ? "std::int64_t" : "std::uint64_t";
+            }
+            if (lowered == "byte")
+            {
+                return isSigned ? "signed char" : "unsigned char";
+            }
+            if (lowered == "shortint")
+            {
+                return isSigned ? "short" : "unsigned short";
+            }
+            if (lowered == "int" || lowered == "integer")
+            {
+                return isSigned ? "int" : "unsigned int";
+            }
+            if (lowered == "longint" || lowered == "time")
+            {
+                return isSigned ? "std::int64_t" : "std::uint64_t";
+            }
+            return std::nullopt;
+        }
+
+        template <typename T>
+        std::optional<T> getAttrAs(const wolvrix::lib::grh::Operation &op, std::string_view name)
+        {
+            const auto attr = op.attr(std::string(name));
+            if (!attr)
+            {
+                return std::nullopt;
+            }
+            if (const auto *value = std::get_if<T>(&*attr))
+            {
+                return *value;
+            }
+            return std::nullopt;
+        }
+
+        int findNamedArgIndex(const std::vector<std::string> &names, std::string_view target)
+        {
+            for (std::size_t i = 0; i < names.size(); ++i)
+            {
+                if (names[i] == target)
+                {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        }
+
+        void collectDpiImports(const wolvrix::lib::grh::Graph &graph, CodegenState &state)
+        {
+            using namespace wolvrix::lib::grh;
+
+            for (const auto opId : graph.operations())
+            {
+                const auto op = graph.getOperation(opId);
+                if (op.kind() != OperationKind::kDpicImport)
+                {
+                    continue;
+                }
+
+                const std::string symbol =
+                    op.symbolText().empty() ? ("unnamed_dpi_import_" + std::to_string(opId.index))
+                                            : std::string(op.symbolText());
+                const auto argsDirection = getAttrAs<std::vector<std::string>>(op, "argsDirection");
+                const auto argsWidth = getAttrAs<std::vector<int64_t>>(op, "argsWidth");
+                const auto argsName = getAttrAs<std::vector<std::string>>(op, "argsName");
+                const auto argsSigned = getAttrAs<std::vector<bool>>(op, "argsSigned");
+                const auto argsType = getAttrAs<std::vector<std::string>>(op, "argsType");
+                const bool hasReturn = getAttrAs<bool>(op, "hasReturn").value_or(false);
+                const int64_t returnWidth = getAttrAs<int64_t>(op, "returnWidth").value_or(0);
+                const bool returnSigned = getAttrAs<bool>(op, "returnSigned").value_or(false);
+                const std::string returnType = getAttrAs<std::string>(op, "returnType").value_or("void");
+
+                if (!argsDirection || !argsWidth || !argsName || !argsSigned || !argsType ||
+                    argsDirection->size() != argsWidth->size() || argsDirection->size() != argsName->size() ||
+                    argsDirection->size() != argsSigned->size() || argsDirection->size() != argsType->size())
+                {
+                    state.unsupportedOps.push_back("kDpicImport (" + symbol + ": malformed DPI signature metadata)");
+                    continue;
+                }
+
+                CodegenState::DpiImportSignature sig;
+                sig.symbol = symbol;
+                sig.hasReturn = hasReturn;
+                sig.returnTypeName = returnType;
+
+                bool ok = true;
+                for (std::size_t i = 0; i < argsName->size(); ++i)
+                {
+                    std::optional<std::string> cppType;
+                    if (lowercase((*argsType)[i]) == "string")
+                    {
+                        if ((*argsDirection)[i] == "input")
+                        {
+                            cppType = "const char *";
+                        }
+                    }
+                    else
+                    {
+                        cppType = mapDpiScalarCppType((*argsType)[i], (*argsWidth)[i], (*argsSigned)[i]);
+                    }
+                    if (!cppType)
+                    {
+                        state.unsupportedOps.push_back(
+                            "kDpicImport (" + symbol + ": unsupported DPI argument type " + (*argsType)[i] + ")");
+                        ok = false;
+                        break;
+                    }
+                    if ((*argsDirection)[i] != "input" && (*argsDirection)[i] != "output")
+                    {
+                        state.unsupportedOps.push_back(
+                            "kDpicImport (" + symbol + ": unsupported DPI argument direction " + (*argsDirection)[i] + ")");
+                        ok = false;
+                        break;
+                    }
+                    sig.args.push_back(CodegenState::DpiImportArg{
+                        (*argsDirection)[i],
+                        (*argsName)[i],
+                        (*argsType)[i],
+                        *cppType,
+                    });
+                }
+                if (!ok)
+                {
+                    continue;
+                }
+
+                if (hasReturn)
+                {
+                    const auto cppType = mapDpiScalarCppType(returnType, returnWidth, returnSigned);
+                    if (!cppType)
+                    {
+                        state.unsupportedOps.push_back(
+                            "kDpicImport (" + symbol + ": unsupported DPI return type " + returnType + ")");
+                        continue;
+                    }
+                    sig.returnCppType = *cppType;
+                }
+                else
+                {
+                    sig.returnCppType = "void";
+                }
+
+                std::ostringstream decl;
+                decl << sig.returnCppType << " " << symbol << "(";
+                for (std::size_t i = 0; i < sig.args.size(); ++i)
+                {
+                    if (i != 0)
+                    {
+                        decl << ", ";
+                    }
+                    decl << sig.args[i].cppType;
+                    if (sig.args[i].direction == "output")
+                    {
+                        decl << " *";
+                    }
+                    decl << " " << sanitizeIdentifier(sig.args[i].name);
+                }
+                decl << ");";
+
+                const auto [it, inserted] = state.dpiImports.emplace(symbol, std::move(sig));
+                if (!inserted)
+                {
+                    state.unsupportedOps.push_back("kDpicImport (" + symbol + ": duplicate DPI import symbol)");
+                    continue;
+                }
+                state.dpiForwardDecls.push_back(decl.str());
+                (void)it;
+            }
+        }
+
         // Forward declare sanitizeIdentifier for use in lowerOperation
         // (already defined above)
 
@@ -194,10 +522,23 @@ namespace wolvrix::lib::emit
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < op.results().size()) {
                     const auto resultId = op.results()[idx];
-                    const auto tempName = materializedValueName(resultId);
-                    state.combinationalStmts.push_back(
-                        "        [[maybe_unused]] const " + getCppTypeForWidth(graph.valueWidth(resultId)) + " " + tempName + " = " + expr + ";");
-                    state.valueExprs[resultId] = tempName;
+                    if (graph.valueType(resultId) == ValueType::String) {
+                        state.valueExprs[resultId] = expr;
+                        return;
+                    }
+                    const auto resultType = getCppTypeForWidth(graph.valueWidth(resultId));
+                    if (state.persistentTemps) {
+                        const auto slot = state.nextPersistentTempSlot++;
+                        state.combinationalStmts.push_back(
+                            "        step_tmp_[" + std::to_string(slot) + "] = static_cast<std::uint64_t>(" + expr + ");");
+                        state.valueExprs[resultId] =
+                            "static_cast<" + resultType + ">(step_tmp_[" + std::to_string(slot) + "])";
+                    } else {
+                        const auto tempName = materializedValueName(resultId);
+                        state.combinationalStmts.push_back(
+                            "        [[maybe_unused]] const " + resultType + " " + tempName + " = " + expr + ";");
+                        state.valueExprs[resultId] = tempName;
+                    }
                 }
             };
 
@@ -207,7 +548,11 @@ namespace wolvrix::lib::emit
                     if (!valueAttr) valueAttr = op.attr("value");
                     if (valueAttr) {
                         if (auto* strVal = std::get_if<std::string>(&*valueAttr)) {
-                            setResultExpr(0, convertVerilogConstant(*strVal));
+                            if (!op.results().empty() && graph.valueType(op.results()[0]) == ValueType::String) {
+                                setResultExpr(0, cppStringLiteral(*strVal));
+                            } else {
+                                setResultExpr(0, convertVerilogConstant(*strVal));
+                            }
                         } else if (auto* intVal = std::get_if<int64_t>(&*valueAttr)) {
                             setResultExpr(0, std::to_string(*intVal));
                         } else {
@@ -610,14 +955,139 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kSystemTask:
-                case OperationKind::kSystemFunction:
-                case OperationKind::kDpicImport: {
+                case OperationKind::kSystemFunction: {
                     // Debug constructs - no simulation logic
                     break;
                 }
+                case OperationKind::kDpicImport: {
+                    // Signatures are pre-collected before lowering.
+                    break;
+                }
                 case OperationKind::kDpicCall: {
-                    for (std::size_t i = 0; i < op.results().size(); ++i) {
-                        setResultExpr(i, "0");
+                    const std::string opName =
+                        op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                    const std::string targetImport =
+                        getAttrAs<std::string>(op, "targetImportSymbol").value_or("");
+                    const auto importIt = state.dpiImports.find(targetImport);
+                    if (targetImport.empty() || importIt == state.dpiImports.end())
+                    {
+                        state.unsupportedOps.push_back("kDpicCall (" + opName + ": unresolved DPI import)");
+                        break;
+                    }
+
+                    const auto inArgName = getAttrAs<std::vector<std::string>>(op, "inArgName").value_or(std::vector<std::string>{});
+                    const auto outArgName = getAttrAs<std::vector<std::string>>(op, "outArgName").value_or(std::vector<std::string>{});
+                    const auto inoutArgName = getAttrAs<std::vector<std::string>>(op, "inoutArgName").value_or(std::vector<std::string>{});
+                    const auto eventEdge = getAttrAs<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
+                    const bool hasReturn = getAttrAs<bool>(op, "hasReturn").value_or(false);
+                    if (!inoutArgName.empty())
+                    {
+                        state.unsupportedOps.push_back("kDpicCall (" + opName + ": inout DPI calls are unsupported)");
+                        break;
+                    }
+                    if (op.operands().size() < 1 + eventEdge.size())
+                    {
+                        state.unsupportedOps.push_back("kDpicCall (" + opName + ": operand count does not match eventEdge)");
+                        break;
+                    }
+
+                    const auto eventStart = op.operands().size() - eventEdge.size();
+                    if (eventStart < 1 || eventStart != 1 + inArgName.size())
+                    {
+                        state.unsupportedOps.push_back("kDpicCall (" + opName + ": operand count does not match input args)");
+                        break;
+                    }
+
+                    const auto &sig = importIt->second;
+                    if (sig.hasReturn != hasReturn)
+                    {
+                        state.unsupportedOps.push_back("kDpicCall (" + opName + ": hasReturn does not match import signature)");
+                        break;
+                    }
+
+                    const std::size_t outputOffset = hasReturn ? 1 : 0;
+                    if (op.results().size() != outputOffset + outArgName.size())
+                    {
+                        state.unsupportedOps.push_back("kDpicCall (" + opName + ": result count does not match return/output args)");
+                        break;
+                    }
+
+                    std::map<std::string, std::string> outputTemps;
+                    for (std::size_t resultIndex = outputOffset; resultIndex < op.results().size(); ++resultIndex)
+                    {
+                        const auto valueId = op.results()[resultIndex];
+                        const auto type = getCppTypeForWidth(graph.valueWidth(valueId));
+                        const auto name = dpiScratchValueName("dpi_out", valueId);
+                        state.combinationalStmts.push_back("        " + type + " " + name + " = 0;");
+                        outputTemps.emplace(outArgName[resultIndex - outputOffset], name);
+                    }
+
+                    std::string returnTemp;
+                    if (hasReturn)
+                    {
+                        returnTemp = dpiScratchValueName("dpi_ret", op.results()[0]);
+                        state.combinationalStmts.push_back("        " + sig.returnCppType + " " + returnTemp + " = 0;");
+                    }
+
+                    std::ostringstream call;
+                    if (hasReturn)
+                    {
+                        call << returnTemp << " = ";
+                    }
+                    call << sig.symbol << "(";
+                    bool firstArg = true;
+                    for (const auto &arg : sig.args)
+                    {
+                        if (!firstArg)
+                        {
+                            call << ", ";
+                        }
+                        firstArg = false;
+                        if (arg.direction == "input")
+                        {
+                            const int idx = findNamedArgIndex(inArgName, arg.name);
+                            if (idx < 0)
+                            {
+                                state.unsupportedOps.push_back(
+                                    "kDpicCall (" + opName + ": missing DPI input arg " + arg.name + ")");
+                                call.str(std::string{});
+                                break;
+                            }
+                            call << getOperandExpr(static_cast<std::size_t>(idx + 1));
+                        }
+                        else if (arg.direction == "output")
+                        {
+                            const auto outIt = outputTemps.find(arg.name);
+                            if (outIt == outputTemps.end())
+                            {
+                                state.unsupportedOps.push_back(
+                                    "kDpicCall (" + opName + ": missing DPI output arg " + arg.name + ")");
+                                call.str(std::string{});
+                                break;
+                            }
+                            call << "&" << outIt->second;
+                        }
+                    }
+                    if (call.str().empty())
+                    {
+                        break;
+                    }
+                    call << ");";
+
+                    const std::string condition = getOperandExpr(0);
+                    state.combinationalStmts.push_back("        if (" + condition + ") { " + call.str() + " }");
+
+                    if (hasReturn)
+                    {
+                        setResultExpr(0, returnTemp);
+                    }
+                    for (std::size_t resultIndex = outputOffset; resultIndex < op.results().size(); ++resultIndex)
+                    {
+                        const auto outIt = outputTemps.find(outArgName[resultIndex - outputOffset]);
+                        if (outIt != outputTemps.end())
+                        {
+                            setResultExpr(resultIndex, outIt->second);
+                        }
                     }
                     break;
                 }
@@ -864,6 +1334,7 @@ namespace wolvrix::lib::emit
         }
 
         constexpr std::size_t kDefaultMetadataShardMaxBytes = 16u * 1024u * 1024u;
+        constexpr std::size_t kDefaultBehaviorShardMaxBytes = 512u * 1024u * 1024u;
 
         std::optional<std::size_t> parseMetadataShardMaxBytes(const EmitOptions &options,
                                                               EmitDiagnostics *diagnostics)
@@ -892,6 +1363,38 @@ namespace wolvrix::lib::emit
                 if (diagnostics != nullptr)
                 {
                     diagnostics->error("metadata_shard_max_bytes must be an unsigned integer", *attr);
+                }
+                return std::nullopt;
+            }
+        }
+
+        std::optional<std::size_t> parseBehaviorShardMaxBytes(const EmitOptions &options,
+                                                              EmitDiagnostics *diagnostics)
+        {
+            const auto attr = attrValue(options, "behavior_shard_max_bytes");
+            if (!attr)
+            {
+                return kDefaultBehaviorShardMaxBytes;
+            }
+
+            try
+            {
+                const auto parsed = std::stoull(*attr);
+                if (parsed == 0)
+                {
+                    if (diagnostics != nullptr)
+                    {
+                        diagnostics->error("behavior_shard_max_bytes must be greater than zero", *attr);
+                    }
+                    return std::nullopt;
+                }
+                return static_cast<std::size_t>(parsed);
+            }
+            catch (const std::exception &)
+            {
+                if (diagnostics != nullptr)
+                {
+                    diagnostics->error("behavior_shard_max_bytes must be an unsigned integer", *attr);
                 }
                 return std::nullopt;
             }
@@ -1052,6 +1555,12 @@ namespace wolvrix::lib::emit
             std::string functionName;
         };
 
+        struct BehaviorShardPlan
+        {
+            std::string filename;
+            std::string methodName;
+        };
+
         std::vector<MetadataShardPlan> planMetadataShards(const std::string &baseName,
                                                           const GsimScratchpadMetadata &metadata,
                                                           std::size_t maxBytes)
@@ -1082,6 +1591,69 @@ namespace wolvrix::lib::emit
                 }
                 currentBytes += line.size();
             }, metadata);
+            return plans;
+        }
+
+        std::vector<std::string> collectStepStatements(const CodegenState &state)
+        {
+            std::vector<std::string> statements;
+            statements.reserve(state.combinationalStmts.size());
+            statements.insert(statements.end(), state.combinationalStmts.begin(), state.combinationalStmts.end());
+            for (const auto &[domain, domainStatements] : state.sequentialStmts)
+            {
+                (void)domain;
+                statements.insert(statements.end(), domainStatements.begin(), domainStatements.end());
+            }
+            return statements;
+        }
+
+        constexpr std::size_t statementEmitBytes(std::string_view statement)
+        {
+            return statement.size() + 1;
+        }
+
+        std::size_t estimateBehaviorStatementBytes(const std::vector<std::string> &statements)
+        {
+            std::size_t total = 0;
+            for (const auto &statement : statements)
+            {
+                total += statementEmitBytes(statement);
+            }
+            return total;
+        }
+
+        std::vector<BehaviorShardPlan> planBehaviorShards(const std::string &baseName,
+                                                          const std::vector<std::string> &statements,
+                                                          std::size_t maxBytes)
+        {
+            std::vector<BehaviorShardPlan> plans;
+            std::size_t currentBytes = 0;
+            std::size_t shardIndex = 0;
+
+            auto openNextPlan = [&]() {
+                std::ostringstream indexText;
+                indexText << std::setw(3) << std::setfill('0') << shardIndex++;
+                const std::string suffix = indexText.str();
+                plans.push_back(BehaviorShardPlan{
+                    baseName + "__step_" + suffix + ".cpp",
+                    "run_step_shard_" + suffix,
+                });
+                currentBytes = 0;
+            };
+
+            for (const auto &statement : statements)
+            {
+                const auto bytes = statementEmitBytes(statement);
+                if (plans.empty())
+                {
+                    openNextPlan();
+                }
+                if (currentBytes != 0 && currentBytes + bytes > maxBytes)
+                {
+                    openNextPlan();
+                }
+                currentBytes += bytes;
+            }
             return plans;
         }
 
@@ -1445,7 +2017,8 @@ namespace wolvrix::lib::emit
         void writeHeader(std::ostream &os,
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
-                         const CodegenState& state)
+                         const CodegenState& state,
+                         const std::vector<BehaviorShardPlan> &behaviorShardPlans)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
@@ -1456,6 +2029,15 @@ namespace wolvrix::lib::emit
             os << "#include <stdexcept>\n";
             os << "#include <string>\n";
             os << "#include <vector>\n\n";
+            if (!state.dpiForwardDecls.empty())
+            {
+                os << "extern \"C\" {\n";
+                for (const auto &decl : state.dpiForwardDecls)
+                {
+                    os << decl << "\n";
+                }
+                os << "}\n\n";
+            }
             os << "class SSimTop {\n";
             os << "public:\n";
             os << "    SSimTop();\n";
@@ -1492,6 +2074,12 @@ namespace wolvrix::lib::emit
 
             os << "private:\n";
             os << "    bool reset_ = false;\n";
+            for (const auto &plan : behaviorShardPlans) {
+                os << "    void " << plan.methodName << "();\n";
+            }
+            if (!behaviorShardPlans.empty()) {
+                os << "\n";
+            }
 
             // Input port storage
             for (const auto& [name, type] : state.inputPorts) {
@@ -1506,6 +2094,10 @@ namespace wolvrix::lib::emit
             // Register/latch storage
             for (const auto& decl : state.storageDecls) {
                 os << "    " << decl << "\n";
+            }
+            if (state.persistentTemps && state.persistentTempCount != 0) {
+                os << "    std::vector<std::uint64_t> step_tmp_ = std::vector<std::uint64_t>("
+                   << state.persistentTempCount << ", 0);\n";
             }
 
             // Difftest state
@@ -1560,6 +2152,8 @@ namespace wolvrix::lib::emit
                          const GsimScratchpadMetadata &metadata,
                          const CodegenState &state,
                          std::string_view headerFilename,
+                         std::size_t behaviorShardMaxBytes,
+                         const std::vector<BehaviorShardPlan> &behaviorShardPlans,
                          std::size_t metadataShardMaxBytes,
                          std::vector<std::string> &managedSourceFiles,
                          std::vector<std::string> &artifactPaths,
@@ -1572,6 +2166,7 @@ namespace wolvrix::lib::emit
             const auto manifestPath = outputDir / (std::string(baseName) + ".manifest");
             const auto previousManagedFiles = readManagedSourceManifest(manifestPath);
             const auto metadataBytes = estimateMetadataAssignmentBytes(metadata);
+            const auto stepStatements = collectStepStatements(state);
             const bool shardMetadata = metadataBytes > metadataShardMaxBytes;
             const auto shardPlans =
                 shardMetadata ? planMetadataShards(std::string(baseName), metadata, metadataShardMaxBytes) : std::vector<MetadataShardPlan>{};
@@ -1601,16 +2196,18 @@ namespace wolvrix::lib::emit
             os << "        difftest_exit_ = 0;\n";
             os << "        return;\n";
             os << "    }\n";
-            for (const auto &stmt : state.combinationalStmts)
+            if (behaviorShardPlans.empty())
             {
-                os << stmt << "\n";
-            }
-            for (const auto &[domain, stmts] : state.sequentialStmts)
-            {
-                (void)domain;
-                for (const auto &stmt : stmts)
+                for (const auto &stmt : stepStatements)
                 {
                     os << stmt << "\n";
+                }
+            }
+            else
+            {
+                for (const auto &plan : behaviorShardPlans)
+                {
+                    os << "    " << plan.methodName << "();\n";
                 }
             }
             os << "    difftest_exit_ = 0;\n";
@@ -1705,6 +2302,92 @@ namespace wolvrix::lib::emit
 
             managedSourceFiles.push_back(std::string(baseName) + ".cpp");
             artifactPaths.push_back((outputDir / (std::string(baseName) + ".cpp")).string());
+
+            if (!behaviorShardPlans.empty())
+            {
+                std::size_t shardIndex = 0;
+                std::size_t shardBytes = 0;
+                std::ofstream shardStream;
+
+                auto finishShard = [&]() -> bool {
+                    if (!shardStream.is_open())
+                    {
+                        return true;
+                    }
+                    shardStream << "}\n";
+                    if (!shardStream.good())
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("failed to finalize gsim behavior shard",
+                                               (outputDir / behaviorShardPlans[shardIndex].filename).string());
+                        }
+                        return false;
+                    }
+                    shardStream.close();
+                    ++shardIndex;
+                    shardBytes = 0;
+                    return true;
+                };
+
+                auto startShard = [&]() -> bool {
+                    const auto &plan = behaviorShardPlans[shardIndex];
+                    shardStream = std::ofstream(outputDir / plan.filename, std::ios::trunc);
+                    if (!shardStream)
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("failed to open gsim behavior shard for writing",
+                                               (outputDir / plan.filename).string());
+                        }
+                        return false;
+                    }
+                    shardStream << "#include \"" << headerFilename << "\"\n\n";
+                    shardStream << "void SSimTop::" << plan.methodName << "() {\n";
+                    managedSourceFiles.push_back(plan.filename);
+                    artifactPaths.push_back((outputDir / plan.filename).string());
+                    shardBytes = 0;
+                    return true;
+                };
+
+                if (!startShard())
+                {
+                    return false;
+                }
+
+                for (const auto &statement : stepStatements)
+                {
+                    const auto bytes = statementEmitBytes(statement);
+                    if (shardBytes != 0 && shardBytes + bytes > behaviorShardMaxBytes)
+                    {
+                        if (!finishShard())
+                        {
+                            return false;
+                        }
+                        if (shardIndex >= behaviorShardPlans.size() || !startShard())
+                        {
+                            return false;
+                        }
+                    }
+
+                    shardStream << statement << "\n";
+                    if (!shardStream.good())
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("failed to write gsim behavior shard",
+                                               (outputDir / behaviorShardPlans[shardIndex].filename).string());
+                        }
+                        return false;
+                    }
+                    shardBytes += bytes;
+                }
+
+                if (!finishShard())
+                {
+                    return false;
+                }
+            }
 
             if (!shardPlans.empty())
             {
@@ -1854,9 +2537,70 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        // Generate code from GRH operations
-        CodegenState state;
-        collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
+        std::vector<wolvrix::lib::grh::OperationId> operationIdsByIndex;
+        for (const auto opId : target->graph->operations())
+        {
+            if (opId.index >= operationIdsByIndex.size())
+            {
+                operationIdsByIndex.resize(static_cast<std::size_t>(opId.index) + 1);
+            }
+            operationIdsByIndex[opId.index] = opId;
+        }
+
+        auto buildCodegenState = [&](bool persistentTemps) {
+            CodegenState state;
+            state.persistentTemps = persistentTemps;
+            collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
+            collectRegisters(*target->graph, state);
+            collectMemories(*target->graph, state);
+            collectDpiImports(*target->graph, state);
+
+            for (int64_t opIdx : metadata->topoOrder) {
+                if (opIdx >= 0 && static_cast<std::size_t>(opIdx) < operationIdsByIndex.size()) {
+                    const auto opId = operationIdsByIndex[static_cast<std::size_t>(opIdx)];
+                    if (opId.valid())
+                    {
+                        auto op = target->graph->getOperation(opId);
+                        lowerOperation(*target->graph, op, state);
+                    }
+                }
+            }
+
+            for (const auto& port : target->graph->outputPorts()) {
+                auto it = state.outputValueNames.find(port.value);
+                if (it == state.outputValueNames.end()) {
+                    continue;
+                }
+                const std::string& sanitizedName = it->second;
+                auto exprIt = state.valueExprs.find(port.value);
+                if (exprIt != state.valueExprs.end()) {
+                    state.combinationalStmts.push_back(
+                        "        output_" + sanitizedName + "_ = " + exprIt->second + ";");
+                }
+            }
+
+            state.persistentTempCount = state.nextPersistentTempSlot;
+            return state;
+        };
+
+        auto reportUnsupportedOps = [&](const CodegenState &state) -> bool {
+            if (state.unsupportedOps.empty()) {
+                return false;
+            }
+            std::string msg = "unsupported operations encountered: ";
+            for (size_t i = 0; i < state.unsupportedOps.size() && i < 5; ++i) {
+                if (i > 0) msg += ", ";
+                msg += state.unsupportedOps[i];
+            }
+            if (state.unsupportedOps.size() > 5) {
+                msg += " and " + std::to_string(state.unsupportedOps.size() - 5) + " more";
+            }
+            reportError(msg, target->graph->symbol());
+            result.success = false;
+            return true;
+        };
+
+        CodegenState state = buildCodegenState(false);
 
         // Validate custom port order names
         if (options.portOrderStrategy == PortOrderStrategy::Custom && !options.portOrderNames.empty()) {
@@ -1878,63 +2622,7 @@ namespace wolvrix::lib::emit
             }
         }
 
-        collectRegisters(*target->graph, state);
-        collectMemories(*target->graph, state);
-
-        // Traverse operations in topo order
-        std::vector<wolvrix::lib::grh::OperationId> operationIdsByIndex;
-        for (const auto opId : target->graph->operations())
-        {
-            if (opId.index >= operationIdsByIndex.size())
-            {
-                operationIdsByIndex.resize(static_cast<std::size_t>(opId.index) + 1);
-            }
-            operationIdsByIndex[opId.index] = opId;
-        }
-        for (int64_t opIdx : metadata->topoOrder) {
-            if (opIdx >= 0 && static_cast<std::size_t>(opIdx) < operationIdsByIndex.size()) {
-                const auto opId = operationIdsByIndex[static_cast<std::size_t>(opIdx)];
-                if (opId.valid())
-                {
-                    auto op = target->graph->getOperation(opId);
-                    lowerOperation(*target->graph, op, state);
-                }
-            }
-        }
-
-        // Generate combinational output driving statements
-        // For each output port, find the GRH value that drives it and emit an assignment
-        for (const auto& port : target->graph->outputPorts()) {
-            auto it = state.outputValueNames.find(port.value);
-            if (it == state.outputValueNames.end()) continue;
-            const std::string& sanitizedName = it->second;
-
-            // The output port's value might be defined by an operation (the GRH uses the port value as the result of some op)
-            // Or the output might be connected via an assign to some other value
-            // Look up the expression for this value
-            auto exprIt = state.valueExprs.find(port.value);
-            if (exprIt != state.valueExprs.end()) {
-                state.combinationalStmts.push_back(
-                    "        output_" + sanitizedName + "_ = " + exprIt->second + ";");
-            } else {
-                // Try to find the value through the graph's definition chain
-                // The output port value should have been set by some lowered operation
-                // If not found, it means the output is not driven (leave at 0)
-            }
-        }
-
-        // Check for unsupported operations
-        if (!state.unsupportedOps.empty()) {
-            std::string msg = "unsupported operations encountered: ";
-            for (size_t i = 0; i < state.unsupportedOps.size() && i < 5; ++i) {
-                if (i > 0) msg += ", ";
-                msg += state.unsupportedOps[i];
-            }
-            if (state.unsupportedOps.size() > 5) {
-                msg += " and " + std::to_string(state.unsupportedOps.size() - 5) + " more";
-            }
-            reportError(msg, target->graph->symbol());
-            result.success = false;
+        if (reportUnsupportedOps(state)) {
             return result;
         }
 
@@ -1944,12 +2632,26 @@ namespace wolvrix::lib::emit
                                          : defaultBaseName(*target);
         const std::filesystem::path headerPath = outputDir / (baseName + ".hpp");
         const std::filesystem::path sourcePath = outputDir / (baseName + ".cpp");
+        const auto behaviorShardMaxBytes = parseBehaviorShardMaxBytes(options, diagnostics());
         const auto metadataShardMaxBytes = parseMetadataShardMaxBytes(options, diagnostics());
-        if (!metadataShardMaxBytes)
+        if (!behaviorShardMaxBytes || !metadataShardMaxBytes)
         {
             result.success = false;
             return result;
         }
+        auto behaviorStatements = collectStepStatements(state);
+        if (estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes)
+        {
+            state = buildCodegenState(true);
+            if (reportUnsupportedOps(state)) {
+                return result;
+            }
+            behaviorStatements = collectStepStatements(state);
+        }
+        const auto behaviorShardPlans =
+            estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes
+                ? planBehaviorShards(baseName, behaviorStatements, *behaviorShardMaxBytes)
+                : std::vector<BehaviorShardPlan>{};
 
         auto header = openOutputFile(headerPath);
         auto source = openOutputFile(sourcePath);
@@ -1959,7 +2661,7 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        writeHeader(*header, *target, *metadata, state);
+        writeHeader(*header, *target, *metadata, state, behaviorShardPlans);
         std::vector<std::string> managedSourceFiles;
         if (!writeSource(*source,
                          outputDir,
@@ -1968,6 +2670,8 @@ namespace wolvrix::lib::emit
                          *metadata,
                          state,
                          headerPath.filename().string(),
+                         *behaviorShardMaxBytes,
+                         behaviorShardPlans,
                          *metadataShardMaxBytes,
                          managedSourceFiles,
                          result.artifacts,

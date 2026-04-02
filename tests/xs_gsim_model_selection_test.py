@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -8,6 +9,7 @@ import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DIFFTEST_DIR = REPO_ROOT / "testcase" / "xiangshan" / "difftest"
+XIANGSHAN_DIR = REPO_ROOT / "testcase" / "xiangshan"
 ARTIFACT_ROOT = REPO_ROOT / "build" / "artifacts" / "xs_gsim_model_selection"
 
 
@@ -61,6 +63,63 @@ def run_make(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def run_top_make(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    build_dir = model_dir.parent / "build_top"
+    cpp_path = model_dir / "fixture.cpp"
+    hpp_path = model_dir / "fixture.hpp"
+    manifest_path = model_dir / "fixture.manifest"
+    return subprocess.run(
+        [
+            "make",
+            "-C",
+            str(XIANGSHAN_DIR),
+            "-n",
+            "gsim",
+            "GSIM=1",
+            "NUM_CORES=1",
+            "RTL_SUFFIX=sv",
+            "WITH_CHISELDB=0",
+            "WITH_CONSTANTIN=0",
+            f"NOOP_HOME={REPO_ROOT}",
+            f"DESIGN_DIR={model_dir}",
+            f"BUILD_DIR={build_dir}",
+            "WOLVRIX_GSIM=1",
+            f"WOLVRIX_GSIM_CPP={cpp_path}",
+            f"WOLVRIX_GSIM_HPP={hpp_path}",
+            f"WOLVRIX_GSIM_MANIFEST={manifest_path}",
+            f"WOLVRIX_GSIM_INCLUDE_DIR={model_dir}",
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def run_root_path_print(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    base_rel = (model_dir / "fixture").relative_to(REPO_ROOT)
+    print_rule = (
+        "print-xs-gsim-paths:\n"
+        "\t@printf 'CPP=%s\\nHPP=%s\\nMANIFEST=%s\\n' "
+        "'$(XS_WOLF_GSIM_CPP_ABS)' '$(XS_WOLF_GSIM_HPP_ABS)' '$(XS_WOLF_GSIM_MANIFEST_ABS)'"
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            f"source env.sh && make --eval {shlex.quote(print_rule)} "
+            "print-xs-gsim-paths "
+            f"XS_WOLF_GSIM_BASE={shlex.quote(str(base_rel))}",
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def test_uses_manifest_instead_of_globbing(model_dir: pathlib.Path) -> None:
     canonical_cpp = model_dir / "fixture.cpp"
     shard_cpp = model_dir / "fixture__meta_000.cpp"
@@ -91,11 +150,55 @@ def test_fails_without_manifest(model_dir: pathlib.Path) -> None:
     expect("manifest" in stderr.lower(), f"missing-manifest diagnostic should mention manifest: {stderr.strip()}")
 
 
+def test_top_make_forwards_manifest(model_dir: pathlib.Path) -> None:
+    canonical_cpp = model_dir / "fixture.cpp"
+    hpp_path = model_dir / "fixture.hpp"
+    manifest_path = model_dir / "fixture.manifest"
+    write_file(hpp_path, "#pragma once\n")
+    write_file(canonical_cpp, "int fixture_model() { return 0; }\n")
+    write_file(manifest_path, "fixture.cpp\n")
+
+    result = run_top_make(model_dir)
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"top-level dry-run should succeed: {stdout.strip()}")
+    expect(
+        f'WOLVRIX_GSIM_MANIFEST="{manifest_path}"' in stdout,
+        f"top-level XiangShan make should forward the manifest to difftest: {stdout.strip()}",
+    )
+
+
+def test_root_make_normalizes_relative_gsim_artifact_paths(model_dir: pathlib.Path) -> None:
+    canonical_cpp = model_dir / "fixture.cpp"
+    hpp_path = model_dir / "fixture.hpp"
+    manifest_path = model_dir / "fixture.manifest"
+    write_file(hpp_path, "#pragma once\n")
+    write_file(canonical_cpp, "int fixture_model() { return 0; }\n")
+    write_file(manifest_path, "fixture.cpp\n")
+
+    result = run_root_path_print(model_dir)
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"root-level path print should succeed: {stdout.strip()}")
+    expect(
+        f"CPP={canonical_cpp}" in stdout,
+        f"root Makefile should normalize the emitted cpp path from XS_WOLF_GSIM_BASE: {stdout.strip()}",
+    )
+    expect(
+        f"HPP={hpp_path}" in stdout,
+        f"root Makefile should normalize the emitted header path from XS_WOLF_GSIM_BASE: {stdout.strip()}",
+    )
+    expect(
+        f"MANIFEST={manifest_path}" in stdout,
+        f"root Makefile should normalize the emitted manifest path from XS_WOLF_GSIM_BASE: {stdout.strip()}",
+    )
+
+
 def main() -> int:
     try:
         reset_dir(ARTIFACT_ROOT)
         test_uses_manifest_instead_of_globbing(ARTIFACT_ROOT / "case_manifest" / "model")
         test_fails_without_manifest(ARTIFACT_ROOT / "case_missing_manifest" / "model")
+        test_top_make_forwards_manifest(ARTIFACT_ROOT / "case_top_manifest" / "model")
+        test_root_make_normalizes_relative_gsim_artifact_paths(ARTIFACT_ROOT / "case_root_relative" / "model")
     except Exception as ex:
         return fail(str(ex))
     return 0

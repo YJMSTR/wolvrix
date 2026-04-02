@@ -60,6 +60,17 @@ Each call to `step()`:
 
 Combinational outputs reflect the **current** cycle's inputs. Register values visible through outputs reflect the **previous** cycle's captured state (1-cycle latency).
 
+## Generated Source Set
+
+`EmitGsimCpp` keeps the public API stable even when the implementation is sharded for large designs.
+
+- The canonical entry points remain `<base>.hpp` and `<base>.cpp`.
+- The emitter also writes `<base>.manifest`, which lists every managed implementation source in build order.
+- Large metadata payloads may spill into `<base>__meta_*.cpp`.
+- Large `step()` bodies may spill into `<base>__step_*.cpp`.
+
+Downstream builds should compile the canonical `<base>.cpp` together with every file named in `<base>.manifest`. The public header does not change when sharding is enabled.
+
 ## Difftest Compatibility Stubs
 
 The generated class includes stubs for downstream difftest integration:
@@ -93,5 +104,7 @@ void set_difftest__DOT__logCtrl__DOT__end(uint64_t);
 
 - Signals wider than 64 bits are truncated to `uint64_t`
 - No multi-clock domain support (single implicit clock)
-- No DPI-C or external module integration
-- Memory operations (`kMemory`) are not yet supported
+- DPI-C support is limited to side-effect-only input-only calls, integral return values, integral `output` args, and `input string` args; `inout`, string return/output, and other unsupported signatures still raise unsupported-op diagnostics
+- External module integration still requires flattening; `kInstance` / `kBlackbox` remain unsupported in emitted simulators
+- Memory lowering is limited to the current vector-backed model emitted for `kMemory`, `kMemoryReadPort`, and `kMemoryWritePort`
+- Four-state constant digits (`x/z/?`) are coerced to zero when lowered into the emitted 2-state C++ runtime

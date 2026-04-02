@@ -94,6 +94,31 @@ std::vector<std::filesystem::path> findMetadataShards(const std::filesystem::pat
     return shards;
 }
 
+std::vector<std::filesystem::path> findBehaviorShards(const std::filesystem::path &dir,
+                                                      std::string_view baseName)
+{
+    std::vector<std::filesystem::path> shards;
+    if (!std::filesystem::exists(dir))
+    {
+        return shards;
+    }
+    const std::string prefix = std::string(baseName) + "__step_";
+    for (const auto &entry : std::filesystem::directory_iterator(dir))
+    {
+        if (!entry.is_regular_file())
+        {
+            continue;
+        }
+        const auto name = entry.path().filename().string();
+        if (entry.path().extension() == ".cpp" && name.rfind(prefix, 0) == 0)
+        {
+            shards.push_back(entry.path());
+        }
+    }
+    std::sort(shards.begin(), shards.end());
+    return shards;
+}
+
 ValueId makeValue(Graph &graph,
                   const std::string &name,
                   int32_t width = 1,
@@ -472,6 +497,170 @@ Design buildDpicIgnoredDesign()
     graph.addOperand(call, cond);
     graph.addOperand(call, in);
     graph.addOperand(call, clk);
+
+    return design;
+}
+
+Design buildDpicReturnDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("dpic_ret_top");
+    design.markAsTop("dpic_ret_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto in = makeValue(graph, "in", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+
+    const auto cond = makeConstant(graph, "dpi_cond", "dpi_cond_const", 1, "1'b1");
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_add1"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"logic"});
+    graph.setAttr(import, "hasReturn", true);
+    graph.setAttr(import, "returnWidth", static_cast<int64_t>(8));
+    graph.setAttr(import, "returnSigned", false);
+    graph.setAttr(import, "returnType", std::string("logic"));
+
+    const auto dpiResult = makeValue(graph, "dpi_ret", 8, false);
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_ret_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_add1"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", true);
+    graph.addOperand(call, cond);
+    graph.addOperand(call, in);
+    graph.addOperand(call, clk);
+    graph.addResult(call, dpiResult);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, dpiResult);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
+Design buildDpicReturnOutputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("dpic_ret_out_top");
+    design.markAsTop("dpic_ret_out_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto in = makeValue(graph, "in", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("in", in);
+
+    const auto outRet = makeValue(graph, "y_ret", 8, false);
+    const auto outMirror = makeValue(graph, "y_mirror", 8, false);
+    graph.bindOutputPort("y_ret", outRet);
+    graph.bindOutputPort("y_mirror", outMirror);
+
+    const auto cond = makeConstant(graph, "dpi_cond", "dpi_cond_const", 1, "1'b1");
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_bump_and_copy"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"input", "output"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{8, 8});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"value", "mirror"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{false, false});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"logic", "logic"});
+    graph.setAttr(import, "hasReturn", true);
+    graph.setAttr(import, "returnWidth", static_cast<int64_t>(8));
+    graph.setAttr(import, "returnSigned", false);
+    graph.setAttr(import, "returnType", std::string("logic"));
+
+    const auto dpiRet = makeValue(graph, "dpi_ret", 8, false);
+    const auto dpiMirror = makeValue(graph, "dpi_mirror", 8, false);
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_ret_out_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_bump_and_copy"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{"mirror"});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", true);
+    graph.addOperand(call, cond);
+    graph.addOperand(call, in);
+    graph.addOperand(call, clk);
+    graph.addResult(call, dpiRet);
+    graph.addResult(call, dpiMirror);
+
+    const auto assignRet = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_ret"));
+    graph.addOperand(assignRet, dpiRet);
+    graph.addResult(assignRet, outRet);
+
+    const auto assignMirror = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_mirror"));
+    graph.addOperand(assignMirror, dpiMirror);
+    graph.addResult(assignMirror, outMirror);
+
+    return design;
+}
+
+Design buildDpicStringInputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("dpic_string_top");
+    design.markAsTop("dpic_string_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+    const auto outConst = makeConstant(graph, "out_const", "out_const_op", 8, "8'h2a");
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, outConst);
+    graph.addResult(assign, out);
+
+    const auto cond = makeConstant(graph, "dpi_cond", "dpi_string_cond_const", 1, "1'b1");
+    const auto filename = graph.createValue(graph.internSymbol("filename"), 8 * 21, false, ValueType::String);
+    const auto filenameConst = graph.createOperation(OperationKind::kConstant, graph.internSymbol("filename_const"));
+    graph.addResult(filenameConst, filename);
+    graph.setAttr(filenameConst, "constValue", std::string("unit/test/assert.sv"));
+
+    const auto line = makeConstant(graph, "line", "line_const", 64, "64'sd123");
+
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture_path"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"input", "input"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{static_cast<int64_t>(8 * 21), 64});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"filename", "line"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{false, true});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"string", "longint"});
+    graph.setAttr(import, "hasReturn", false);
+
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_string_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_capture_path"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{"filename", "line"});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", false);
+    graph.addOperand(call, cond);
+    graph.addOperand(call, filename);
+    graph.addOperand(call, line);
+    graph.addOperand(call, clk);
+
+    return design;
+}
+
+Design buildUnknownConstantDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("unknown_const_top");
+    design.markAsTop("unknown_const_top");
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+
+    const auto unknownConst = makeConstant(graph, "unknown_const", "unknown_const_op", 8, "8'hxx");
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, unknownConst);
+    graph.addResult(assign, out);
 
     return design;
 }
@@ -1275,6 +1464,63 @@ void testLargeCombinationalChainUsesMaterializedTemporaries()
     expect(std::system(exePath.c_str()) == 0, "materialized temporary driver should run successfully");
 }
 
+void testBehaviorShardsManifestAndCompile()
+{
+    Design design = buildLinearAddChainDesign(256);
+    runGsim(design, "chain_top");
+
+    const auto dir = artifactRoot() / "behavior_shards";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chain_split");
+    options.topOverrides = {"chain_top"};
+    options.attributes["behavior_shard_max_bytes"] = "256";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "behavior-sharded emit should succeed");
+    expect(!diags.hasError(), "behavior-sharded emit should not emit diagnostics");
+
+    const auto behaviorShards = findBehaviorShards(dir, "chain_split");
+    expect(!behaviorShards.empty(), "tiny behavior shard threshold should produce step shards");
+
+    const auto manifestLines = readLines(dir / "chain_split.manifest");
+    expect(!manifestLines.empty(), "behavior-sharded emit should still write a manifest");
+    for (const auto &shard : behaviorShards)
+    {
+        expect(std::find(manifestLines.begin(), manifestLines.end(), shard.filename().string()) != manifestLines.end(),
+               "behavior shard should be listed in the managed source manifest");
+    }
+
+    const std::string header = readFile(dir / "chain_split.hpp");
+    const std::string source = readFile(dir / "chain_split.cpp");
+    expect(!contains(header, "sim_tmp_v"),
+           "behavior sharding should keep implementation details out of the header");
+    expect(!contains(source, "sim_tmp_v"),
+           "canonical source should stay lightweight when behavior is sharded");
+
+    const std::filesystem::path wrapperPath = dir / "behavior_shard_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"chain_split.hpp\"\n";
+        for (const auto &name : manifestLines)
+        {
+            wrapper << "#include \"" << name << "\"\n";
+        }
+        wrapper << "int main() { SSimTop sim; sim.set_reset(1); sim.step(); sim.set_in(5); sim.step(); return sim.get_y() == static_cast<std::uint8_t>(5 + 256) ? 0 : 1; }\n";
+    }
+
+    const std::string exePath = (dir / "behavior_shard_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "behavior-sharded source set should compile");
+    expect(std::system(exePath.c_str()) == 0, "behavior-sharded source set should run");
+}
+
 void testMemoryLoweringBehavior()
 {
     Design design = buildMemoryBehaviorDesign();
@@ -1326,7 +1572,7 @@ void testMemoryLoweringBehavior()
     expect(std::system(exePath.c_str()) == 0, "memory lowering driver should run successfully");
 }
 
-void testDpicOpsAreIgnoredForEmission()
+void testDpicSideEffectCallBehavior()
 {
     Design design = buildDpicIgnoredDesign();
     runGsim(design, "dpic_top");
@@ -1349,16 +1595,166 @@ void testDpicOpsAreIgnoredForEmission()
     {
         std::ofstream driver(driverPath);
         driver << "#include \"dpic_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "static std::uint32_t g_dpi_calls = 0;\n";
+        driver << "static std::uint32_t g_dpi_last = 0;\n";
+        driver << "extern \"C\" void dpi_capture(std::uint8_t value) { ++g_dpi_calls; g_dpi_last = value; }\n";
         driver << "#include \"dpic_sim.cpp\"\n";
-        driver << "int main() { SSimTop sim; sim.set_reset(1); sim.step(); sim.set_in(7); sim.step(); return sim.get_y() == 7 ? 0 : 1; }\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_in(7); sim.step();\n";
+        driver << "    if (sim.get_y() != 7) return 1;\n";
+        driver << "    if (g_dpi_calls != 1 || g_dpi_last != 7) return 2;\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
     }
 
     const std::string exePath = (dir / "dpic_driver").string();
     const std::string compileCmd =
         "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
         " -o " + exePath + " " + driverPath.string() + " 2>&1";
-    expect(std::system(compileCmd.c_str()) == 0, "dpic-ignored driver should compile");
-    expect(std::system(exePath.c_str()) == 0, "dpic-ignored driver should run successfully");
+    expect(std::system(compileCmd.c_str()) == 0, "dpic side-effect driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "dpic side-effect driver should run successfully");
+}
+
+void testDpicReturnAndOutputBehavior()
+{
+    Design design = buildDpicReturnOutputDesign();
+    runGsim(design, "dpic_ret_out_top");
+
+    const auto dir = artifactRoot() / "dpic_return_output";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_ret_out_sim");
+    options.topOverrides = {"dpic_ret_out_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "return/output dpic emit should succeed");
+    expect(!diags.hasError(), "return/output dpic emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "dpic_ret_out_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"dpic_ret_out_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "extern \"C\" std::uint8_t dpi_bump_and_copy(std::uint8_t value, std::uint8_t *mirror) {\n";
+        driver << "    *mirror = static_cast<std::uint8_t>(value + 2);\n";
+        driver << "    return static_cast<std::uint8_t>(value + 1);\n";
+        driver << "}\n";
+        driver << "#include \"dpic_ret_out_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_in(9); sim.step();\n";
+        driver << "    if (sim.get_y_ret() != 10) return 1;\n";
+        driver << "    if (sim.get_y_mirror() != 11) return 2;\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "dpic_ret_out_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "dpic return/output driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "dpic return/output driver should run successfully");
+}
+
+void testDpicStringInputBehavior()
+{
+    Design design = buildDpicStringInputDesign();
+    runGsim(design, "dpic_string_top");
+
+    const auto dir = artifactRoot() / "dpic_string_input";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_string_sim");
+    options.topOverrides = {"dpic_string_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "string-input dpic emit should succeed");
+    expect(!diags.hasError(), "string-input dpic emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "dpic_string_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"dpic_string_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "#include <cstring>\n";
+        driver << "static const char *g_filename = nullptr;\n";
+        driver << "static std::int64_t g_line = 0;\n";
+        driver << "extern \"C\" void dpi_capture_path(const char *filename, std::int64_t line) { g_filename = filename; g_line = line; }\n";
+        driver << "#include \"dpic_string_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.step();\n";
+        driver << "    if (sim.get_y() != 42) return 1;\n";
+        driver << "    if (g_filename == nullptr || std::strcmp(g_filename, \"unit/test/assert.sv\") != 0) return 2;\n";
+        driver << "    if (g_line != 123) return 3;\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "dpic_string_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "dpic string-input driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "dpic string-input driver should run successfully");
+}
+
+void testUnknownConstantBehavior()
+{
+    Design design = buildUnknownConstantDesign();
+    runGsim(design, "unknown_const_top");
+
+    const auto dir = artifactRoot() / "unknown_constant";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("unknown_const_sim");
+    options.topOverrides = {"unknown_const_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "unknown-constant emit should succeed");
+    expect(!diags.hasError(), "unknown-constant emit should not emit diagnostics");
+
+    const std::string source = readFile(dir / "unknown_const_sim.cpp");
+    expect(contains(source, "0x0ULL"),
+           "unknown-state constants should lower to a valid 2-state zero literal");
+
+    const std::filesystem::path driverPath = dir / "unknown_const_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"unknown_const_sim.hpp\"\n";
+        driver << "#include \"unknown_const_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    if (sim.get_y() != 0) return 1;\n";
+        driver << "    sim.step();\n";
+        driver << "    return sim.get_y() == 0 ? 0 : 2;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "unknown_const_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "unknown-constant driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "unknown-constant driver should run successfully");
 }
 
 int main()
@@ -1385,8 +1781,12 @@ int main()
         testRegisterLatencyBehavior();
         testReplicateSignExtendBehavior();
         testLargeCombinationalChainUsesMaterializedTemporaries();
+        testBehaviorShardsManifestAndCompile();
         testMemoryLoweringBehavior();
-        testDpicOpsAreIgnoredForEmission();
+        testDpicSideEffectCallBehavior();
+        testDpicReturnAndOutputBehavior();
+        testDpicStringInputBehavior();
+        testUnknownConstantBehavior();
     }
     catch (const std::exception &ex)
     {

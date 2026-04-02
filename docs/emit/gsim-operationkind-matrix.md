@@ -8,7 +8,7 @@ The table below shows which GRH `OperationKind` values are supported by the C++ 
 
 | OperationKind | C++ Expression | Notes |
 |---------------|---------------|-------|
-| `kConstant` | Literal value | Converts Verilog format (e.g., `8'hff` -> `0xff`) |
+| `kConstant` | Literal value | Converts Verilog format (e.g., `8'hff` -> `0xff`); unknown bits (`x/z/?`) are lowered to `0` under the 2-state runtime |
 | `kAssign` | Direct assignment | `result = operand` |
 | `kAdd` | `a + b` | |
 | `kSub` | `a - b` | |
@@ -49,21 +49,26 @@ The table below shows which GRH `OperationKind` values are supported by the C++ 
 | `kLatch` | State variable | Level-sensitive storage |
 | `kLatchReadPort` | Read from latch | Uses `latchSymbol` attr |
 | `kLatchWritePort` | Transparent write | Uses `latchSymbol` attr |
+| `kMemory` | Vector-backed storage | Uses `memSymbol`, `width`, `row`, and zero/literal init attrs |
+| `kMemoryReadPort` | Indexed read | Reads the current row from vector-backed storage |
+| `kMemoryWritePort` | Conditional write | Uses `memSymbol`, address/data/mask operands, and clock attrs |
 | `kSystemTask` | Ignored | Debug constructs |
 | `kSystemFunction` | Ignored | Debug constructs |
+
+### Conditionally Supported
+
+| OperationKind | Supported Shape | Unsupported Shape |
+|---------------|-----------------|-------------------|
+| `kDpicImport` | Accepted for side-effect-only input-only imports, integral return values, integral `output` args, and `input string` args | Rejected for `inout`, string return/output, and other non-integral/non-string argument forms |
+| `kDpicCall` | Lowered for side-effect-only input-only calls, integral return values, integral `output` args, and `input string` args | Rejected for `inout`, string return/output, and other unsupported DPI signatures |
 
 ### Not Supported
 
 | OperationKind | Reason |
 |---------------|--------|
-| `kMemory` | Multi-port memory lowering not implemented |
-| `kMemoryReadPort` | Depends on kMemory |
-| `kMemoryWritePort` | Depends on kMemory |
 | `kSliceArray` | Array indexing not implemented |
 | `kInstance` | Requires flattened design (use `hier-flatten` pass) |
 | `kBlackbox` | External modules cannot be simulated |
-| `kDpicImport` | DPI-C not supported in generated simulator |
-| `kDpicCall` | DPI-C not supported |
 | `kXMRRead` | Cross-module references not supported |
 | `kXMRWrite` | Cross-module references not supported |
 | `kCaseEq` | Four-state comparison not applicable |
@@ -75,3 +80,4 @@ The table below shows which GRH `OperationKind` values are supported by the C++ 
 
 - **Width > 64 bits**: All values are truncated to `uint64_t`. Designs with signals wider than 64 bits may produce incorrect results or compile warnings.
 - **Concat/Replicate > 64 bits**: Shift amounts >= 64 are clamped to 0 (high bits discarded).
+- **Four-state values**: `kConstant` lowers unknown digits (`x/z/?`) to zero because the emitted runtime is 2-state.
