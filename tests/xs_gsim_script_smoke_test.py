@@ -89,15 +89,19 @@ def main() -> int:
 
         header = out_base.with_suffix(".hpp")
         source = out_base.with_suffix(".cpp")
+        compat_header = out_dir / "SimTop.h"
         expect(header.exists(), f"missing header artifact: {header}")
         expect(source.exists(), f"missing source artifact: {source}")
+        expect(compat_header.exists(), f"missing downstream compatibility header: {compat_header}")
 
         header_text = header.read_text(encoding="utf-8")
         source_text = source.read_text(encoding="utf-8")
+        compat_text = compat_header.read_text(encoding="utf-8")
         expect('class SSimTop' in header_text, 'missing downstream simulator-facing SSimTop API')
         expect('void set_reset(unsigned reset)' in header_text, 'missing set_reset API')
         expect('void step()' in header_text, 'missing step API')
         expect('get_difftest__DOT__exit()' in header_text, 'missing difftest exit accessor')
+        expect('#include "xs_fixture_gsim.hpp"' in compat_text, 'missing compatibility include for emitted header')
         expect('metadata.graph_symbol = "SimTop";' in source_text, "missing graph symbol metadata")
         expect('metadata.scratchpad_namespace = "gsim.SimTop";' in source_text, "missing scratchpad namespace metadata")
     except Exception as ex:

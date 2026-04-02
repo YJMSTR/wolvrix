@@ -434,6 +434,46 @@ if (WOLVRIX_BUILD_PYTHON)
     set_tests_properties(xs-gsim-script-smoke PROPERTIES
         ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
     )
+
+    add_test(
+        NAME xs-emu-path-resolver
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/xs_emu_path_resolver_test.py"
+    )
+    set_tests_properties(xs-emu-path-resolver PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
+
+    add_test(
+        NAME hdlbits-gsim-batch-limits
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/hdlbits_gsim_batch_limits_test.py"
+    )
+    set_tests_properties(hdlbits-gsim-batch-limits PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
+
+    add_test(
+        NAME hdlbits-gsim-runtime-smoke
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/hdlbits_gsim_runtime_smoke_test.py"
+    )
+    set_tests_properties(hdlbits-gsim-runtime-smoke PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
+
+    add_test(
+        NAME hdlbits-gsim-runner-patterns
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/hdlbits_gsim_runner_patterns_test.py"
+    )
+    set_tests_properties(hdlbits-gsim-runner-patterns PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
+
+    add_test(
+        NAME hdlbits-gsim-batch-runtime
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/hdlbits_gsim_batch_runtime_test.py"
+    )
+    set_tests_properties(hdlbits-gsim-batch-runtime PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
 endif()
 
 add_executable(json-emit-verilator-repcut-package
