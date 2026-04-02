@@ -144,9 +144,9 @@ namespace wolvrix::lib::transform
             }
         }
 
-        void emitRealtimeStageLog(std::string_view graphSymbol, std::string_view message)
+        void emitRealtimeStageLog(std::string_view /*graphSymbol*/, std::string_view message)
         {
-            std::cerr << "[gsim] graph=" << graphSymbol << ' ' << message << '\n';
+            std::cerr << "[gsim] " << message << '\n';
             std::cerr.flush();
         }
 

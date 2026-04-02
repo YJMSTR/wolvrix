@@ -140,7 +140,9 @@ def test_same_design_pipeline_flow() -> None:
         print_diagnostics_level="off",
     )
     expect(not changed, "gsim should remain scratchpad-only from Python")
-    expect(not diagnostics, "gsim Python pipeline should not emit diagnostics on fixture")
+    # Filter out info-level diagnostics (gsim progress messages) when checking for errors
+    non_info_diags = [d for d in (diagnostics or []) if d.get("kind") != "info"]
+    expect(not non_info_diags, "gsim Python pipeline should not emit warnings or errors on fixture")
 
     base = out_dir / "same_design_metadata"
     wolvrix.write_gsim_cpp(design, str(base), top=["top"])
@@ -209,7 +211,10 @@ def test_cross_root_target_paths_stay_distinct() -> None:
     changed0, diags0 = design.run_pipeline([["gsim", ["-path", "top0.u_leaf"]]], print_diagnostics_level="off")
     changed1, diags1 = design.run_pipeline([["gsim", ["-path", "top1.u_leaf"]]], print_diagnostics_level="off")
     expect(not changed0 and not changed1, "gsim should stay scratchpad-only for cross-root fixture")
-    expect(not diags0 and not diags1, "cross-root gsim fixture should not emit diagnostics")
+    # Filter out info-level diagnostics (gsim progress messages) when checking for errors
+    non_info_diags0 = [d for d in (diags0 or []) if d.get("kind") != "info"]
+    non_info_diags1 = [d for d in (diags1 or []) if d.get("kind") != "info"]
+    expect(not non_info_diags0 and not non_info_diags1, "cross-root gsim fixture should not emit warnings or errors")
 
     top0_base = out_dir / "top0_leaf"
     top1_base = out_dir / "top1_leaf"

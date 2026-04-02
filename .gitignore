@@ -43,3 +43,4 @@ _deps
 *.pyc
 .cache/
 build_test/
+.humanize*
