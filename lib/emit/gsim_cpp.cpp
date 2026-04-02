@@ -48,6 +48,67 @@ namespace wolvrix::lib::emit
             int64_t graphRevision = 0;
         };
 
+        // ValueId comparator for std::map
+        struct ValueIdCompare {
+            bool operator()(const wolvrix::lib::grh::ValueId& lhs, const wolvrix::lib::grh::ValueId& rhs) const {
+                if (lhs.index != rhs.index) return lhs.index < rhs.index;
+                if (lhs.generation != rhs.generation) return lhs.generation < rhs.generation;
+                if (lhs.graph.index != rhs.graph.index) return lhs.graph.index < rhs.graph.index;
+                return lhs.graph.generation < rhs.graph.generation;
+            }
+        };
+
+        // Code generation state for lowering GRH operations to C++
+        struct CodegenState
+        {
+            // Value expressions: maps ValueId to C++ expression string
+            std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
+            // Storage declarations for registers
+            std::vector<std::string> storageDecls;
+            // Sequential update statements
+            std::map<std::string, std::vector<std::string>> sequentialStmts;
+            // Port declarations
+            std::vector<std::pair<std::string, std::string>> inputPorts;
+            std::vector<std::pair<std::string, std::string>> outputPorts;
+            // Track unsupported operations
+            std::vector<std::string> unsupportedOps;
+        };
+
+        // Get C++ type for a value based on its width
+        std::string getCppTypeForWidth(int32_t width)
+        {
+            if (width <= 8) return "std::uint8_t";
+            if (width <= 16) return "std::uint16_t";
+            if (width <= 32) return "std::uint32_t";
+            if (width <= 64) return "std::uint64_t";
+            return "std::vector<std::uint64_t>";
+        }
+
+        // Convert Verilog-style constant to C++ constant
+        std::string convertVerilogConstant(const std::string& verilogConst)
+        {
+            size_t apostrophe = verilogConst.find('\'');
+            if (apostrophe == std::string::npos) return verilogConst;
+            if (apostrophe + 2 >= verilogConst.size()) return "0";
+
+            char base = verilogConst[apostrophe + 1];
+            std::string value = verilogConst.substr(apostrophe + 2);
+
+            switch (base) {
+                case 'h': return "0x" + value;
+                case 'b': {
+                    try { return std::to_string(std::stoul(value, nullptr, 2)); }
+                    catch (...) { return "0"; }
+                }
+                case 'd': return value;
+                case 'o': {
+                    try { return std::to_string(std::stoul(value, nullptr, 8)); }
+                    catch (...) { return "0"; }
+                }
+                default: return "0";
+            }
+        }
+
         std::optional<std::string> attrValue(const EmitOptions &options, std::string_view key)
         {
             const auto it = options.attributes.find(std::string(key));
@@ -82,6 +143,181 @@ namespace wolvrix::lib::emit
                 out.insert(out.begin(), '_');
             }
             return out;
+        }
+
+        // Forward declare sanitizeIdentifier for use in lowerOperation
+        // (already defined above)
+
+        // Lower a single operation to C++
+        void lowerOperation(
+            const wolvrix::lib::grh::Graph& graph,
+            const wolvrix::lib::grh::Operation& op,
+            CodegenState& state)
+        {
+            using namespace wolvrix::lib::grh;
+
+            const auto kind = op.kind();
+
+            // Helper to get operand expression
+            auto getOperandExpr = [&](size_t idx) -> std::string {
+                if (idx >= op.operands().size()) return "0";
+                auto it = state.valueExprs.find(op.operands()[idx]);
+                if (it != state.valueExprs.end()) return it->second;
+                return "0";
+            };
+
+            // Helper to set result expression
+            auto setResultExpr = [&](size_t idx, const std::string& expr) {
+                if (idx < op.results().size()) {
+                    state.valueExprs[op.results()[idx]] = expr;
+                }
+            };
+
+            switch (kind) {
+                case OperationKind::kConstant: {
+                    auto valueAttr = op.attr("constValue");
+                    if (!valueAttr) valueAttr = op.attr("value");
+                    if (valueAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*valueAttr)) {
+                            setResultExpr(0, convertVerilogConstant(*strVal));
+                        } else if (auto* intVal = std::get_if<int64_t>(&*valueAttr)) {
+                            setResultExpr(0, std::to_string(*intVal));
+                        } else {
+                            setResultExpr(0, "0");
+                        }
+                    } else {
+                        setResultExpr(0, "0");
+                    }
+                    break;
+                }
+                case OperationKind::kAssign: {
+                    setResultExpr(0, getOperandExpr(0));
+                    break;
+                }
+                case OperationKind::kAdd: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " + " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kSub: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " - " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kMul: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " * " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kDiv: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " / " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kAnd: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " & " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kOr: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " | " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kXor: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kNot: {
+                    setResultExpr(0, "(~" + getOperandExpr(0) + ")");
+                    break;
+                }
+                case OperationKind::kLogicNot: {
+                    setResultExpr(0, "(!" + getOperandExpr(0) + ")");
+                    break;
+                }
+                case OperationKind::kMux: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " ? " + getOperandExpr(1) + " : " + getOperandExpr(2) + ")");
+                    break;
+                }
+                case OperationKind::kRegister: {
+                    // Register defines storage - handled in collectRegisters
+                    break;
+                }
+                case OperationKind::kRegisterReadPort: {
+                    std::string sym = std::string(op.symbolText());
+                    if (!sym.empty()) {
+                        std::string regName = "reg_" + sanitizeIdentifier(sym);
+                        setResultExpr(0, regName);
+                    }
+                    break;
+                }
+                case OperationKind::kRegisterWritePort: {
+                    std::string condition = getOperandExpr(0);
+                    std::string nextValue = getOperandExpr(1);
+                    std::string mask = getOperandExpr(2);
+
+                    std::string sym = std::string(op.symbolText());
+                    if (!sym.empty()) {
+                        std::string regName = "reg_" + sanitizeIdentifier(sym);
+                        if (mask != "0") {
+                            state.sequentialStmts["posedge_clock"].push_back(
+                                "        if (" + condition + ") { " + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
+                        } else {
+                            state.sequentialStmts["posedge_clock"].push_back(
+                                "        if (" + condition + ") { " + regName + " = " + nextValue + "; }");
+                        }
+                    }
+                    break;
+                }
+                case OperationKind::kSystemTask:
+                case OperationKind::kSystemFunction: {
+                    // Debug constructs - no simulation logic
+                    break;
+                }
+                default: {
+                    std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                    state.unsupportedOps.push_back(std::string(toString(kind)) + " (" + opName + ")");
+                    break;
+                }
+            }
+        }
+
+        // Collect port information from graph
+        void collectPorts(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
+        {
+            for (const auto& port : graph.inputPorts()) {
+                auto value = graph.getValue(port.value);
+                std::string type = getCppTypeForWidth(value.width());
+                state.inputPorts.push_back({port.name, type});
+                std::string portExpr = "input_" + sanitizeIdentifier(port.name) + "_";
+                state.valueExprs[port.value] = portExpr;
+            }
+
+            for (const auto& port : graph.outputPorts()) {
+                auto value = graph.getValue(port.value);
+                std::string type = getCppTypeForWidth(value.width());
+                state.outputPorts.push_back({port.name, type});
+            }
+        }
+
+        // Collect register storage declarations
+        void collectRegisters(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
+        {
+            for (const auto& opId : graph.operations()) {
+                auto op = graph.getOperation(opId);
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
+                    std::string sym = std::string(op.symbolText());
+                    if (sym.empty()) sym = "unnamed_reg_" + std::to_string(opId.index);
+                    std::string regName = "reg_" + sanitizeIdentifier(sym);
+
+                    int32_t width = 32;
+                    if (!op.results().empty()) {
+                        auto val = graph.getValue(op.results()[0]);
+                        width = val.width();
+                    }
+                    std::string type = getCppTypeForWidth(width);
+                    state.storageDecls.push_back(type + " " + regName + " = 0;");
+
+                    if (!op.results().empty()) {
+                        state.valueExprs[op.results()[0]] = regName;
+                    }
+                }
+            }
         }
 
         std::string joinStrings(const std::vector<std::string> &items, std::string_view delim)
@@ -407,7 +643,8 @@ namespace wolvrix::lib::emit
 
         void writeHeader(std::ostream &os,
                          const EmitTarget &target,
-                         const GsimScratchpadMetadata &metadata)
+                         const GsimScratchpadMetadata &metadata,
+                         const CodegenState& state)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
@@ -419,34 +656,98 @@ namespace wolvrix::lib::emit
             os << "#include <vector>\n\n";
             os << "class SSimTop {\n";
             os << "public:\n";
-            os << "    SSimTop() = default;\n";
+            os << "    SSimTop() { reset(); }\n";
             os << "    ~SSimTop() = default;\n\n";
-            os << "    void set_reset(unsigned reset) { reset_ = reset; }\n";
+            os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
+            os << "    void reset() {\n";
+            os << "        reset_ = true;\n";
+            for (const auto& decl : state.storageDecls) {
+                os << "        " << decl << "\n";
+            }
+            os << "    }\n\n";
             os << "    void step() {\n";
-            os << "        if (reset_) {\n";
-            os << "            difftest_exit_ = 0;\n";
-            os << "            difftest_step_ = 0;\n";
-            os << "            return;\n";
-            os << "        }\n";
             os << "        ++difftest_step_;\n";
+            if (!state.sequentialStmts.empty()) {
+                os << "        if (reset_) {\n";
+                os << "            reset_ = false;\n";
+                os << "            difftest_exit_ = 0;\n";
+                os << "            return;\n";
+                os << "        }\n";
+                for (const auto& [domain, stmts] : state.sequentialStmts) {
+                    (void)domain;
+                    for (const auto& stmt : stmts) {
+                        os << stmt << "\n";
+                    }
+                }
+            }
             os << "        difftest_exit_ = 0;\n";
             os << "    }\n\n";
-            os << "    unsigned get_difftest__DOT__uart__DOT__out__DOT__valid() const { return uart_out_valid_; }\n";
-            os << "    std::uint8_t get_difftest__DOT__uart__DOT__out__DOT__ch() const { return uart_out_ch_; }\n";
-            os << "    unsigned get_difftest__DOT__uart__DOT__in__DOT__valid() const { return uart_in_valid_; }\n";
-            os << "    void set_difftest__DOT__uart__DOT__in__DOT__ch(std::uint8_t ch) { uart_in_ch_ = ch; }\n";
+
+            // Input port setters
+            for (const auto& [name, type] : state.inputPorts) {
+                std::string methodName = "set_" + sanitizeIdentifier(name);
+                os << "    void " << methodName << "(" << type << " value) { input_" << sanitizeIdentifier(name) << "_ = value; }\n";
+            }
+            if (!state.inputPorts.empty()) os << "\n";
+
+            // Output port getters
+            for (const auto& [name, type] : state.outputPorts) {
+                std::string methodName = "get_" + sanitizeIdentifier(name);
+                os << "    " << type << " " << methodName << "() const { return output_" << sanitizeIdentifier(name) << "_; }\n";
+            }
+            if (!state.outputPorts.empty()) os << "\n";
+
+            // Difftest compatibility stubs
+            os << "    unsigned get_difftest__DOT__uart__DOT__out__DOT__valid() const { return 0; }\n";
+            os << "    std::uint8_t get_difftest__DOT__uart__DOT__out__DOT__ch() const { return 0; }\n";
+            os << "    unsigned get_difftest__DOT__uart__DOT__in__DOT__valid() const { return 0; }\n";
+            os << "    void set_difftest__DOT__uart__DOT__in__DOT__ch(std::uint8_t) { }\n";
             os << "    std::uint64_t get_difftest__DOT__exit() const { return difftest_exit_; }\n";
             os << "    std::uint64_t get_difftest__DOT__step() const { return difftest_step_; }\n";
             os << "    void set_difftest__DOT__perfCtrl__DOT__clean(unsigned clean) { perf_clean_ = clean; }\n";
             os << "    void set_difftest__DOT__perfCtrl__DOT__dump(unsigned dump) { perf_dump_ = dump; }\n";
             os << "    void set_difftest__DOT__logCtrl__DOT__begin(std::uint64_t begin) { log_begin_ = begin; }\n";
             os << "    void set_difftest__DOT__logCtrl__DOT__end(std::uint64_t end) { log_end_ = end; }\n\n";
+
             os << "private:\n";
-            os << "    unsigned reset_ = 0;\n";
-            os << "    unsigned uart_out_valid_ = 0;\n";
-            os << "    std::uint8_t uart_out_ch_ = 0;\n";
-            os << "    unsigned uart_in_valid_ = 0;\n";
-            os << "    std::uint8_t uart_in_ch_ = 0;\n";
+            os << "    bool reset_ = false;\n";
+
+            // Input port storage
+            for (const auto& [name, type] : state.inputPorts) {
+                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = 0;\n";
+            }
+
+            // Output port storage
+            for (const auto& [name, type] : state.outputPorts) {
+                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = 0;\n";
+            }
+
+            // Register storage
+            for (const auto& decl : state.storageDecls) {
+                os << "    " << decl << "\n";
+            }
+            // Collect register names from write ports if no registers found
+            if (state.storageDecls.empty()) {
+                // Find unique register names from write ports
+                std::set<std::string> regNames;
+                for (const auto& opId : target.graph->operations()) {
+                    auto op = target.graph->getOperation(opId);
+                    if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
+                        std::string sym = std::string(op.symbolText());
+                        if (!sym.empty()) {
+                            regNames.insert("reg_" + sanitizeIdentifier(sym));
+                        }
+                    }
+                }
+                for (const auto& regName : regNames) {
+                    os << "    std::uint8_t " << regName << " = 0;\n";
+                }
+                if (regNames.empty()) {
+                    os << "    std::uint8_t reg_state = 0;\n";
+                }
+            }
+
+            // Difftest state
             os << "    std::uint64_t difftest_exit_ = 0;\n";
             os << "    std::uint64_t difftest_step_ = 0;\n";
             os << "    unsigned perf_clean_ = 0;\n";
@@ -729,6 +1030,36 @@ namespace wolvrix::lib::emit
             return result;
         }
 
+        // Generate code from GRH operations
+        CodegenState state;
+        collectPorts(*target->graph, state);
+        collectRegisters(*target->graph, state);
+
+        // Traverse operations in topo order
+        for (int64_t opIdx : metadata->topoOrder) {
+            auto opIdIt = std::find_if(target->graph->operations().begin(), target->graph->operations().end(),
+                [&](const wolvrix::lib::grh::OperationId& id) { return static_cast<int64_t>(id.index) == opIdx; });
+            if (opIdIt != target->graph->operations().end()) {
+                auto op = target->graph->getOperation(*opIdIt);
+                lowerOperation(*target->graph, op, state);
+            }
+        }
+
+        // Check for unsupported operations
+        if (!state.unsupportedOps.empty()) {
+            std::string msg = "unsupported operations encountered: ";
+            for (size_t i = 0; i < state.unsupportedOps.size() && i < 5; ++i) {
+                if (i > 0) msg += ", ";
+                msg += state.unsupportedOps[i];
+            }
+            if (state.unsupportedOps.size() > 5) {
+                msg += " and " + std::to_string(state.unsupportedOps.size() - 5) + " more";
+            }
+            reportError(msg, target->graph->symbol());
+            result.success = false;
+            return result;
+        }
+
         const std::filesystem::path outputDir = resolveOutputDir(options);
         const std::string baseName = options.outputFilename && !options.outputFilename->empty()
                                          ? sanitizeIdentifier(std::filesystem::path(*options.outputFilename).stem().string())
@@ -744,7 +1075,7 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        writeHeader(*header, *target, *metadata);
+        writeHeader(*header, *target, *metadata, state);
         writeSource(*source, *target, *metadata, headerPath.filename().string());
 
         result.artifacts.push_back(headerPath.string());
