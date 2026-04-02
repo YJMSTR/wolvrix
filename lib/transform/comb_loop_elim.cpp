@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <optional>
 #include <set>
@@ -371,9 +372,28 @@ namespace wolvrix::lib::transform
             }
         }
 
-        std::optional<int64_t> getConstIntValue(const Graph &graph, ValueId valueId)
+        std::optional<uint64_t> makeBitMask(int64_t width)
+        {
+            if (width <= 0 || width > 64)
+            {
+                return std::nullopt;
+            }
+            if (width == 64)
+            {
+                return ~uint64_t{0};
+            }
+            return (uint64_t{1} << static_cast<unsigned>(width)) - 1u;
+        }
+
+        std::optional<int64_t> getConstIntValueImpl(const Graph &graph,
+                                                    ValueId valueId,
+                                                    std::unordered_set<ValueId, ValueIdHash> &visiting)
         {
             if (!valueId.valid())
+            {
+                return std::nullopt;
+            }
+            if (!visiting.insert(valueId).second)
             {
                 return std::nullopt;
             }
@@ -381,23 +401,108 @@ namespace wolvrix::lib::transform
             const OperationId defId = value.definingOp();
             if (!defId.valid())
             {
+                visiting.erase(valueId);
                 return std::nullopt;
             }
             const Operation defOp = graph.getOperation(defId);
-            if (defOp.kind() != OperationKind::kConstant)
+            switch (defOp.kind())
             {
+            case OperationKind::kConstant:
+            {
+                auto attr = defOp.attr("constValue");
+                if (!attr)
+                {
+                    visiting.erase(valueId);
+                    return std::nullopt;
+                }
+                if (const auto *literal = std::get_if<std::string>(&*attr))
+                {
+                    auto parsed = parseConstIntLiteral(*literal);
+                    visiting.erase(valueId);
+                    return parsed;
+                }
+                visiting.erase(valueId);
                 return std::nullopt;
             }
-            auto attr = defOp.attr("constValue");
-            if (!attr)
+            case OperationKind::kAssign:
             {
+                if (defOp.operands().size() != 1 || !defOp.operands()[0].valid())
+                {
+                    visiting.erase(valueId);
+                    return std::nullopt;
+                }
+                auto resolved = getConstIntValueImpl(graph, defOp.operands()[0], visiting);
+                visiting.erase(valueId);
+                return resolved;
+            }
+            case OperationKind::kSliceStatic:
+            {
+                if (defOp.operands().size() != 1 || !defOp.operands()[0].valid())
+                {
+                    visiting.erase(valueId);
+                    return std::nullopt;
+                }
+                auto startOpt = getIntAttr(defOp, "sliceStart");
+                auto endOpt = getIntAttr(defOp, "sliceEnd");
+                auto baseOpt = getConstIntValueImpl(graph, defOp.operands()[0], visiting);
+                if (!startOpt || !endOpt || !baseOpt || *startOpt < 0 || *endOpt < *startOpt)
+                {
+                    visiting.erase(valueId);
+                    return std::nullopt;
+                }
+                const int64_t width = *endOpt - *startOpt + 1;
+                auto maskOpt = makeBitMask(width);
+                if (!maskOpt)
+                {
+                    visiting.erase(valueId);
+                    return std::nullopt;
+                }
+                const uint64_t raw = static_cast<uint64_t>(*baseOpt);
+                const int64_t sliced = static_cast<int64_t>((raw >> static_cast<unsigned>(*startOpt)) & *maskOpt);
+                visiting.erase(valueId);
+                return sliced;
+            }
+            case OperationKind::kConcat:
+            {
+                uint64_t accum = 0;
+                int64_t totalWidth = 0;
+                for (ValueId operand : defOp.operands())
+                {
+                    if (!operand.valid())
+                    {
+                        visiting.erase(valueId);
+                        return std::nullopt;
+                    }
+                    const int64_t operandWidth = graph.getValue(operand).width();
+                    auto operandConst = getConstIntValueImpl(graph, operand, visiting);
+                    auto maskOpt = makeBitMask(operandWidth);
+                    if (!operandConst || !maskOpt)
+                    {
+                        visiting.erase(valueId);
+                        return std::nullopt;
+                    }
+                    totalWidth += operandWidth;
+                    if (totalWidth > 64)
+                    {
+                        visiting.erase(valueId);
+                        return std::nullopt;
+                    }
+                    accum = (accum << static_cast<unsigned>(operandWidth)) |
+                            (static_cast<uint64_t>(*operandConst) & *maskOpt);
+                }
+                visiting.erase(valueId);
+                return static_cast<int64_t>(accum);
+            }
+            default:
+                visiting.erase(valueId);
                 return std::nullopt;
             }
-            if (const auto *literal = std::get_if<std::string>(&*attr))
-            {
-                return parseConstIntLiteral(*literal);
-            }
-            return std::nullopt;
+        }
+
+        std::optional<int64_t> getConstIntValue(const Graph &graph, ValueId valueId)
+        {
+            std::unordered_set<ValueId, ValueIdHash> visiting;
+            return getConstIntValueImpl(graph, valueId, visiting);
         }
 
         bool rangeWithin(const BitRange &inner, const BitRange &outer)
@@ -1474,6 +1579,30 @@ namespace wolvrix::lib::transform
                     }
                     break;
                 }
+                case OperationKind::kSliceDynamic:
+                {
+                    if (operands.size() < 2 || !operands[0].valid() || !operands[1].valid())
+                    {
+                        return false;
+                    }
+                    auto widthOpt = getIntAttr(op, "sliceWidth");
+                    auto indexOpt = getConstIntValue(graph, operands[1]);
+                    if (!widthOpt || !indexOpt || *widthOpt <= 0)
+                    {
+                        return false;
+                    }
+                    if (*indexOpt < 0)
+                    {
+                        return false;
+                    }
+                    const int64_t sliceWidth = *widthOpt;
+                    if (sliceWidth != resultWidth)
+                    {
+                        return false;
+                    }
+                    edges.push_back(MappingEdge{operands[0], resultId, *indexOpt, 0, sliceWidth});
+                    break;
+                }
                 default:
                     break;
                 }
@@ -1601,16 +1730,30 @@ namespace wolvrix::lib::transform
                             std::size_t &opsRewritten,
                             const std::function<void(const Operation &, std::string)> &onError)
         {
+            auto debugSplitFail = [](const char *stage, const Operation *op = nullptr) -> bool {
+                if (op)
+                {
+                    std::fprintf(stderr, "[splitFalseLoop] %s op=%s kind=%s\n",
+                                 stage,
+                                 "<op>",
+                                 wolvrix::lib::grh::toString(op->kind()).data());
+                }
+                else
+                {
+                    std::fprintf(stderr, "[splitFalseLoop] %s\n", stage);
+                }
+                return false;
+            };
             std::vector<MappingEdge> edges;
             if (!collectCopyEdges(graph, loop.loopOps, edges))
             {
-                return false;
+                return debugSplitFail("collectCopyEdges");
             }
 
             std::unordered_map<ValueId, std::vector<BitRange>, ValueIdHash> segments;
             if (!buildLoopPartitions(graph, loop.loopValues, edges, segments))
             {
-                return false;
+                return debugSplitFail("buildLoopPartitions");
             }
 
             std::unordered_set<ValueId, ValueIdHash> loopSet(loop.loopValues.begin(), loop.loopValues.end());
@@ -1623,7 +1766,7 @@ namespace wolvrix::lib::transform
                 const auto segIt = segments.find(valueId);
                 if (segIt == segments.end())
                 {
-                    return false;
+                    return debugSplitFail("fragments.missing-segments");
                 }
                 const Value baseValue = graph.getValue(valueId);
                 if (segIt->second.size() > 1)
@@ -1635,7 +1778,7 @@ namespace wolvrix::lib::transform
                     const int64_t width = range.high - range.low + 1;
                     if (width <= 0)
                     {
-                        return false;
+                        return debugSplitFail("fragments.bad-width");
                     }
                     ValueId frag = graph.createValue(static_cast<int32_t>(width),
                                                      baseValue.isSigned(),
@@ -1703,11 +1846,11 @@ namespace wolvrix::lib::transform
             {
                 if (!srcFrag.valid() || !dstFrag.valid())
                 {
-                    return false;
+                    return debugSplitFail("addPair.invalid-fragment");
                 }
                 if (!definedFragments.insert(dstFrag).second)
                 {
-                    return false;
+                    return debugSplitFail("addPair.duplicate-dst");
                 }
                 opPairs[opId].push_back(std::make_pair(srcFrag, dstFrag));
                 return true;
@@ -1724,7 +1867,7 @@ namespace wolvrix::lib::transform
                 const auto &results = op.results();
                 if (results.size() != 1)
                 {
-                    return false;
+                    return debugSplitFail("op.bad-result-count", &op);
                 }
                 const ValueId resultId = results[0];
                 if (loopSet.find(resultId) == loopSet.end())
@@ -1734,7 +1877,7 @@ namespace wolvrix::lib::transform
                 const auto segIt = segments.find(resultId);
                 if (segIt == segments.end())
                 {
-                    return false;
+                    return debugSplitFail("op.missing-result-segments", &op);
                 }
                 const auto &resultSegments = segIt->second;
                 switch (op.kind())
@@ -1820,15 +1963,45 @@ namespace wolvrix::lib::transform
                             }
                             if (seg.low < lo || seg.high > hi)
                             {
-                                return false;
+                                return debugSplitFail("concat.segment-crosses-operand", &op);
                             }
                             BitRange opRange{seg.low - lo, seg.high - lo};
                             auto srcFrag = getFragment(operands[i], opRange);
                             auto dstFrag = getFragment(resultId, seg);
                             if (!srcFrag || !dstFrag || !addPair(opId, *srcFrag, *dstFrag))
                             {
-                                return false;
+                                return debugSplitFail("concat.fragment-or-pair", &op);
                             }
+                        }
+                    }
+                    break;
+                }
+                case OperationKind::kSliceDynamic:
+                {
+                    if (operands.size() < 2 || !operands[0].valid() || !operands[1].valid())
+                    {
+                        return debugSplitFail("slice-dynamic.bad-operands", &op);
+                    }
+                    auto widthOpt = getIntAttr(op, "sliceWidth");
+                    auto indexOpt = getConstIntValue(graph, operands[1]);
+                    if (!widthOpt || !indexOpt || *widthOpt <= 0 || *indexOpt < 0)
+                    {
+                        return debugSplitFail("slice-dynamic.bad-attrs", &op);
+                    }
+                    const int64_t sliceLow = *indexOpt;
+                    const int64_t sliceHigh = sliceLow + *widthOpt - 1;
+                    for (const auto &seg : resultSegments)
+                    {
+                        BitRange baseRange{sliceLow + seg.low, sliceLow + seg.high};
+                        if (baseRange.high > sliceHigh)
+                        {
+                            return debugSplitFail("slice-dynamic.range-overflow", &op);
+                        }
+                        auto srcFrag = getFragment(operands[0], baseRange);
+                        auto dstFrag = getFragment(resultId, seg);
+                        if (!srcFrag || !dstFrag || !addPair(opId, *srcFrag, *dstFrag))
+                        {
+                            return debugSplitFail("slice-dynamic.fragment-or-pair", &op);
                         }
                     }
                     break;
@@ -1840,22 +2013,22 @@ namespace wolvrix::lib::transform
                 {
                     if (operands.size() < 2)
                     {
-                        return false;
+                        return debugSplitFail("bitwise.bad-operand-count", &op);
                     }
                     const int64_t resultWidth = graph.getValue(resultId).width();
                     if (resultWidth <= 0)
                     {
-                        return false;
+                        return debugSplitFail("bitwise.bad-result-width", &op);
                     }
                     for (ValueId operand : operands)
                     {
                         if (!operand.valid())
                         {
-                            return false;
+                            return debugSplitFail("bitwise.invalid-operand", &op);
                         }
                         if (graph.getValue(operand).width() != resultWidth)
                         {
-                            return false;
+                            return debugSplitFail("bitwise.width-mismatch", &op);
                         }
                     }
                     for (const auto &seg : resultSegments)
@@ -1867,18 +2040,18 @@ namespace wolvrix::lib::transform
                             auto frag = getFragment(operand, seg);
                             if (!frag)
                             {
-                                return false;
+                                return debugSplitFail("bitwise.missing-fragment", &op);
                             }
                             segOperands.push_back(*frag);
                         }
                         auto dstFrag = getFragment(resultId, seg);
                         if (!dstFrag)
                         {
-                            return false;
+                            return debugSplitFail("bitwise.missing-dst-fragment", &op);
                         }
                         if (!definedFragments.insert(*dstFrag).second)
                         {
-                            return false;
+                            return debugSplitFail("bitwise.duplicate-dst", &op);
                         }
                         segmentOps[opId].push_back(SegmentOp{op.kind(), std::move(segOperands), *dstFrag});
                     }
@@ -2106,7 +2279,7 @@ namespace wolvrix::lib::transform
                     break;
                 }
                 default:
-                    return false;
+                    return debugSplitFail("unsupported-op-kind", &op);
                 }
             }
 
@@ -2148,7 +2321,7 @@ namespace wolvrix::lib::transform
                     }
                     if (graph.getOperation(opId).results().size() > 1)
                     {
-                        return false;
+                        return debugSplitFail("rewrite-op-pairs.multi-result");
                     }
                     graph.eraseAttr(opId, "sliceStart");
                     graph.eraseAttr(opId, "sliceEnd");
@@ -2157,6 +2330,9 @@ namespace wolvrix::lib::transform
                 }
                 catch (const std::exception &ex)
                 {
+                    std::fprintf(stderr, "[splitFalseLoop] rewrite-op-pairs.exception kind=%s what=%s\n",
+                                 wolvrix::lib::grh::toString(op.kind()).data(),
+                                 ex.what());
                     onError(op, std::string("Failed to rewrite loop op: ") + ex.what());
                     return false;
                 }
@@ -2219,6 +2395,9 @@ namespace wolvrix::lib::transform
                 }
                 catch (const std::exception &ex)
                 {
+                    std::fprintf(stderr, "[splitFalseLoop] rewrite-segment-op.exception kind=%s what=%s\n",
+                                 wolvrix::lib::grh::toString(op.kind()).data(),
+                                 ex.what());
                     onError(op, std::string("Failed to rewrite loop op: ") + ex.what());
                     return false;
                 }
@@ -2247,7 +2426,7 @@ namespace wolvrix::lib::transform
                 const auto segIt = segments.find(valueId);
                 if (segIt == segments.end())
                 {
-                    return false;
+                    return debugSplitFail("viewMap.missing-segments");
                 }
                 const Value value = graph.getValue(valueId);
                 const auto &ranges = segIt->second;
@@ -2258,7 +2437,7 @@ namespace wolvrix::lib::transform
                     auto fragIt = fragmentMap.find(RangeNode{valueId, range});
                     if (fragIt == fragmentMap.end())
                     {
-                        return false;
+                        return debugSplitFail("viewMap.missing-fragment");
                     }
                     ordered.push_back(std::make_pair(range, fragIt->second));
                 }
@@ -2314,6 +2493,9 @@ namespace wolvrix::lib::transform
                     }
                     catch (const std::exception &ex)
                     {
+                        std::fprintf(stderr, "[splitFalseLoop] rewire-external-use.exception kind=%s what=%s\n",
+                                     wolvrix::lib::grh::toString(graph.getOperation(user.operation).kind()).data(),
+                                     ex.what());
                         onError(graph.getOperation(user.operation),
                                 std::string("Failed to rewire external use: ") + ex.what());
                         return false;

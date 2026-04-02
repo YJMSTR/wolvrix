@@ -2,15 +2,20 @@
 #include "core/transform.hpp"
 #include "transform/gsim.hpp"
 
+#include <cstdio>
+#include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <unistd.h>
 
 using namespace wolvrix::lib;
 using namespace wolvrix::lib::transform;
@@ -161,13 +166,73 @@ bool hasDiagMessage(const PassDiagnostics &diags,
     return false;
 }
 
+bool hasDiagMessageContaining(const PassDiagnostics &diags,
+                              std::string_view passName,
+                              std::string_view messageNeedle,
+                              std::string_view contextNeedle = {})
+{
+    for (const auto &diag : diags.messages())
+    {
+        if (diag.passName == passName && diag.message.find(messageNeedle) != std::string::npos)
+        {
+            if (contextNeedle.empty() || diag.context.find(contextNeedle) != std::string::npos)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 PassManagerResult runGsim(grh::Design &design,
                           std::string_view path,
-                          PassDiagnostics &diags)
+                          PassDiagnostics &diags,
+                          PassVerbosity verbosity = PassVerbosity::Error)
 {
     PassManager manager;
+    manager.options().verbosity = verbosity;
     manager.addPass(std::make_unique<GsimPass>(GsimOptions{std::string(path)}));
     return manager.run(design, diags);
+}
+
+std::string captureStderr(const std::function<void()> &fn)
+{
+    std::fflush(stderr);
+    std::cerr.flush();
+
+    FILE *temp = std::tmpfile();
+    expect(temp != nullptr, "tmpfile for stderr capture should succeed");
+
+    const int savedFd = dup(fileno(stderr));
+    expect(savedFd >= 0, "dup for stderr capture should succeed");
+    expect(dup2(fileno(temp), fileno(stderr)) >= 0, "dup2 for stderr capture should succeed");
+
+    try
+    {
+        fn();
+        std::fflush(stderr);
+        std::cerr.flush();
+    }
+    catch (...)
+    {
+        dup2(savedFd, fileno(stderr));
+        close(savedFd);
+        fclose(temp);
+        throw;
+    }
+
+    expect(dup2(savedFd, fileno(stderr)) >= 0, "restoring stderr after capture should succeed");
+    close(savedFd);
+
+    std::rewind(temp);
+    std::string output;
+    char buffer[4096];
+    while (std::size_t count = std::fread(buffer, 1, sizeof(buffer), temp))
+    {
+        output.append(buffer, count);
+    }
+    fclose(temp);
+    return output;
 }
 
 PassManagerResult runPipeline(grh::Design &design,
@@ -788,6 +853,74 @@ void testPrerequisiteAuditPipelineCoverage()
     }
 }
 
+void testEmitsRealtimeStderrProgress()
+{
+    grh::Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+    buildLeafStatefulGraph(graph);
+
+    PassDiagnostics diags;
+    PassManagerResult result;
+    const std::string stderrText = captureStderr([&] {
+        result = runGsim(design, "top", diags, PassVerbosity::Info);
+    });
+    expectGsimSuccess(result, diags, "gsim realtime stderr fixture should run successfully");
+    expect(stderrText.find("[gsim] stage=validate start") != std::string::npos,
+           "gsim should print validate-stage start to stderr immediately");
+}
+
+void testEmitsValidateProgress()
+{
+    grh::Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+    buildLeafStatefulGraph(graph);
+
+    PassDiagnostics diags;
+    const auto result = runGsim(design, "top", diags, PassVerbosity::Info);
+    expectGsimSuccess(result, diags, "gsim validate fixture should run successfully");
+    expect(hasDiagMessageContaining(diags, "gsim", "[gsim] stage=validate start", "top"),
+           "gsim should emit validate-stage start diagnostics");
+    expect(hasDiagMessageContaining(diags, "gsim", "[gsim] stage=validate done", "top"),
+           "gsim should emit validate-stage completion diagnostics");
+}
+
+void testEmitsInstrumentationProgress()
+{
+    grh::Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+    buildLeafStatefulGraph(graph);
+
+    PassDiagnostics diags;
+    const auto result = runGsim(design, "top", diags, PassVerbosity::Info);
+    expectGsimSuccess(result, diags, "gsim progress fixture should run successfully");
+    expect(hasDiagMessageContaining(diags, "gsim", "[gsim] stage=collect start", "top"),
+           "gsim should emit collect-stage start diagnostics");
+    expect(hasDiagMessageContaining(diags, "gsim", "[gsim] stage=topo done", "top"),
+           "gsim should emit topo-stage completion diagnostics");
+    expect(hasDiagMessageContaining(diags, "gsim", "[gsim] stage=write done", "top"),
+           "gsim should emit write-stage completion diagnostics");
+}
+
+void testEmitsInstrumentationSummary()
+{
+    grh::Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+    buildLeafStatefulGraph(graph);
+
+    PassDiagnostics diags;
+    const auto result = runGsim(design, "top", diags, PassVerbosity::Info);
+    expectGsimSuccess(result, diags, "gsim instrumentation fixture should run successfully");
+    expect(hasDiagMessageContaining(diags,
+                                    "gsim",
+                                    "[gsim] graph=top",
+                                    "top"),
+           "gsim should emit a summary instrumentation diagnostic for successful runs");
+}
+
 void testFailuresAreClear()
 {
     {
@@ -867,6 +1000,10 @@ int main()
         testCrossRootInstancePathsStayDistinct();
         testMetadataOrderIsDeterministic();
         testPrerequisiteAuditPipelineCoverage();
+        testEmitsRealtimeStderrProgress();
+        testEmitsValidateProgress();
+        testEmitsInstrumentationProgress();
+        testEmitsInstrumentationSummary();
         testFailuresAreClear();
     }
     catch (const std::exception &ex)
