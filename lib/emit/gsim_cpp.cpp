@@ -614,6 +614,8 @@ namespace wolvrix::lib::emit
         // Collect register storage declarations
         void collectRegisters(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
         {
+            std::set<std::string> declaredStorage;
+
             for (const auto& opId : graph.operations()) {
                 auto op = graph.getOperation(opId);
                 if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
@@ -627,13 +629,13 @@ namespace wolvrix::lib::emit
                         width = val.width();
                     }
                     std::string type = getCppTypeForWidth(width);
-                    state.storageDecls.push_back(type + " " + regName + " = 0;");
-
+                    if (declaredStorage.insert(regName).second) {
+                        state.storageDecls.push_back(type + " " + regName + " = 0;");
+                    }
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = regName;
                     }
                 }
-                // Collect latches similarly to registers
                 if (op.kind() == wolvrix::lib::grh::OperationKind::kLatch) {
                     std::string sym = std::string(op.symbolText());
                     if (sym.empty()) sym = "unnamed_latch_" + std::to_string(opId.index);
@@ -645,10 +647,52 @@ namespace wolvrix::lib::emit
                         width = val.width();
                     }
                     std::string type = getCppTypeForWidth(width);
-                    state.storageDecls.push_back(type + " " + latchName + " = 0;");
-
+                    if (declaredStorage.insert(latchName).second) {
+                        state.storageDecls.push_back(type + " " + latchName + " = 0;");
+                    }
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = latchName;
+                    }
+                }
+                // Also collect storage names from read/write port attrs
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadPort ||
+                    op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
+                    auto regSymAttr = op.attr("regSymbol");
+                    std::string sym;
+                    if (regSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*regSymAttr)) sym = *strVal;
+                    }
+                    if (!sym.empty()) {
+                        std::string regName = "reg_" + sanitizeIdentifier(sym);
+                        if (declaredStorage.insert(regName).second) {
+                            int32_t width = 32;
+                            if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadPort && !op.results().empty()) {
+                                width = graph.getValue(op.results()[0]).width();
+                            } else if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort && op.operands().size() > 1) {
+                                width = graph.valueWidth(op.operands()[1]);
+                            }
+                            state.storageDecls.push_back(getCppTypeForWidth(width) + " " + regName + " = 0;");
+                        }
+                    }
+                }
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort ||
+                    op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort) {
+                    auto latchSymAttr = op.attr("latchSymbol");
+                    std::string sym;
+                    if (latchSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*latchSymAttr)) sym = *strVal;
+                    }
+                    if (!sym.empty()) {
+                        std::string latchName = "latch_" + sanitizeIdentifier(sym);
+                        if (declaredStorage.insert(latchName).second) {
+                            int32_t width = 32;
+                            if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort && !op.results().empty()) {
+                                width = graph.getValue(op.results()[0]).width();
+                            } else if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort && op.operands().size() > 1) {
+                                width = graph.valueWidth(op.operands()[1]);
+                            }
+                            state.storageDecls.push_back(getCppTypeForWidth(width) + " " + latchName + " = 0;");
+                        }
                     }
                 }
             }

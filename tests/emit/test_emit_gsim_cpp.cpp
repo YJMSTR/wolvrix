@@ -349,6 +349,22 @@ void testHappyPathAfterRunningGsim()
     expect(contains(source, "metadata.schedule_activity_order = {"), "source should serialize schedule activity ordering");
     expect(contains(source, "metadata.hypergraph_edge_sinks = {"), "source should serialize hypergraph sink metadata");
     expect(contains(source, "bool validate_top_metadata"), "source should emit validation helper");
+
+    // Compile verification: generated C++ must compile with strict flags
+    {
+        const std::filesystem::path wrapperPath = dir / "compile_check.cpp";
+        {
+            std::ofstream wrapper(wrapperPath);
+            wrapper << "#include \"top_metadata.hpp\"\n";
+            wrapper << "#include \"top_metadata.cpp\"\n";
+            wrapper << "int main() { SSimTop sim; sim.set_reset(1); sim.step(); return 0; }\n";
+        }
+        const std::string compileCmd =
+            "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+            " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+        const int compileResult = std::system(compileCmd.c_str());
+        expect(compileResult == 0, "emitted C++ should compile with -std=c++17 -Wall -Wextra -Werror");
+    }
 }
 
 void testFailureWithoutPriorMetadata()
