@@ -1278,9 +1278,11 @@ namespace
         const char *output = nullptr;
         PyObject *top_list_obj = Py_None;
         PyObject *target_path_obj = Py_None;
-        static const char *kwlist[] = {"design", "output", "top", "target_path", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OO", const_cast<char **>(kwlist),
-                                         &design_obj, &output, &top_list_obj, &target_path_obj))
+        const char *port_order_str = "";
+        PyObject *port_order_names_obj = Py_None;
+        static const char *kwlist[] = {"design", "output", "top", "target_path", "port_order", "port_order_names", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OOsO", const_cast<char **>(kwlist),
+                                         &design_obj, &output, &top_list_obj, &target_path_obj, &port_order_str, &port_order_names_obj))
         {
             return nullptr;
         }
@@ -1347,6 +1349,42 @@ namespace
         if (target_path)
         {
             options.attributes["path"] = target_path;
+        }
+
+        // Parse port_order strategy
+        if (port_order_str && port_order_str[0] != '\0')
+        {
+            std::string order_str(port_order_str);
+            if (order_str == "decl")
+            {
+                options.portOrderStrategy = wolvrix::lib::emit::PortOrderStrategy::Decl;
+            }
+            else if (order_str == "alpha")
+            {
+                options.portOrderStrategy = wolvrix::lib::emit::PortOrderStrategy::Alpha;
+            }
+            else if (order_str == "custom")
+            {
+                options.portOrderStrategy = wolvrix::lib::emit::PortOrderStrategy::Custom;
+            }
+            else
+            {
+                PyErr_SetString(PyExc_ValueError, "port_order must be one of: 'decl', 'alpha', 'custom'");
+                return nullptr;
+            }
+        }
+
+        // Parse port_order_names list for custom ordering
+        if (port_order_names_obj != Py_None)
+        {
+            std::vector<std::string> port_order_names;
+            std::string parse_error;
+            if (!parseStringList(port_order_names_obj, port_order_names, parse_error))
+            {
+                PyErr_SetString(PyExc_ValueError, ("port_order_names: " + parse_error).c_str());
+                return nullptr;
+            }
+            options.portOrderNames = std::move(port_order_names);
         }
 
         wolvrix::lib::emit::EmitResult result;
@@ -1635,7 +1673,7 @@ static PyMethodDef WolvrixMethods[] = {
      METH_VARARGS | METH_KEYWORDS,
      "write_verilator_repcut_package(design, output, top=None)"},
     {"write_gsim_cpp", reinterpret_cast<PyCFunction>(py_write_gsim_cpp), METH_VARARGS | METH_KEYWORDS,
-     "write_gsim_cpp(design, output, top=None, target_path=None)"},
+     "write_gsim_cpp(design, output, top=None, target_path=None, port_order='decl', port_order_names=None)"},
     {"run_pass", reinterpret_cast<PyCFunction>(py_run_pass), METH_VARARGS | METH_KEYWORDS,
      "run_pass(design, name, args=None, dryrun=False, diagnostics='warn', log_level='warn') -> (changed, ok, diagnostics)"},
     {"run_pipeline", reinterpret_cast<PyCFunction>(py_run_pipeline), METH_VARARGS | METH_KEYWORDS,

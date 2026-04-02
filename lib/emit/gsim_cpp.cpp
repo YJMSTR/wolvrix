@@ -277,8 +277,45 @@ namespace wolvrix::lib::emit
             }
         }
 
+        // Sort ports according to strategy
+        void sortPorts(std::vector<std::pair<std::string, std::string>>& ports,
+                       PortOrderStrategy strategy,
+                       const std::vector<std::string>& customOrder)
+        {
+            switch (strategy) {
+                case PortOrderStrategy::Decl:
+                    // Keep declaration order (no change)
+                    break;
+                case PortOrderStrategy::Alpha:
+                    std::sort(ports.begin(), ports.end(),
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+                    break;
+                case PortOrderStrategy::Custom:
+                    if (!customOrder.empty()) {
+                        std::unordered_map<std::string, size_t> orderMap;
+                        for (size_t i = 0; i < customOrder.size(); ++i) {
+                            orderMap[customOrder[i]] = i;
+                        }
+                        std::sort(ports.begin(), ports.end(),
+                                  [&orderMap](const auto& a, const auto& b) {
+                                      auto itA = orderMap.find(a.first);
+                                      auto itB = orderMap.find(b.first);
+                                      bool hasA = itA != orderMap.end();
+                                      bool hasB = itB != orderMap.end();
+                                      if (hasA && hasB) return itA->second < itB->second;
+                                      if (hasA) return true;
+                                      if (hasB) return false;
+                                      return a.first < b.first;
+                                  });
+                    }
+                    break;
+            }
+        }
+
         // Collect port information from graph
-        void collectPorts(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
+        void collectPorts(const wolvrix::lib::grh::Graph& graph, CodegenState& state,
+                          PortOrderStrategy strategy = PortOrderStrategy::Decl,
+                          const std::vector<std::string>& customOrder = {})
         {
             for (const auto& port : graph.inputPorts()) {
                 auto value = graph.getValue(port.value);
@@ -293,6 +330,10 @@ namespace wolvrix::lib::emit
                 std::string type = getCppTypeForWidth(value.width());
                 state.outputPorts.push_back({port.name, type});
             }
+
+            // Apply port ordering
+            sortPorts(state.inputPorts, strategy, customOrder);
+            sortPorts(state.outputPorts, strategy, customOrder);
         }
 
         // Collect register storage declarations
@@ -1032,7 +1073,7 @@ namespace wolvrix::lib::emit
 
         // Generate code from GRH operations
         CodegenState state;
-        collectPorts(*target->graph, state);
+        collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
         collectRegisters(*target->graph, state);
 
         // Traverse operations in topo order

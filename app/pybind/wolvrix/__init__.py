@@ -86,12 +86,14 @@ class Design:
         top: list[str] | None = None,
         target_path: str | None = None,
         dryrun: bool = False,
+        port_order: str = "decl",
+        port_order_names: list[str] | None = None,
     ) -> None:
         if dryrun:
             raise ValueError(
                 "write_gsim_cpp(..., dryrun=True) is not supported because GSim metadata lives in Design scratchpad and is not cloned"
             )
-        _native.write_gsim_cpp(self._capsule, output, top or [], target_path)
+        _native.write_gsim_cpp(self._capsule, output, top or [], target_path, port_order, port_order_names or [])
 
     def clone(self) -> "Design":
         return Design(_native.clone_design(self._capsule))
@@ -160,8 +162,17 @@ def write_gsim_cpp(
     top: list[str] | None = None,
     target_path: str | None = None,
     dryrun: bool = False,
+    port_order: str = "decl",
+    port_order_names: list[str] | None = None,
 ) -> None:
-    design.write_gsim_cpp(output=output, top=top, target_path=target_path, dryrun=dryrun)
+    design.write_gsim_cpp(
+        output=output,
+        top=top,
+        target_path=target_path,
+        dryrun=dryrun,
+        port_order=port_order,
+        port_order_names=port_order_names,
+    )
 
 
 def _level_rank(level: str) -> int | None:
