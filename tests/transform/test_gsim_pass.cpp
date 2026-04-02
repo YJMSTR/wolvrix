@@ -2,6 +2,7 @@
 #include "core/transform.hpp"
 #include "transform/gsim.hpp"
 
+#include <chrono>
 #include <initializer_list>
 #include <iostream>
 #include <map>
@@ -412,6 +413,43 @@ grh::Design buildCrossRootSharedLeafFixture()
     return design;
 }
 
+grh::Design buildLargeReadyFrontierFixture(std::size_t width)
+{
+    grh::Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto lhs = makeValue(graph, "lhs", 8, false);
+    const auto rhs = makeValue(graph, "rhs", 8, false);
+    graph.bindInputPort("lhs", lhs);
+    graph.bindInputPort("rhs", rhs);
+
+    std::vector<grh::ValueId> rootValues;
+    rootValues.reserve(width);
+    for (std::size_t i = 0; i < width; ++i)
+    {
+        const auto rootValue = makeValue(graph, "root_" + std::to_string(i), 8, false);
+        const auto rootOp = graph.createOperation(grh::OperationKind::kAdd,
+                                                  graph.internSymbol("root_add_" + std::to_string(i)));
+        graph.addOperand(rootOp, lhs);
+        graph.addOperand(rootOp, rhs);
+        graph.addResult(rootOp, rootValue);
+        rootValues.push_back(rootValue);
+    }
+
+    for (std::size_t i = 0; i < width; ++i)
+    {
+        const auto sinkValue = makeValue(graph, "sink_" + std::to_string(i), 8, false);
+        const auto sinkOp = graph.createOperation(grh::OperationKind::kXor,
+                                                  graph.internSymbol("sink_xor_" + std::to_string(i)));
+        graph.addOperand(sinkOp, rootValues[i]);
+        graph.addOperand(sinkOp, lhs);
+        graph.addResult(sinkOp, sinkValue);
+    }
+
+    return design;
+}
+
 void testPassRegistration()
 {
     const auto names = availableTransformPasses();
@@ -647,6 +685,39 @@ void testMetadataOrderIsDeterministic()
            "roots metadata should be sorted deterministically");
     expect(groupNames->size() == 1 && groupNames->front() == "combinational",
            "event group names should be stable and sorted");
+}
+
+void testTopologicalSchedulerScalesWithLargeReadyFrontier()
+{
+    constexpr std::size_t kFrontierWidth = 30000;
+    constexpr auto kMaxRuntime = std::chrono::milliseconds(1500);
+
+    grh::Design design = buildLargeReadyFrontierFixture(kFrontierWidth);
+    auto start = std::chrono::steady_clock::now();
+    PassDiagnostics diags;
+    const auto result = runGsim(design, "top", diags);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    expectGsimSuccess(result, diags, "large ready-frontier fixture should succeed");
+
+    const auto *topo = design.getScratchpad<std::vector<int64_t>>("gsim.top.topology.order");
+    expect(topo != nullptr, "large ready-frontier fixture should emit topology order");
+    expect(topo->size() == kFrontierWidth * 2, "large ready-frontier fixture should cover all roots and sinks");
+
+    for (std::size_t i = 1; i < kFrontierWidth; ++i)
+    {
+        expect((*topo)[i - 1] < (*topo)[i],
+               "large ready-frontier roots should preserve ascending-id deterministic order");
+    }
+    for (std::size_t i = kFrontierWidth + 1; i < topo->size(); ++i)
+    {
+        expect((*topo)[i - 1] < (*topo)[i],
+               "large ready-frontier sinks should preserve ascending-id deterministic order");
+    }
+
+    expect(elapsed <= kMaxRuntime,
+           "large ready-frontier scheduler should finish within the deterministic frontier budget");
 }
 
 void testPrerequisiteAuditPipelineCoverage()
@@ -909,6 +980,7 @@ int main()
         testMultiHopInstancePathUsesSharedResolver();
         testCrossRootInstancePathsStayDistinct();
         testMetadataOrderIsDeterministic();
+        testTopologicalSchedulerScalesWithLargeReadyFrontier();
         testPrerequisiteAuditPipelineCoverage();
         testFailuresAreClear();
         testCombinationalCycleRejection();

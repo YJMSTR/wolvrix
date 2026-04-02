@@ -67,6 +67,8 @@ namespace wolvrix::lib::emit
             std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
             // Storage declarations for registers/latches
             std::vector<std::string> storageDecls;
+            // Explicit reset statements for stateful storage
+            std::vector<std::string> resetStmts;
             // Sequential update statements (posedge_clock, combinational latch)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             // Combinational statements that drive outputs in step()
@@ -78,6 +80,9 @@ namespace wolvrix::lib::emit
             std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> outputValueNames;
             // Input port ValueId -> sanitized name mapping for reading inputs
             std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> inputValueNames;
+            // Memory symbol -> storage name and row count
+            std::map<std::string, std::string> memoryStorageNames;
+            std::map<std::string, int64_t> memoryRows;
             // Track unsupported operations
             std::vector<std::string> unsupportedOps;
         };
@@ -152,6 +157,18 @@ namespace wolvrix::lib::emit
             return out;
         }
 
+        std::string materializedValueName(const wolvrix::lib::grh::ValueId &valueId)
+        {
+            std::string name = "sim_tmp_v";
+            name.append(std::to_string(valueId.index));
+            if (valueId.generation != 0)
+            {
+                name.append("_g");
+                name.append(std::to_string(valueId.generation));
+            }
+            return name;
+        }
+
         // Forward declare sanitizeIdentifier for use in lowerOperation
         // (already defined above)
 
@@ -176,7 +193,11 @@ namespace wolvrix::lib::emit
             // Helper to set result expression
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < op.results().size()) {
-                    state.valueExprs[op.results()[idx]] = expr;
+                    const auto resultId = op.results()[idx];
+                    const auto tempName = materializedValueName(resultId);
+                    state.combinationalStmts.push_back(
+                        "        [[maybe_unused]] const " + getCppTypeForWidth(graph.valueWidth(resultId)) + " " + tempName + " = " + expr + ";");
+                    state.valueExprs[resultId] = tempName;
                 }
             };
 
@@ -471,6 +492,54 @@ namespace wolvrix::lib::emit
                     // Latch defines storage - handled similarly to register
                     break;
                 }
+                case OperationKind::kMemory: {
+                    // Memory storage is declared during pre-collection.
+                    break;
+                }
+                case OperationKind::kMemoryReadPort: {
+                    auto memSymAttr = op.attr("memSymbol");
+                    std::string sym;
+                    if (memSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*memSymAttr)) sym = *strVal;
+                    }
+                    const auto memIt = state.memoryStorageNames.find(sym);
+                    const auto rowIt = state.memoryRows.find(sym);
+                    if (memIt == state.memoryStorageNames.end() || rowIt == state.memoryRows.end() || rowIt->second <= 0) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back(std::string(toString(kind)) + " (" + opName + ")");
+                        break;
+                    }
+                    setResultExpr(0,
+                                  memIt->second + "[static_cast<std::size_t>(" + getOperandExpr(0) + ") % " +
+                                      std::to_string(rowIt->second) + "ULL]");
+                    break;
+                }
+                case OperationKind::kMemoryWritePort: {
+                    std::string condition = getOperandExpr(0);
+                    std::string addr = getOperandExpr(1);
+                    std::string data = getOperandExpr(2);
+                    std::string mask = getOperandExpr(3);
+
+                    auto memSymAttr = op.attr("memSymbol");
+                    std::string sym;
+                    if (memSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*memSymAttr)) sym = *strVal;
+                    }
+                    const auto memIt = state.memoryStorageNames.find(sym);
+                    const auto rowIt = state.memoryRows.find(sym);
+                    if (memIt == state.memoryStorageNames.end() || rowIt == state.memoryRows.end() || rowIt->second <= 0) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back(std::string(toString(kind)) + " (" + opName + ")");
+                        break;
+                    }
+
+                    const std::string idxName = "mem_index_" + std::to_string(op.id().index);
+                    state.sequentialStmts["posedge_clock"].push_back(
+                        "        if (" + condition + ") { const std::size_t " + idxName + " = static_cast<std::size_t>(" + addr + ") % " +
+                        std::to_string(rowIt->second) + "ULL; " + memIt->second + "[" + idxName + "] = (" +
+                        memIt->second + "[" + idxName + "] & ~" + mask + ") | (" + data + " & " + mask + "); }");
+                    break;
+                }
                 case OperationKind::kLatchReadPort: {
                     auto latchSymAttr = op.attr("latchSymbol");
                     std::string sym;
@@ -541,8 +610,15 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kSystemTask:
-                case OperationKind::kSystemFunction: {
+                case OperationKind::kSystemFunction:
+                case OperationKind::kDpicImport: {
                     // Debug constructs - no simulation logic
+                    break;
+                }
+                case OperationKind::kDpicCall: {
+                    for (std::size_t i = 0; i < op.results().size(); ++i) {
+                        setResultExpr(i, "0");
+                    }
                     break;
                 }
                 default: {
@@ -634,6 +710,7 @@ namespace wolvrix::lib::emit
                     std::string type = getCppTypeForWidth(width);
                     if (declaredStorage.insert(regName).second) {
                         state.storageDecls.push_back(type + " " + regName + " = 0;");
+                        state.resetStmts.push_back("        " + regName + " = 0;");
                     }
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = regName;
@@ -652,6 +729,7 @@ namespace wolvrix::lib::emit
                     std::string type = getCppTypeForWidth(width);
                     if (declaredStorage.insert(latchName).second) {
                         state.storageDecls.push_back(type + " " + latchName + " = 0;");
+                        state.resetStmts.push_back("        " + latchName + " = 0;");
                     }
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = latchName;
@@ -675,6 +753,7 @@ namespace wolvrix::lib::emit
                                 width = graph.valueWidth(op.operands()[1]);
                             }
                             state.storageDecls.push_back(getCppTypeForWidth(width) + " " + regName + " = 0;");
+                            state.resetStmts.push_back("        " + regName + " = 0;");
                         }
                     }
                 }
@@ -695,8 +774,63 @@ namespace wolvrix::lib::emit
                                 width = graph.valueWidth(op.operands()[1]);
                             }
                             state.storageDecls.push_back(getCppTypeForWidth(width) + " " + latchName + " = 0;");
+                            state.resetStmts.push_back("        " + latchName + " = 0;");
                         }
                     }
+                }
+            }
+        }
+
+        void collectMemories(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
+        {
+            std::set<std::string> declaredStorage;
+            for (const auto& decl : state.storageDecls)
+            {
+                const auto eqPos = decl.find(" = ");
+                if (eqPos == std::string::npos)
+                {
+                    continue;
+                }
+                const auto spacePos = decl.rfind(' ', eqPos - 1);
+                if (spacePos == std::string::npos)
+                {
+                    continue;
+                }
+                declaredStorage.insert(decl.substr(spacePos + 1, eqPos - spacePos - 1));
+            }
+
+            for (const auto opId : graph.operations()) {
+                auto op = graph.getOperation(opId);
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kMemory) {
+                    continue;
+                }
+                const std::string sym = std::string(op.symbolText());
+                if (sym.empty()) {
+                    continue;
+                }
+
+                int64_t width = 32;
+                int64_t rows = 1;
+                if (auto widthAttr = op.attr("width")) {
+                    if (auto* intVal = std::get_if<int64_t>(&*widthAttr)) width = *intVal;
+                }
+                if (auto rowAttr = op.attr("row")) {
+                    if (auto* intVal = std::get_if<int64_t>(&*rowAttr)) rows = *intVal;
+                }
+                if (rows <= 0) {
+                    rows = 1;
+                }
+
+                const std::string memName = "mem_" + sanitizeIdentifier(sym) + "_";
+                state.memoryStorageNames[sym] = memName;
+                state.memoryRows[sym] = rows;
+                if (declaredStorage.insert(memName).second) {
+                    const std::string type = getCppTypeForWidth(static_cast<int32_t>(width));
+                    state.storageDecls.push_back(
+                        "std::vector<" + type + "> " + memName + " = std::vector<" + type + ">(" +
+                        std::to_string(rows) + ", 0);");
+                    state.resetStmts.push_back(
+                        "        std::fill(" + memName + ".begin(), " + memName + ".end(), 0);");
                 }
             }
         }
@@ -1316,6 +1450,7 @@ namespace wolvrix::lib::emit
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
             os << "#pragma once\n\n";
+            os << "#include <algorithm>\n";
             os << "#include <cstdint>\n";
             os << "#include <map>\n";
             os << "#include <stdexcept>\n";
@@ -1323,52 +1458,11 @@ namespace wolvrix::lib::emit
             os << "#include <vector>\n\n";
             os << "class SSimTop {\n";
             os << "public:\n";
-            os << "    SSimTop() { reset(); }\n";
+            os << "    SSimTop();\n";
             os << "    ~SSimTop() = default;\n\n";
             os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
-            os << "    void reset() {\n";
-            os << "        reset_ = true;\n";
-            // Reset storage members to zero
-            for (const auto& decl : state.storageDecls) {
-                // Extract variable name from "type varname = 0;" -> "varname"
-                auto eqPos = decl.find(" = ");
-                if (eqPos != std::string::npos) {
-                    auto spacePos = decl.rfind(' ', eqPos - 1);
-                    if (spacePos != std::string::npos) {
-                        std::string varName = decl.substr(spacePos + 1, eqPos - spacePos - 1);
-                        os << "        " << varName << " = 0;\n";
-                    }
-                }
-            }
-            // Reset output ports
-            for (const auto& [name, type] : state.outputPorts) {
-                os << "        output_" << sanitizeIdentifier(name) << "_ = 0;\n";
-            }
-            os << "    }\n\n";
-            os << "    void step() {\n";
-            os << "        ++difftest_step_;\n";
-            os << "        if (reset_) {\n";
-            os << "            reset_ = false;\n";
-            os << "            difftest_exit_ = 0;\n";
-            os << "            return;\n";
-            os << "        }\n";
-            // Combinational logic: evaluate expressions and drive outputs
-            if (!state.combinationalStmts.empty()) {
-                for (const auto& stmt : state.combinationalStmts) {
-                    os << stmt << "\n";
-                }
-            }
-            // Sequential logic: register/latch updates
-            if (!state.sequentialStmts.empty()) {
-                for (const auto& [domain, stmts] : state.sequentialStmts) {
-                    (void)domain;
-                    for (const auto& stmt : stmts) {
-                        os << stmt << "\n";
-                    }
-                }
-            }
-            os << "        difftest_exit_ = 0;\n";
-            os << "    }\n\n";
+            os << "    void reset();\n\n";
+            os << "    void step();\n\n";
 
             // Input port setters
             for (const auto& [name, type] : state.inputPorts) {
@@ -1464,6 +1558,7 @@ namespace wolvrix::lib::emit
                          std::string_view baseName,
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
+                         const CodegenState &state,
                          std::string_view headerFilename,
                          std::size_t metadataShardMaxBytes,
                          std::vector<std::string> &managedSourceFiles,
@@ -1484,6 +1579,42 @@ namespace wolvrix::lib::emit
             os << "#include \"" << headerFilename << "\"\n\n";
             os << "#include <algorithm>\n";
             os << "#include <set>\n\n";
+            os << "SSimTop::SSimTop() {\n";
+            os << "    reset();\n";
+            os << "}\n\n";
+            os << "void SSimTop::reset() {\n";
+            os << "    reset_ = true;\n";
+            for (const auto &stmt : state.resetStmts)
+            {
+                os << stmt << "\n";
+            }
+            for (const auto &[name, type] : state.outputPorts)
+            {
+                (void)type;
+                os << "    output_" << sanitizeIdentifier(name) << "_ = 0;\n";
+            }
+            os << "}\n\n";
+            os << "void SSimTop::step() {\n";
+            os << "    ++difftest_step_;\n";
+            os << "    if (reset_) {\n";
+            os << "        reset_ = false;\n";
+            os << "        difftest_exit_ = 0;\n";
+            os << "        return;\n";
+            os << "    }\n";
+            for (const auto &stmt : state.combinationalStmts)
+            {
+                os << stmt << "\n";
+            }
+            for (const auto &[domain, stmts] : state.sequentialStmts)
+            {
+                (void)domain;
+                for (const auto &stmt : stmts)
+                {
+                    os << stmt << "\n";
+                }
+            }
+            os << "    difftest_exit_ = 0;\n";
+            os << "}\n\n";
             os << "namespace wolvrix::gsim {\n\n";
             os << "namespace {\n";
             os << "template <typename T>\n";
@@ -1748,14 +1879,26 @@ namespace wolvrix::lib::emit
         }
 
         collectRegisters(*target->graph, state);
+        collectMemories(*target->graph, state);
 
         // Traverse operations in topo order
+        std::vector<wolvrix::lib::grh::OperationId> operationIdsByIndex;
+        for (const auto opId : target->graph->operations())
+        {
+            if (opId.index >= operationIdsByIndex.size())
+            {
+                operationIdsByIndex.resize(static_cast<std::size_t>(opId.index) + 1);
+            }
+            operationIdsByIndex[opId.index] = opId;
+        }
         for (int64_t opIdx : metadata->topoOrder) {
-            auto opIdIt = std::find_if(target->graph->operations().begin(), target->graph->operations().end(),
-                [&](const wolvrix::lib::grh::OperationId& id) { return static_cast<int64_t>(id.index) == opIdx; });
-            if (opIdIt != target->graph->operations().end()) {
-                auto op = target->graph->getOperation(*opIdIt);
-                lowerOperation(*target->graph, op, state);
+            if (opIdx >= 0 && static_cast<std::size_t>(opIdx) < operationIdsByIndex.size()) {
+                const auto opId = operationIdsByIndex[static_cast<std::size_t>(opIdx)];
+                if (opId.valid())
+                {
+                    auto op = target->graph->getOperation(opId);
+                    lowerOperation(*target->graph, op, state);
+                }
             }
         }
 
@@ -1823,6 +1966,7 @@ namespace wolvrix::lib::emit
                          baseName,
                          *target,
                          *metadata,
+                         state,
                          headerPath.filename().string(),
                          *metadataShardMaxBytes,
                          managedSourceFiles,

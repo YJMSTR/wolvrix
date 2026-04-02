@@ -344,6 +344,138 @@ Design buildReplicateSignExtendDesign()
     return design;
 }
 
+Design buildLinearAddChainDesign(std::size_t depth)
+{
+    Design design;
+    auto &graph = design.createGraph("chain_top");
+    design.markAsTop("chain_top");
+
+    const auto in = makeValue(graph, "in", 8, false);
+    graph.bindInputPort("in", in);
+
+    ValueId current = in;
+    for (std::size_t i = 0; i < depth; ++i)
+    {
+        const auto one = makeConstant(graph,
+                                      "chain_one_" + std::to_string(i),
+                                      "chain_one_const_" + std::to_string(i),
+                                      8,
+                                      "8'h01");
+        const auto next = makeValue(graph, "chain_val_" + std::to_string(i), 8, false);
+        const auto add = graph.createOperation(OperationKind::kAdd, graph.internSymbol("chain_add_" + std::to_string(i)));
+        graph.addOperand(add, current);
+        graph.addOperand(add, one);
+        graph.addResult(add, next);
+        current = next;
+    }
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_chain_out"));
+    graph.addOperand(assign, current);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
+Design buildMemoryBehaviorDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("mem_top");
+    design.markAsTop("mem_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto wen = makeValue(graph, "wen", 1, false);
+    const auto raddr = makeValue(graph, "raddr", 2, false);
+    const auto waddr = makeValue(graph, "waddr", 2, false);
+    const auto wdata = makeValue(graph, "wdata", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("wen", wen);
+    graph.bindInputPort("raddr", raddr);
+    graph.bindInputPort("waddr", waddr);
+    graph.bindInputPort("wdata", wdata);
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+
+    const auto memMask = makeConstant(graph, "mem_mask", "mem_mask_const", 8, "8'hff");
+
+    const auto mem = graph.createOperation(OperationKind::kMemory, graph.internSymbol("mem0"));
+    graph.setAttr(mem, "width", static_cast<int64_t>(8));
+    graph.setAttr(mem, "row", static_cast<int64_t>(4));
+    graph.setAttr(mem, "isSigned", false);
+    graph.setAttr(mem, "initKind", std::vector<std::string>{"literal"});
+    graph.setAttr(mem, "initFile", std::vector<std::string>{""});
+    graph.setAttr(mem, "initValue", std::vector<std::string>{"8'h00"});
+    graph.setAttr(mem, "initStart", std::vector<int64_t>{-1});
+    graph.setAttr(mem, "initLen", std::vector<int64_t>{0});
+
+    const auto memRead = graph.createOperation(OperationKind::kMemoryReadPort, graph.internSymbol("mem0_read"));
+    graph.setAttr(memRead, "memSymbol", std::string("mem0"));
+    graph.addOperand(memRead, raddr);
+    const auto readData = makeValue(graph, "read_data", 8, false);
+    graph.addResult(memRead, readData);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, readData);
+    graph.addResult(assign, out);
+
+    const auto memWrite = graph.createOperation(OperationKind::kMemoryWritePort, graph.internSymbol("mem0_write"));
+    graph.setAttr(memWrite, "memSymbol", std::string("mem0"));
+    graph.setAttr(memWrite, "clockSymbol", std::string("clk"));
+    graph.setAttr(memWrite, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.addOperand(memWrite, wen);
+    graph.addOperand(memWrite, waddr);
+    graph.addOperand(memWrite, wdata);
+    graph.addOperand(memWrite, memMask);
+    graph.addOperand(memWrite, clk);
+
+    return design;
+}
+
+Design buildDpicIgnoredDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("dpic_top");
+    design.markAsTop("dpic_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto in = makeValue(graph, "in", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, in);
+    graph.addResult(assign, out);
+
+    const auto cond = makeConstant(graph, "dpi_cond", "dpi_cond_const", 1, "1'b1");
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"logic"});
+    graph.setAttr(import, "hasReturn", false);
+    graph.setAttr(import, "returnWidth", static_cast<int64_t>(0));
+    graph.setAttr(import, "returnSigned", false);
+    graph.setAttr(import, "returnType", std::string("void"));
+
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", false);
+    graph.addOperand(call, cond);
+    graph.addOperand(call, in);
+    graph.addOperand(call, clk);
+
+    return design;
+}
+
 void runGsim(Design &design, const std::string &path)
 {
     PassManager manager;
@@ -1090,6 +1222,145 @@ void testReplicateSignExtendBehavior()
     expect(std::system(exePath.c_str()) == 0, "replicate sign-extend driver should pass");
 }
 
+void testLargeCombinationalChainUsesMaterializedTemporaries()
+{
+    Design design = buildLinearAddChainDesign(128);
+    runGsim(design, "chain_top");
+
+    const auto dir = artifactRoot() / "materialized_temps";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chain_sim");
+    options.topOverrides = {"chain_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "linear add chain emit should succeed");
+    expect(!diags.hasError(), "linear add chain emit should not emit diagnostics");
+
+    const std::string header = readFile(dir / "chain_sim.hpp");
+    const std::string source = readFile(dir / "chain_sim.cpp");
+    expect(!contains(header, "sim_tmp_v"),
+           "large combinational chains should keep materialized temporaries out of the public header");
+    expect(!contains(header, "output_y_ = sim_tmp_v"),
+           "header should not inline step behavior for large combinational chains");
+    expect(contains(source, "const std::uint8_t sim_tmp_v"),
+           "large combinational chains should materialize intermediate temporaries in the emitted source");
+    expect(contains(source, "output_y_ = sim_tmp_v"),
+           "output assignments should consume a materialized temporary rather than an inlined expression tree");
+
+    const std::filesystem::path driverPath = dir / "chain_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"chain_sim.hpp\"\n";
+        driver << "#include \"chain_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_in(5); sim.step();\n";
+        driver << "    if (sim.get_y() != 133) { std::printf(\"FAIL %u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "chain_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "materialized temporary driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "materialized temporary driver should run successfully");
+}
+
+void testMemoryLoweringBehavior()
+{
+    Design design = buildMemoryBehaviorDesign();
+    runGsim(design, "mem_top");
+
+    const auto dir = artifactRoot() / "memory_behavior";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("mem_sim");
+    options.topOverrides = {"mem_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "memory lowering emit should succeed");
+    expect(!diags.hasError(), "memory lowering emit should not emit diagnostics");
+
+    const std::string header = readFile(dir / "mem_sim.hpp");
+    const std::string source = readFile(dir / "mem_sim.cpp");
+    expect(contains(header, "std::vector<std::uint8_t> mem_mem0_"),
+           "memory lowering should declare vector-backed storage");
+    expect(contains(source, "std::fill(mem_mem0_.begin(), mem_mem0_.end(), 0);"),
+           "memory lowering should reset vector-backed storage in the emitted source");
+
+    const std::filesystem::path driverPath = dir / "mem_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"mem_sim.hpp\"\n";
+        driver << "#include \"mem_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_raddr(1); sim.set_wen(1); sim.set_waddr(1); sim.set_wdata(42); sim.step();\n";
+        driver << "    if (sim.get_y() != 0) { std::printf(\"FAIL write-step %u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    sim.set_wen(0); sim.step();\n";
+        driver << "    if (sim.get_y() != 42) { std::printf(\"FAIL readback %u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "mem_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "memory lowering driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "memory lowering driver should run successfully");
+}
+
+void testDpicOpsAreIgnoredForEmission()
+{
+    Design design = buildDpicIgnoredDesign();
+    runGsim(design, "dpic_top");
+
+    const auto dir = artifactRoot() / "dpic_ignored";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_sim");
+    options.topOverrides = {"dpic_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "dpic-ignored emit should succeed");
+    expect(!diags.hasError(), "dpic-ignored emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "dpic_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"dpic_sim.hpp\"\n";
+        driver << "#include \"dpic_sim.cpp\"\n";
+        driver << "int main() { SSimTop sim; sim.set_reset(1); sim.step(); sim.set_in(7); sim.step(); return sim.get_y() == 7 ? 0 : 1; }\n";
+    }
+
+    const std::string exePath = (dir / "dpic_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "dpic-ignored driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "dpic-ignored driver should run successfully");
+}
+
 int main()
 {
     try
@@ -1113,6 +1384,9 @@ int main()
         testHypergraphVersionMismatchRejection();
         testRegisterLatencyBehavior();
         testReplicateSignExtendBehavior();
+        testLargeCombinationalChainUsesMaterializedTemporaries();
+        testMemoryLoweringBehavior();
+        testDpicOpsAreIgnoredForEmission();
     }
     catch (const std::exception &ex)
     {

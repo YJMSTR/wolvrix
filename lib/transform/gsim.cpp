@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <map>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -202,50 +203,57 @@ namespace wolvrix::lib::transform
 
         std::vector<wolvrix::lib::grh::OperationId> stableTopologicalOrder(const std::vector<OpRecord> &records)
         {
-            std::unordered_map<uint32_t, std::size_t> indegree;
-            std::unordered_map<uint32_t, std::vector<wolvrix::lib::grh::OperationId>> succs;
-            std::vector<wolvrix::lib::grh::OperationId> ready;
-
-            for (const auto &record : records)
+            std::unordered_map<uint32_t, std::size_t> positionByIndex;
+            positionByIndex.reserve(records.size());
+            for (std::size_t i = 0; i < records.size(); ++i)
             {
-                indegree[record.id.index] = record.preds.size();
-                succs.emplace(record.id.index, record.succs);
+                positionByIndex.emplace(records[i].id.index, i);
+            }
+
+            std::vector<std::size_t> indegree(records.size(), 0);
+            std::vector<std::vector<std::size_t>> succPositions(records.size());
+            std::priority_queue<std::size_t, std::vector<std::size_t>, std::greater<>> ready;
+
+            for (std::size_t i = 0; i < records.size(); ++i)
+            {
+                const auto &record = records[i];
+                indegree[i] = record.preds.size();
+                auto &mappedSuccs = succPositions[i];
+                mappedSuccs.reserve(record.succs.size());
+                for (const auto succ : record.succs)
+                {
+                    const auto succIt = positionByIndex.find(succ.index);
+                    if (succIt != positionByIndex.end())
+                    {
+                        mappedSuccs.push_back(succIt->second);
+                    }
+                }
                 if (record.preds.empty())
                 {
-                    ready.push_back(record.id);
+                    ready.push(i);
                 }
             }
-            std::sort(ready.begin(), ready.end(), [](const auto &lhs, const auto &rhs) {
-                return lhs.index < rhs.index;
-            });
 
             std::vector<wolvrix::lib::grh::OperationId> order;
+            order.reserve(records.size());
             while (!ready.empty())
             {
-                const auto next = ready.front();
-                ready.erase(ready.begin());
+                const auto nextPos = ready.top();
+                ready.pop();
+                const auto next = records[nextPos].id;
                 order.push_back(next);
-                auto it = succs.find(next.index);
-                if (it == succs.end())
+                for (const auto succPos : succPositions[nextPos])
                 {
-                    continue;
-                }
-                for (const auto succ : it->second)
-                {
-                    auto indegreeIt = indegree.find(succ.index);
-                    if (indegreeIt == indegree.end() || indegreeIt->second == 0)
+                    if (indegree[succPos] == 0)
                     {
                         continue;
                     }
-                    --indegreeIt->second;
-                    if (indegreeIt->second == 0)
+                    --indegree[succPos];
+                    if (indegree[succPos] == 0)
                     {
-                        ready.push_back(succ);
+                        ready.push(succPos);
                     }
                 }
-                std::sort(ready.begin(), ready.end(), [](const auto &lhs, const auto &rhs) {
-                    return lhs.index < rhs.index;
-                });
             }
 
             if (order.size() != records.size())
