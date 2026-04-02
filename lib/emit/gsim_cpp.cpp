@@ -86,8 +86,7 @@ namespace wolvrix::lib::emit
             if (width <= 8) return "std::uint8_t";
             if (width <= 16) return "std::uint16_t";
             if (width <= 32) return "std::uint32_t";
-            if (width <= 64) return "std::uint64_t";
-            return "std::vector<std::uint64_t>";
+            return "std::uint64_t";  // Wide values truncated to 64 bits for now
         }
 
         // Convert Verilog-style constant to C++ constant
@@ -229,7 +228,17 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kNot: {
-                    setResultExpr(0, "(~" + getOperandExpr(0) + ")");
+                    // Mask result to operand width to avoid promoted bitwise complement warnings
+                    int64_t w = 0;
+                    if (!op.operands().empty()) w = graph.valueWidth(op.operands()[0]);
+                    if (w > 0 && w < 64) {
+                        uint64_t mask = (uint64_t(1) << w) - 1;
+                        std::ostringstream ss;
+                        ss << "((~" << getOperandExpr(0) << ") & 0x" << std::hex << mask << "ULL)";
+                        setResultExpr(0, ss.str());
+                    } else {
+                        setResultExpr(0, "(~" + getOperandExpr(0) + ")");
+                    }
                     break;
                 }
                 case OperationKind::kLogicNot: {
@@ -275,7 +284,16 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kXnor: {
-                    setResultExpr(0, "(~(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + "))");
+                    int64_t w = 0;
+                    if (!op.results().empty()) w = graph.valueWidth(op.results()[0]);
+                    if (w > 0 && w < 64) {
+                        uint64_t mask = (uint64_t(1) << w) - 1;
+                        std::ostringstream ss;
+                        ss << "((~(" << getOperandExpr(0) << " ^ " << getOperandExpr(1) << ")) & 0x" << std::hex << mask << "ULL)";
+                        setResultExpr(0, ss.str());
+                    } else {
+                        setResultExpr(0, "(~(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + "))");
+                    }
                     break;
                 }
                 // Arithmetic
@@ -355,8 +373,10 @@ namespace wolvrix::lib::emit
                                 shift += widths[j];
                             }
                             std::string part = getOperandExpr(i);
-                            if (shift > 0) {
+                            if (shift > 0 && shift < 64) {
                                 part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
+                            } else if (shift >= 64) {
+                                part = "0"; // Bits beyond 64 are truncated
                             }
                             if (expr.empty()) {
                                 expr = part;
@@ -386,8 +406,10 @@ namespace wolvrix::lib::emit
                         for (int64_t i = 0; i < count; ++i) {
                             std::string part = getOperandExpr(0);
                             int64_t shift = (count - 1 - i) * opWidth;
-                            if (shift > 0) {
+                            if (shift > 0 && shift < 64) {
                                 part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
+                            } else if (shift >= 64) {
+                                part = "0"; // Bits beyond 64 are truncated
                             }
                             if (expr.empty()) {
                                 expr = part;
