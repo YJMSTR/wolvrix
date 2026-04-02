@@ -1367,6 +1367,21 @@ namespace wolvrix::lib::emit
         // Generate code from GRH operations
         CodegenState state;
         collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
+
+        // Validate custom port order names
+        if (options.portOrderStrategy == PortOrderStrategy::Custom && !options.portOrderNames.empty()) {
+            std::set<std::string> allPortNames;
+            for (const auto& [name, type] : state.inputPorts) allPortNames.insert(name);
+            for (const auto& [name, type] : state.outputPorts) allPortNames.insert(name);
+            for (const auto& name : options.portOrderNames) {
+                if (allPortNames.find(name) == allPortNames.end()) {
+                    reportError("port_order_names contains nonexistent port", name);
+                    result.success = false;
+                    return result;
+                }
+            }
+        }
+
         collectRegisters(*target->graph, state);
 
         // Traverse operations in topo order
