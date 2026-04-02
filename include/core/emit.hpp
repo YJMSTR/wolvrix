@@ -31,6 +31,13 @@ namespace wolvrix::lib::emit
         using wolvrix::lib::diag::Diagnostics::debug;
     };
 
+    enum class PortOrderStrategy
+    {
+        Decl,   // Declaration order (default)
+        Alpha,  // Alphabetical order
+        Custom  // User-specified order
+    };
+
     struct EmitOptions
     {
         std::optional<std::string> outputDir;
@@ -39,6 +46,8 @@ namespace wolvrix::lib::emit
         std::map<std::string, std::string, std::less<>> attributes;
         bool traceUnderscoreValues = false;
         bool splitModules = false;
+        PortOrderStrategy portOrderStrategy = PortOrderStrategy::Decl;
+        std::vector<std::string> portOrderNames; // For Custom strategy
     };
 
     struct EmitResult

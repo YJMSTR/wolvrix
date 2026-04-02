@@ -1278,9 +1278,11 @@ namespace
         const char *output = nullptr;
         PyObject *top_list_obj = Py_None;
         PyObject *target_path_obj = Py_None;
-        static const char *kwlist[] = {"design", "output", "top", "target_path", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OO", const_cast<char **>(kwlist),
-                                         &design_obj, &output, &top_list_obj, &target_path_obj))
+        const char *port_order_str = nullptr;
+        PyObject *port_order_names_obj = Py_None;
+        static const char *kwlist[] = {"design", "output", "top", "target_path", "port_order", "port_order_names", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OOsO", const_cast<char **>(kwlist),
+                                         &design_obj, &output, &top_list_obj, &target_path_obj, &port_order_str, &port_order_names_obj))
         {
             return nullptr;
         }
@@ -1347,6 +1349,42 @@ namespace
         if (target_path)
         {
             options.attributes["path"] = target_path;
+        }
+
+        // Parse port_order (empty string means use default)
+        if (port_order_str && port_order_str[0] != '\0')
+        {
+            std::string strategy(port_order_str);
+            if (strategy == "decl")
+            {
+                options.portOrderStrategy = wolvrix::lib::emit::PortOrderStrategy::Decl;
+            }
+            else if (strategy == "alpha")
+            {
+                options.portOrderStrategy = wolvrix::lib::emit::PortOrderStrategy::Alpha;
+            }
+            else if (strategy == "custom")
+            {
+                options.portOrderStrategy = wolvrix::lib::emit::PortOrderStrategy::Custom;
+            }
+            else
+            {
+                PyErr_SetString(PyExc_ValueError, "port_order must be 'decl', 'alpha', or 'custom'");
+                return nullptr;
+            }
+        }
+
+        // Parse port_order_names
+        if (port_order_names_obj != Py_None)
+        {
+            std::vector<std::string> port_names;
+            std::string parseError;
+            if (!parseStringList(port_order_names_obj, port_names, parseError))
+            {
+                PyErr_SetString(PyExc_ValueError, ("port_order_names: " + parseError).c_str());
+                return nullptr;
+            }
+            options.portOrderNames = std::move(port_names);
         }
 
         wolvrix::lib::emit::EmitResult result;
