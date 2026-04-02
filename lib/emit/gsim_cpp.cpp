@@ -63,13 +63,19 @@ namespace wolvrix::lib::emit
         {
             // Value expressions: maps ValueId to C++ expression string
             std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
-            // Storage declarations for registers
+            // Storage declarations for registers/latches
             std::vector<std::string> storageDecls;
-            // Sequential update statements
+            // Sequential update statements (posedge_clock, combinational latch)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
+            // Combinational statements that drive outputs in step()
+            std::vector<std::string> combinationalStmts;
             // Port declarations
             std::vector<std::pair<std::string, std::string>> inputPorts;
             std::vector<std::pair<std::string, std::string>> outputPorts;
+            // Output port ValueId -> sanitized name mapping for driving outputs
+            std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> outputValueNames;
+            // Input port ValueId -> sanitized name mapping for reading inputs
+            std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> inputValueNames;
             // Track unsupported operations
             std::vector<std::string> unsupportedOps;
         };
@@ -441,7 +447,12 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kLatchReadPort: {
-                    std::string sym = std::string(op.symbolText());
+                    auto latchSymAttr = op.attr("latchSymbol");
+                    std::string sym;
+                    if (latchSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*latchSymAttr)) sym = *strVal;
+                    }
+                    if (sym.empty()) sym = std::string(op.symbolText());
                     if (!sym.empty()) {
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
                         setResultExpr(0, latchName);
@@ -451,10 +462,14 @@ namespace wolvrix::lib::emit
                 case OperationKind::kLatchWritePort: {
                     std::string condition = getOperandExpr(0);
                     std::string nextValue = getOperandExpr(1);
-                    std::string sym = std::string(op.symbolText());
+                    auto latchSymAttr = op.attr("latchSymbol");
+                    std::string sym;
+                    if (latchSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*latchSymAttr)) sym = *strVal;
+                    }
+                    if (sym.empty()) sym = std::string(op.symbolText());
                     if (!sym.empty()) {
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
-                        // Latch is transparent when enable is high
                         state.sequentialStmts["combinational"].push_back(
                             "        if (" + condition + ") { " + latchName + " = " + nextValue + "; }");
                     }
@@ -465,7 +480,12 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kRegisterReadPort: {
-                    std::string sym = std::string(op.symbolText());
+                    auto regSymAttr = op.attr("regSymbol");
+                    std::string sym;
+                    if (regSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*regSymAttr)) sym = *strVal;
+                    }
+                    if (sym.empty()) sym = std::string(op.symbolText());
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
                         setResultExpr(0, regName);
@@ -477,7 +497,12 @@ namespace wolvrix::lib::emit
                     std::string nextValue = getOperandExpr(1);
                     std::string mask = getOperandExpr(2);
 
-                    std::string sym = std::string(op.symbolText());
+                    auto regSymAttr = op.attr("regSymbol");
+                    std::string sym;
+                    if (regSymAttr) {
+                        if (auto* strVal = std::get_if<std::string>(&*regSymAttr)) sym = *strVal;
+                    }
+                    if (sym.empty()) sym = std::string(op.symbolText());
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
                         if (mask != "0") {
@@ -549,12 +574,14 @@ namespace wolvrix::lib::emit
                 state.inputPorts.push_back({port.name, type});
                 std::string portExpr = "input_" + sanitizeIdentifier(port.name) + "_";
                 state.valueExprs[port.value] = portExpr;
+                state.inputValueNames[port.value] = sanitizeIdentifier(port.name);
             }
 
             for (const auto& port : graph.outputPorts()) {
                 auto value = graph.getValue(port.value);
                 std::string type = getCppTypeForWidth(value.width());
                 state.outputPorts.push_back({port.name, type});
+                state.outputValueNames[port.value] = sanitizeIdentifier(port.name);
             }
 
             // Apply port ordering
@@ -946,18 +973,38 @@ namespace wolvrix::lib::emit
             os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
             os << "    void reset() {\n";
             os << "        reset_ = true;\n";
+            // Reset storage members to zero
             for (const auto& decl : state.storageDecls) {
-                os << "        " << decl << "\n";
+                // Extract variable name from "type varname = 0;" -> "varname"
+                auto eqPos = decl.find(" = ");
+                if (eqPos != std::string::npos) {
+                    auto spacePos = decl.rfind(' ', eqPos - 1);
+                    if (spacePos != std::string::npos) {
+                        std::string varName = decl.substr(spacePos + 1, eqPos - spacePos - 1);
+                        os << "        " << varName << " = 0;\n";
+                    }
+                }
+            }
+            // Reset output ports
+            for (const auto& [name, type] : state.outputPorts) {
+                os << "        output_" << sanitizeIdentifier(name) << "_ = 0;\n";
             }
             os << "    }\n\n";
             os << "    void step() {\n";
             os << "        ++difftest_step_;\n";
+            os << "        if (reset_) {\n";
+            os << "            reset_ = false;\n";
+            os << "            difftest_exit_ = 0;\n";
+            os << "            return;\n";
+            os << "        }\n";
+            // Combinational logic: evaluate expressions and drive outputs
+            if (!state.combinationalStmts.empty()) {
+                for (const auto& stmt : state.combinationalStmts) {
+                    os << stmt << "\n";
+                }
+            }
+            // Sequential logic: register/latch updates
             if (!state.sequentialStmts.empty()) {
-                os << "        if (reset_) {\n";
-                os << "            reset_ = false;\n";
-                os << "            difftest_exit_ = 0;\n";
-                os << "            return;\n";
-                os << "        }\n";
                 for (const auto& [domain, stmts] : state.sequentialStmts) {
                     (void)domain;
                     for (const auto& stmt : stmts) {
@@ -1007,29 +1054,9 @@ namespace wolvrix::lib::emit
                 os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = 0;\n";
             }
 
-            // Register storage
+            // Register/latch storage
             for (const auto& decl : state.storageDecls) {
                 os << "    " << decl << "\n";
-            }
-            // Collect register names from write ports if no registers found
-            if (state.storageDecls.empty()) {
-                // Find unique register names from write ports
-                std::set<std::string> regNames;
-                for (const auto& opId : target.graph->operations()) {
-                    auto op = target.graph->getOperation(opId);
-                    if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
-                        std::string sym = std::string(op.symbolText());
-                        if (!sym.empty()) {
-                            regNames.insert("reg_" + sanitizeIdentifier(sym));
-                        }
-                    }
-                }
-                for (const auto& regName : regNames) {
-                    os << "    std::uint8_t " << regName << " = 0;\n";
-                }
-                if (regNames.empty()) {
-                    os << "    std::uint8_t reg_state = 0;\n";
-                }
             }
 
             // Difftest state
@@ -1327,6 +1354,27 @@ namespace wolvrix::lib::emit
             if (opIdIt != target->graph->operations().end()) {
                 auto op = target->graph->getOperation(*opIdIt);
                 lowerOperation(*target->graph, op, state);
+            }
+        }
+
+        // Generate combinational output driving statements
+        // For each output port, find the GRH value that drives it and emit an assignment
+        for (const auto& port : target->graph->outputPorts()) {
+            auto it = state.outputValueNames.find(port.value);
+            if (it == state.outputValueNames.end()) continue;
+            const std::string& sanitizedName = it->second;
+
+            // The output port's value might be defined by an operation (the GRH uses the port value as the result of some op)
+            // Or the output might be connected via an assign to some other value
+            // Look up the expression for this value
+            auto exprIt = state.valueExprs.find(port.value);
+            if (exprIt != state.valueExprs.end()) {
+                state.combinationalStmts.push_back(
+                    "        output_" + sanitizedName + "_ = " + exprIt->second + ";");
+            } else {
+                // Try to find the value through the graph's definition chain
+                // The output port value should have been set by some lowered operation
+                // If not found, it means the output is not driven (leave at 0)
             }
         }
 
