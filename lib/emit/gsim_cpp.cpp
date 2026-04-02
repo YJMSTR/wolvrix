@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iomanip>
 #include <map>
 #include <optional>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -727,6 +729,289 @@ namespace wolvrix::lib::emit
             return out;
         }
 
+        constexpr std::size_t kDefaultMetadataShardMaxBytes = 16u * 1024u * 1024u;
+
+        std::optional<std::size_t> parseMetadataShardMaxBytes(const EmitOptions &options,
+                                                              EmitDiagnostics *diagnostics)
+        {
+            const auto attr = attrValue(options, "metadata_shard_max_bytes");
+            if (!attr)
+            {
+                return kDefaultMetadataShardMaxBytes;
+            }
+
+            try
+            {
+                const auto parsed = std::stoull(*attr);
+                if (parsed == 0)
+                {
+                    if (diagnostics != nullptr)
+                    {
+                        diagnostics->error("metadata_shard_max_bytes must be greater than zero", *attr);
+                    }
+                    return std::nullopt;
+                }
+                return static_cast<std::size_t>(parsed);
+            }
+            catch (const std::exception &)
+            {
+                if (diagnostics != nullptr)
+                {
+                    diagnostics->error("metadata_shard_max_bytes must be an unsigned integer", *attr);
+                }
+                return std::nullopt;
+            }
+        }
+
+        template <typename Sink>
+        void emitMetadataAssignments(Sink &&sink, const GsimScratchpadMetadata &metadata)
+        {
+            sink("    metadata.roots = {" + joinInts(metadata.roots, ", ") + "};\n");
+            sink("    metadata.topo_order = {" + joinInts(metadata.topoOrder, ", ") + "};\n");
+
+            std::ostringstream groupNames;
+            groupNames << "    metadata.event_group_names = {";
+            for (std::size_t i = 0; i < metadata.eventGroupNames.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    groupNames << ", ";
+                }
+                groupNames << '"' << metadata.eventGroupNames[i] << '"';
+            }
+            groupNames << "};\n";
+            sink(groupNames.str());
+
+            sink("    metadata.event_groups = {\n");
+            for (const auto &[name, ids] : metadata.eventGroups)
+            {
+                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
+            }
+            sink("    };\n");
+
+            std::ostringstream activityOrder;
+            activityOrder << "    metadata.schedule_activity_order = {";
+            for (std::size_t i = 0; i < metadata.scheduleActivityOrder.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    activityOrder << ", ";
+                }
+                activityOrder << '"' << metadata.scheduleActivityOrder[i] << '"';
+            }
+            activityOrder << "};\n";
+            sink(activityOrder.str());
+
+            sink("    metadata.schedule_activity_members = {\n");
+            for (const auto &[name, ids] : metadata.scheduleActivityMembers)
+            {
+                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
+            }
+            sink("    };\n");
+
+            sink("    metadata.schedule_activity_classes = {\n");
+            for (const auto &[name, activityClass] : metadata.scheduleActivityClasses)
+            {
+                sink("        {\"" + name + "\", \"" + activityClass + "\"},\n");
+            }
+            sink("    };\n");
+
+            std::ostringstream nodeNames;
+            nodeNames << "    metadata.hypergraph_node_names = {";
+            for (std::size_t i = 0; i < metadata.hypergraphNodeNames.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    nodeNames << ", ";
+                }
+                nodeNames << '"' << metadata.hypergraphNodeNames[i] << '"';
+            }
+            nodeNames << "};\n";
+            sink(nodeNames.str());
+
+            sink("    metadata.hypergraph_node_members = {\n");
+            for (const auto &[name, ids] : metadata.hypergraphNodeMembers)
+            {
+                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
+            }
+            sink("    };\n");
+
+            std::ostringstream edgeNames;
+            edgeNames << "    metadata.hypergraph_edge_names = {";
+            for (std::size_t i = 0; i < metadata.hypergraphEdgeNames.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    edgeNames << ", ";
+                }
+                edgeNames << '"' << metadata.hypergraphEdgeNames[i] << '"';
+            }
+            edgeNames << "};\n";
+            sink(edgeNames.str());
+
+            sink("    metadata.hypergraph_edge_sources = {\n");
+            for (const auto &[name, sourceName] : metadata.hypergraphEdgeSources)
+            {
+                sink("        {\"" + name + "\", \"" + sourceName + "\"},\n");
+            }
+            sink("    };\n");
+
+            sink("    metadata.hypergraph_edge_targets = {\n");
+            for (const auto &[name, targetName] : metadata.hypergraphEdgeTargets)
+            {
+                sink("        {\"" + name + "\", \"" + targetName + "\"},\n");
+            }
+            sink("    };\n");
+
+            sink("    metadata.hypergraph_edge_sinks = {\n");
+            for (const auto &[name, ids] : metadata.hypergraphEdgeSinks)
+            {
+                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
+            }
+            sink("    };\n");
+
+            sink("    metadata.classifications = {\n");
+            for (const auto &[id, className] : metadata.classifications)
+            {
+                sink("        {" + std::to_string(id) + ", \"" + className + "\"},\n");
+            }
+            sink("    };\n");
+
+            sink("    metadata.predecessors = {\n");
+            for (const auto &[id, ids] : metadata.predecessors)
+            {
+                sink("        {" + std::to_string(id) + ", {" + joinInts(ids, ", ") + "} },\n");
+            }
+            sink("    };\n");
+
+            sink("    metadata.successors = {\n");
+            for (const auto &[id, ids] : metadata.successors)
+            {
+                sink("        {" + std::to_string(id) + ", {" + joinInts(ids, ", ") + "} },\n");
+            }
+            sink("    };\n");
+
+            std::ostringstream descriptors;
+            descriptors << "    metadata.op_descriptors = {";
+            for (std::size_t i = 0; i < metadata.opDescriptors.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    descriptors << ", ";
+                }
+                descriptors << '"' << metadata.opDescriptors[i] << '"';
+            }
+            descriptors << "};\n";
+            sink(descriptors.str());
+        }
+
+        std::size_t estimateMetadataAssignmentBytes(const GsimScratchpadMetadata &metadata)
+        {
+            std::size_t total = 0;
+            emitMetadataAssignments([&](const std::string &line) { total += line.size(); }, metadata);
+            return total;
+        }
+
+        struct MetadataShardPlan
+        {
+            std::string filename;
+            std::string functionName;
+        };
+
+        std::vector<MetadataShardPlan> planMetadataShards(const std::string &baseName,
+                                                          const GsimScratchpadMetadata &metadata,
+                                                          std::size_t maxBytes)
+        {
+            std::vector<MetadataShardPlan> plans;
+            std::size_t currentBytes = 0;
+            std::size_t shardIndex = 0;
+
+            auto openNextPlan = [&]() {
+                std::ostringstream indexText;
+                indexText << std::setw(3) << std::setfill('0') << shardIndex++;
+                const std::string suffix = indexText.str();
+                plans.push_back(MetadataShardPlan{
+                    baseName + "__meta_" + suffix + ".cpp",
+                    "populate_" + baseName + "_metadata_shard_" + suffix,
+                });
+                currentBytes = 0;
+            };
+
+            emitMetadataAssignments([&](const std::string &line) {
+                if (plans.empty())
+                {
+                    openNextPlan();
+                }
+                if (currentBytes != 0 && currentBytes + line.size() > maxBytes)
+                {
+                    openNextPlan();
+                }
+                currentBytes += line.size();
+            }, metadata);
+            return plans;
+        }
+
+        std::unordered_set<std::string> readManagedSourceManifest(const std::filesystem::path &manifestPath)
+        {
+            std::unordered_set<std::string> files;
+            std::ifstream manifest(manifestPath);
+            std::string line;
+            while (std::getline(manifest, line))
+            {
+                if (!line.empty())
+                {
+                    files.insert(line);
+                }
+            }
+            return files;
+        }
+
+        bool writeManagedSourceManifest(const std::filesystem::path &manifestPath,
+                                        const std::vector<std::string> &managedFiles,
+                                        EmitDiagnostics *diagnostics)
+        {
+            std::ofstream manifest(manifestPath, std::ios::trunc);
+            if (!manifest)
+            {
+                if (diagnostics != nullptr)
+                {
+                    diagnostics->error("failed to write gsim source manifest", manifestPath.string());
+                }
+                return false;
+            }
+            for (const auto &name : managedFiles)
+            {
+                manifest << name << "\n";
+            }
+            return true;
+        }
+
+        bool removeStaleManagedSources(const std::filesystem::path &outputDir,
+                                       const std::unordered_set<std::string> &previousManagedFiles,
+                                       const std::unordered_set<std::string> &managedFiles,
+                                       EmitDiagnostics *diagnostics)
+        {
+            for (const auto &name : previousManagedFiles)
+            {
+                if (managedFiles.find(name) != managedFiles.end())
+                {
+                    continue;
+                }
+                const auto stalePath = outputDir / name;
+                std::error_code removeEc;
+                std::filesystem::remove(stalePath, removeEc);
+                if (removeEc)
+                {
+                    if (diagnostics != nullptr)
+                    {
+                        diagnostics->error("failed to remove stale gsim source artifact", stalePath.string());
+                    }
+                    return false;
+                }
+            }
+            return true;
+        }
+
         std::optional<GsimScratchpadMetadata> loadMetadata(const wolvrix::lib::grh::Design &design,
                                                            const std::string &scratchPrefix,
                                                            EmitDiagnostics *diagnostics)
@@ -1174,15 +1459,27 @@ namespace wolvrix::lib::emit
             (void)metadata;
         }
 
-        void writeSource(std::ostream &os,
+        bool writeSource(std::ostream &os,
+                         const std::filesystem::path &outputDir,
+                         std::string_view baseName,
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
-                         std::string_view headerFilename)
+                         std::string_view headerFilename,
+                         std::size_t metadataShardMaxBytes,
+                         std::vector<std::string> &managedSourceFiles,
+                         std::vector<std::string> &artifactPaths,
+                         EmitDiagnostics *diagnostics)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
             const std::string factoryName = "make_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
             const std::string validateName = "validate_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
+            const auto manifestPath = outputDir / (std::string(baseName) + ".manifest");
+            const auto previousManagedFiles = readManagedSourceManifest(manifestPath);
+            const auto metadataBytes = estimateMetadataAssignmentBytes(metadata);
+            const bool shardMetadata = metadataBytes > metadataShardMaxBytes;
+            const auto shardPlans =
+                shardMetadata ? planMetadataShards(std::string(baseName), metadata, metadataShardMaxBytes) : std::vector<MetadataShardPlan>{};
 
             os << "#include \"" << headerFilename << "\"\n\n";
             os << "#include <algorithm>\n";
@@ -1194,6 +1491,14 @@ namespace wolvrix::lib::emit
             os << "    return std::set<T>(values.begin(), values.end()).size() != values.size();\n";
             os << "}\n";
             os << "} // namespace\n\n";
+            for (const auto &plan : shardPlans)
+            {
+                os << "void " << plan.functionName << "(" << structName << "& metadata);\n";
+            }
+            if (!shardPlans.empty())
+            {
+                os << "\n";
+            }
             os << structName << " " << factoryName << "() {\n";
             os << "    " << structName << " metadata;\n";
             os << "    metadata.graph_symbol = \"" << target.scratchGraphSymbol << "\";\n";
@@ -1201,124 +1506,23 @@ namespace wolvrix::lib::emit
             os << "    metadata.scratchpad_namespace = \"" << target.namespacePath << "\";\n";
             os << "    metadata.op_count = " << metadata.opCount << ";\n";
             os << "    metadata.graph_revision = " << metadata.graphRevision << ";\n";
-            os << "    metadata.roots = {" << joinInts(metadata.roots, ", ") << "};\n";
-            os << "    metadata.topo_order = {" << joinInts(metadata.topoOrder, ", ") << "};\n";
-            os << "    metadata.event_group_names = {";
-            for (std::size_t i = 0; i < metadata.eventGroupNames.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    os << ", ";
-                }
-                os << '"' << metadata.eventGroupNames[i] << '"';
-            }
-            os << "};\n";
-            os << "    metadata.event_groups = {\n";
-            for (const auto &[name, ids] : metadata.eventGroups)
-            {
-                os << "        {\"" << name << "\", {" << joinInts(ids, ", ") << "}},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.schedule_activity_order = {";
-            for (std::size_t i = 0; i < metadata.scheduleActivityOrder.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    os << ", ";
-                }
-                os << '"' << metadata.scheduleActivityOrder[i] << '"';
-            }
-            os << "};\n";
-            os << "    metadata.schedule_activity_members = {\n";
-            for (const auto &[name, ids] : metadata.scheduleActivityMembers)
-            {
-                os << "        {\"" << name << "\", {" << joinInts(ids, ", ") << "}},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.schedule_activity_classes = {\n";
-            for (const auto &[name, activityClass] : metadata.scheduleActivityClasses)
-            {
-                os << "        {\"" << name << "\", \"" << activityClass << "\"},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.hypergraph_node_names = {";
-            for (std::size_t i = 0; i < metadata.hypergraphNodeNames.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    os << ", ";
-                }
-                os << '"' << metadata.hypergraphNodeNames[i] << '"';
-            }
-            os << "};\n";
-            os << "    metadata.hypergraph_node_members = {\n";
-            for (const auto &[name, ids] : metadata.hypergraphNodeMembers)
-            {
-                os << "        {\"" << name << "\", {" << joinInts(ids, ", ") << "}},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.hypergraph_edge_names = {";
-            for (std::size_t i = 0; i < metadata.hypergraphEdgeNames.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    os << ", ";
-                }
-                os << '"' << metadata.hypergraphEdgeNames[i] << '"';
-            }
-            os << "};\n";
-            os << "    metadata.hypergraph_edge_sources = {\n";
-            for (const auto &[name, sourceName] : metadata.hypergraphEdgeSources)
-            {
-                os << "        {\"" << name << "\", \"" << sourceName << "\"},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.hypergraph_edge_targets = {\n";
-            for (const auto &[name, targetName] : metadata.hypergraphEdgeTargets)
-            {
-                os << "        {\"" << name << "\", \"" << targetName << "\"},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.hypergraph_edge_sinks = {\n";
-            for (const auto &[name, ids] : metadata.hypergraphEdgeSinks)
-            {
-                os << "        {\"" << name << "\", {" << joinInts(ids, ", ") << "}},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.classifications = {\n";
-            for (const auto &[id, className] : metadata.classifications)
-            {
-                os << "        {" << id << ", \"" << className << "\"},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.predecessors = {\n";
-            for (const auto &[id, ids] : metadata.predecessors)
-            {
-                os << "        {" << id << ", {" << joinInts(ids, ", ") << "}},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.successors = {\n";
-            for (const auto &[id, ids] : metadata.successors)
-            {
-                os << "        {" << id << ", {" << joinInts(ids, ", ") << "}},\n";
-            }
-            os << "    };\n";
-            os << "    metadata.op_descriptors = {";
-            for (std::size_t i = 0; i < metadata.opDescriptors.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    os << ", ";
-                }
-                os << '"' << metadata.opDescriptors[i] << '"';
-            }
-            os << "};\n";
             os << "    metadata.schedule_kind = \"" << metadata.scheduleKind << "\";\n";
             os << "    metadata.schedule_version = " << metadata.scheduleVersion << ";\n";
             os << "    metadata.schedule_contract = \"" << metadata.scheduleContract << "\";\n";
             os << "    metadata.hypergraph_kind = \"" << metadata.hypergraphKind << "\";\n";
             os << "    metadata.hypergraph_version = " << metadata.hypergraphVersion << ";\n";
             os << "    metadata.hypergraph_contract = \"" << metadata.hypergraphContract << "\";\n";
+            if (shardPlans.empty())
+            {
+                emitMetadataAssignments([&](const std::string &line) { os << line; }, metadata);
+            }
+            else
+            {
+                for (const auto &plan : shardPlans)
+                {
+                    os << "    " << plan.functionName << "(metadata);\n";
+                }
+            }
             os << "    return metadata;\n";
             os << "}\n\n";
             os << "bool " << validateName << "(const " << structName << "& metadata) {\n";
@@ -1367,6 +1571,113 @@ namespace wolvrix::lib::emit
             os << "    return true;\n";
             os << "}\n\n";
             os << "} // namespace wolvrix::gsim\n";
+
+            managedSourceFiles.push_back(std::string(baseName) + ".cpp");
+            artifactPaths.push_back((outputDir / (std::string(baseName) + ".cpp")).string());
+
+            if (!shardPlans.empty())
+            {
+                std::size_t shardIndex = 0;
+                std::size_t shardBytes = 0;
+                std::ofstream shardStream;
+
+                auto finishShard = [&]() -> bool {
+                    if (!shardStream.is_open())
+                    {
+                        return true;
+                    }
+                    shardStream << "}\n\n} // namespace wolvrix::gsim\n";
+                    if (!shardStream.good())
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("failed to finalize gsim metadata shard",
+                                               (outputDir / shardPlans[shardIndex].filename).string());
+                        }
+                        return false;
+                    }
+                    shardStream.close();
+                    ++shardIndex;
+                    shardBytes = 0;
+                    return true;
+                };
+
+                auto startShard = [&]() -> bool {
+                    const auto &plan = shardPlans[shardIndex];
+                    shardStream = std::ofstream(outputDir / plan.filename, std::ios::trunc);
+                    if (!shardStream)
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("failed to open gsim metadata shard for writing",
+                                               (outputDir / plan.filename).string());
+                        }
+                        return false;
+                    }
+                    shardStream << "#include \"" << headerFilename << "\"\n\n";
+                    shardStream << "namespace wolvrix::gsim {\n\n";
+                    shardStream << "void " << plan.functionName << "(" << structName << "& metadata) {\n";
+                    managedSourceFiles.push_back(plan.filename);
+                    artifactPaths.push_back((outputDir / plan.filename).string());
+                    shardBytes = 0;
+                    return true;
+                };
+
+                if (!startShard())
+                {
+                    return false;
+                }
+
+                bool shardWriteOk = true;
+                emitMetadataAssignments([&](const std::string &line) {
+                    if (!shardWriteOk)
+                    {
+                        return;
+                    }
+                    if (shardBytes != 0 && shardBytes + line.size() > metadataShardMaxBytes)
+                    {
+                        shardWriteOk = finishShard();
+                        if (!shardWriteOk)
+                        {
+                            return;
+                        }
+                        if (shardIndex >= shardPlans.size() || !startShard())
+                        {
+                            shardWriteOk = false;
+                            return;
+                        }
+                    }
+                    shardStream << line;
+                    if (!shardStream.good())
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("failed to write gsim metadata shard",
+                                               (outputDir / shardPlans[shardIndex].filename).string());
+                        }
+                        shardWriteOk = false;
+                        return;
+                    }
+                    shardBytes += line.size();
+                }, metadata);
+
+                if (!shardWriteOk || !finishShard())
+                {
+                    return false;
+                }
+            }
+
+            const std::unordered_set<std::string> currentManagedFiles(managedSourceFiles.begin(), managedSourceFiles.end());
+            if (!removeStaleManagedSources(outputDir, previousManagedFiles, currentManagedFiles, diagnostics))
+            {
+                return false;
+            }
+            if (!writeManagedSourceManifest(manifestPath, managedSourceFiles, diagnostics))
+            {
+                return false;
+            }
+            artifactPaths.push_back(manifestPath.string());
+            return true;
         }
     } // namespace
 
@@ -1490,6 +1801,12 @@ namespace wolvrix::lib::emit
                                          : defaultBaseName(*target);
         const std::filesystem::path headerPath = outputDir / (baseName + ".hpp");
         const std::filesystem::path sourcePath = outputDir / (baseName + ".cpp");
+        const auto metadataShardMaxBytes = parseMetadataShardMaxBytes(options, diagnostics());
+        if (!metadataShardMaxBytes)
+        {
+            result.success = false;
+            return result;
+        }
 
         auto header = openOutputFile(headerPath);
         auto source = openOutputFile(sourcePath);
@@ -1500,10 +1817,23 @@ namespace wolvrix::lib::emit
         }
 
         writeHeader(*header, *target, *metadata, state);
-        writeSource(*source, *target, *metadata, headerPath.filename().string());
+        std::vector<std::string> managedSourceFiles;
+        if (!writeSource(*source,
+                         outputDir,
+                         baseName,
+                         *target,
+                         *metadata,
+                         headerPath.filename().string(),
+                         *metadataShardMaxBytes,
+                         managedSourceFiles,
+                         result.artifacts,
+                         diagnostics()))
+        {
+            result.success = false;
+            return result;
+        }
 
         result.artifacts.push_back(headerPath.string());
-        result.artifacts.push_back(sourcePath.string());
         return result;
     }
 

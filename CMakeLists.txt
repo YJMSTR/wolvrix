@@ -444,6 +444,14 @@ if (WOLVRIX_BUILD_PYTHON)
     )
 
     add_test(
+        NAME xs-gsim-model-selection
+        COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/xs_gsim_model_selection_test.py"
+    )
+    set_tests_properties(xs-gsim-model-selection PROPERTIES
+        ENVIRONMENT "PYTHONNOUSERSITE=1;PYTHONPATH=${WOLVRIX_PYTHON_BUILD_DIR};WOLVRIX_PYTHON_BUILD_DIR=${WOLVRIX_PYTHON_BUILD_DIR}"
+    )
+
+    add_test(
         NAME hdlbits-gsim-batch-limits
         COMMAND ${Python_EXECUTABLE} -S "${CMAKE_SOURCE_DIR}/tests/hdlbits_gsim_batch_limits_test.py"
     )

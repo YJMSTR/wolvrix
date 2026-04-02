@@ -8,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -47,6 +48,50 @@ std::string readFile(const std::filesystem::path &path)
 bool contains(std::string_view text, std::string_view needle)
 {
     return text.find(needle) != std::string_view::npos;
+}
+
+std::vector<std::string> readLines(const std::filesystem::path &path)
+{
+    std::vector<std::string> lines;
+    std::ifstream stream(path);
+    if (!stream.is_open())
+    {
+        return lines;
+    }
+    std::string line;
+    while (std::getline(stream, line))
+    {
+        if (!line.empty())
+        {
+            lines.push_back(line);
+        }
+    }
+    return lines;
+}
+
+std::vector<std::filesystem::path> findMetadataShards(const std::filesystem::path &dir,
+                                                      std::string_view baseName)
+{
+    std::vector<std::filesystem::path> shards;
+    if (!std::filesystem::exists(dir))
+    {
+        return shards;
+    }
+    const std::string prefix = std::string(baseName) + "__meta_";
+    for (const auto &entry : std::filesystem::directory_iterator(dir))
+    {
+        if (!entry.is_regular_file())
+        {
+            continue;
+        }
+        const auto name = entry.path().filename().string();
+        if (entry.path().extension() == ".cpp" && name.rfind(prefix, 0) == 0)
+        {
+            shards.push_back(entry.path());
+        }
+    }
+    std::sort(shards.begin(), shards.end());
+    return shards;
 }
 
 ValueId makeValue(Graph &graph,
@@ -355,12 +400,14 @@ void testHappyPathAfterRunningGsim()
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp happy path should succeed");
     expect(!diags.hasError(), "EmitGsimCpp happy path should not emit errors");
-    expect(result.artifacts.size() == 2, "EmitGsimCpp should report header and source artifacts");
+    expect(result.artifacts.size() == 3, "EmitGsimCpp should report header, source, and manifest artifacts");
 
     const std::filesystem::path headerPath = dir / "top_metadata.hpp";
     const std::filesystem::path sourcePath = dir / "top_metadata.cpp";
+    const std::filesystem::path manifestPath = dir / "top_metadata.manifest";
     expect(std::filesystem::exists(headerPath), "EmitGsimCpp should create header artifact");
     expect(std::filesystem::exists(sourcePath), "EmitGsimCpp should create source artifact");
+    expect(std::filesystem::exists(manifestPath), "EmitGsimCpp should create manifest artifact");
 
     const std::string header = readFile(headerPath);
     const std::string source = readFile(sourcePath);
@@ -518,6 +565,83 @@ void testFailureOnStaleMetadataAfterDestructiveMutation()
     expect(!result.success, "EmitGsimCpp should reject stale metadata after destructive graph mutation");
     expect(diags.hasError(), "destructive stale metadata should produce diagnostics");
     expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
+}
+
+void testMetadataShardManifestAndCleanup()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "metadata_shards";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("split_metadata");
+    options.topOverrides = {"top"};
+    options.attributes["metadata_shard_max_bytes"] = "128";
+
+    const EmitResult splitResult = emitter.emit(design, options);
+    expect(splitResult.success, "EmitGsimCpp split metadata emission should succeed");
+    expect(!diags.hasError(), "split metadata emission should not emit diagnostics");
+
+    const std::filesystem::path headerPath = dir / "split_metadata.hpp";
+    const std::filesystem::path sourcePath = dir / "split_metadata.cpp";
+    const std::filesystem::path manifestPath = dir / "split_metadata.manifest";
+    expect(std::filesystem::exists(headerPath), "split metadata emission should keep stable header path");
+    expect(std::filesystem::exists(sourcePath), "split metadata emission should keep stable source path");
+    expect(std::filesystem::exists(manifestPath), "split metadata emission should write a manifest");
+
+    const auto shards = findMetadataShards(dir, "split_metadata");
+    expect(!shards.empty(), "split metadata emission should create at least one shard with a tiny threshold");
+
+    const auto manifestLines = readLines(manifestPath);
+    expect(!manifestLines.empty(), "split metadata manifest should list managed source files");
+    expect(manifestLines.front() == "split_metadata.cpp", "split metadata manifest should start with the canonical source");
+    for (const auto &shard : shards)
+    {
+        expect(std::find(manifestLines.begin(), manifestLines.end(), shard.filename().string()) != manifestLines.end(),
+               "split metadata manifest should include every shard");
+    }
+
+    const std::string source = readFile(sourcePath);
+    expect(!contains(source, "metadata.schedule_activity_order = {"),
+           "canonical source should stay lightweight when metadata is sharded");
+
+    {
+        const std::filesystem::path wrapperPath = dir / "split_compile_check.cpp";
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"split_metadata.hpp\"\n";
+        for (const auto &name : manifestLines)
+        {
+            wrapper << "#include \"" << name << "\"\n";
+        }
+        wrapper << "int main() { auto metadata = wolvrix::gsim::make_top_metadata(); return metadata.op_count < 0; }\n";
+        const std::string compileCmd =
+            "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+            " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+        expect(std::system(compileCmd.c_str()) == 0, "split metadata source set should compile with strict flags");
+    }
+
+    EmitDiagnostics rerunDiags;
+    EmitGsimCpp rerunEmitter(&rerunDiags);
+    EmitOptions rerunOptions;
+    rerunOptions.outputDir = dir.string();
+    rerunOptions.outputFilename = std::string("split_metadata");
+    rerunOptions.topOverrides = {"top"};
+    rerunOptions.attributes["metadata_shard_max_bytes"] = "10485760";
+
+    const EmitResult rerunResult = rerunEmitter.emit(design, rerunOptions);
+    expect(rerunResult.success, "rerun without sharding should still succeed");
+    expect(!rerunDiags.hasError(), "rerun without sharding should not emit diagnostics");
+    expect(findMetadataShards(dir, "split_metadata").empty(),
+           "rerun without sharding should remove stale metadata shards from the previous manifest");
+
+    const auto rerunManifestLines = readLines(manifestPath);
+    expect(rerunManifestLines.size() == 1 && rerunManifestLines.front() == "split_metadata.cpp",
+           "rerun manifest should only keep the canonical source when no shards are needed");
 }
 
 void testGraphOnlyAndMultiHopTargetSelectionConsistency()
@@ -976,6 +1100,7 @@ int main()
         testFailureOnNamespacePathMismatch();
         testFailureOnStaleMetadataAfterMutation();
         testFailureOnStaleMetadataAfterDestructiveMutation();
+        testMetadataShardManifestAndCleanup();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
         testBehavioralCompileAndRun();
