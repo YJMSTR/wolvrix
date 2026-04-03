@@ -104,9 +104,16 @@ namespace wolvrix::lib::emit
             std::map<std::string, DpiImportSignature> dpiImports;
             std::vector<std::string> dpiForwardDecls;
             // When behavior is sharded, materialized temporaries live in shared storage.
+            struct PersistentTempGroup
+            {
+                std::string cppType;
+                std::string storageName;
+                std::size_t count = 0;
+            };
+
             bool persistentTemps = false;
-            std::size_t nextPersistentTempSlot = 0;
-            std::size_t persistentTempCount = 0;
+            std::vector<PersistentTempGroup> persistentTempGroups;
+            std::map<std::string, std::size_t> persistentTempGroupIndices;
             // Track unsupported operations
             std::vector<std::string> unsupportedOps;
         };
@@ -376,6 +383,24 @@ namespace wolvrix::lib::emit
             return name;
         }
 
+        std::string allocatePersistentTempExpr(CodegenState &state, const std::string &cppType)
+        {
+            auto groupIt = state.persistentTempGroupIndices.find(cppType);
+            if (groupIt == state.persistentTempGroupIndices.end())
+            {
+                const auto groupIndex = state.persistentTempGroups.size();
+                CodegenState::PersistentTempGroup group;
+                group.cppType = cppType;
+                group.storageName = "step_tmp_group_" + std::to_string(groupIndex) + "_";
+                groupIt = state.persistentTempGroupIndices.emplace(cppType, groupIndex).first;
+                state.persistentTempGroups.push_back(std::move(group));
+            }
+
+            auto &group = state.persistentTempGroups[groupIt->second];
+            const auto slot = group.count++;
+            return group.storageName + "[" + std::to_string(slot) + "]";
+        }
+
         std::string dpiScratchValueName(std::string_view prefix, const wolvrix::lib::grh::ValueId &valueId)
         {
             std::string name(prefix);
@@ -620,11 +645,9 @@ namespace wolvrix::lib::emit
                     }
                     const auto resultType = getCppTypeForWidth(graph.valueWidth(resultId));
                     if (state.persistentTemps) {
-                        const auto slot = state.nextPersistentTempSlot++;
-                        state.combinationalStmts.push_back(
-                            "        step_tmp_[" + std::to_string(slot) + "] = static_cast<std::uint64_t>(" + expr + ");");
-                        state.valueExprs[resultId] =
-                            "static_cast<" + resultType + ">(step_tmp_[" + std::to_string(slot) + "])";
+                        const auto tempName = allocatePersistentTempExpr(state, resultType);
+                        state.combinationalStmts.push_back("        " + tempName + " = " + expr + ";");
+                        state.valueExprs[resultId] = tempName;
                     } else {
                         const auto tempName = materializedValueName(resultId);
                         state.combinationalStmts.push_back(
@@ -632,6 +655,34 @@ namespace wolvrix::lib::emit
                         state.valueExprs[resultId] = tempName;
                     }
                 }
+            };
+            struct MutableResultStorage
+            {
+                std::string cppType;
+                std::string expr;
+            };
+            auto reserveMutableResultStorage = [&](size_t idx) -> std::optional<MutableResultStorage> {
+                if (idx >= op.results().size()) {
+                    return std::nullopt;
+                }
+                const auto resultId = op.results()[idx];
+                if (graph.valueType(resultId) == ValueType::String) {
+                    return std::nullopt;
+                }
+                const auto resultType = getCppTypeForWidth(graph.valueWidth(resultId));
+                if (state.persistentTemps) {
+                    const auto tempName = allocatePersistentTempExpr(state, resultType);
+                    state.valueExprs[resultId] = tempName;
+                    return MutableResultStorage{resultType, tempName};
+                }
+                const auto tempName = materializedValueName(resultId);
+                state.combinationalStmts.push_back(
+                    "        [[maybe_unused]] " + resultType + " " + tempName + "{};");
+                state.valueExprs[resultId] = tempName;
+                return MutableResultStorage{resultType, tempName};
+            };
+            auto getShiftAmountExpr = [&](size_t idx) -> std::string {
+                return "(static_cast<std::size_t>(static_cast<std::uint64_t>(" + getOperandExpr(idx) + ")))";
             };
 
             switch (kind) {
@@ -771,15 +822,25 @@ namespace wolvrix::lib::emit
                 }
                 // Shift operations
                 case OperationKind::kShl: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " << " + getOperandExpr(1) + ")");
+                    setResultExpr(0, "(" + getOperandExpr(0) + " << " + getShiftAmountExpr(1) + ")");
                     break;
                 }
                 case OperationKind::kLShr: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ")");
+                    setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getShiftAmountExpr(1) + ")");
                     break;
                 }
                 case OperationKind::kAShr: {
-                    setResultExpr(0, "(static_cast<std::make_signed_t<decltype(" + getOperandExpr(0) + ")>>(" + getOperandExpr(0) + ") >> " + getOperandExpr(1) + ")");
+                    const auto operandWidth = graph.valueWidth(op.operands()[0]);
+                    if (operandWidth > 64) {
+                        setResultExpr(0, "(arithmeticShiftRight(" + getOperandExpr(0) + ", " + getShiftAmountExpr(1) + "))");
+                    } else {
+                        const auto operandExpr = getOperandExpr(0);
+                        setResultExpr(
+                            0,
+                            "(static_cast<std::make_signed_t<std::remove_cv_t<std::remove_reference_t<decltype(" +
+                                operandExpr + ")>>>>(" +
+                                operandExpr + ") >> " + getShiftAmountExpr(1) + ")");
+                    }
                     break;
                 }
                 // Reduce operations
@@ -849,36 +910,48 @@ namespace wolvrix::lib::emit
                         const bool wideResult = !op.results().empty() && graph.valueWidth(op.results()[0]) > 64;
                         const std::string resultType =
                             !op.results().empty() ? getCppTypeForWidth(graph.valueWidth(op.results()[0])) : "std::uint64_t";
-                        // Concat: first operand is MSB, operands go high-to-low
-                        // result = (op0 << (w1+w2+...)) | (op1 << (w2+w3+...)) | ... | opN
-                        std::string expr;
-                        // Calculate total shift for each operand
                         std::vector<int64_t> widths;
                         for (size_t i = 0; i < op.operands().size(); ++i) {
                             widths.push_back(graph.valueWidth(op.operands()[i]));
                         }
-                        for (size_t i = 0; i < op.operands().size(); ++i) {
-                            int64_t shift = 0;
-                            for (size_t j = i + 1; j < op.operands().size(); ++j) {
-                                shift += widths[j];
+                        if (wideResult) {
+                            auto storage = reserveMutableResultStorage(0);
+                            if (!storage) {
+                                state.unsupportedOps.push_back(std::string(toString(kind)));
+                                break;
                             }
-                            std::string part = getOperandExpr(i);
-                            if (shift > 0 && wideResult) {
-                                part = "(" + resultType + "(" + part + ") << " + std::to_string(shift) + ")";
-                            } else if (shift > 0 && shift < 64) {
-                                part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
-                            } else if (!wideResult && shift >= 64) {
-                                part = "0"; // Bits beyond 64 are truncated
-                            } else if (wideResult) {
-                                part = resultType + "(" + part + ")";
+                            state.combinationalStmts.push_back(
+                                "        " + storage->expr + " = " + storage->cppType + "(" + getOperandExpr(0) + ");");
+                            for (size_t i = 1; i < op.operands().size(); ++i) {
+                                state.combinationalStmts.push_back(
+                                    "        " + storage->expr + " = ((" + storage->expr + " << " +
+                                    std::to_string(widths[i]) + ") | " + storage->cppType + "(" +
+                                    getOperandExpr(i) + "));");
                             }
-                            if (expr.empty()) {
-                                expr = part;
-                            } else {
-                                expr = "(" + expr + " | " + part + ")";
+                        } else {
+                            // Concat: first operand is MSB, operands go high-to-low
+                            // result = (op0 << (w1+w2+...)) | (op1 << (w2+w3+...)) | ... | opN
+                            std::string expr;
+                            // Calculate total shift for each operand
+                            for (size_t i = 0; i < op.operands().size(); ++i) {
+                                int64_t shift = 0;
+                                for (size_t j = i + 1; j < op.operands().size(); ++j) {
+                                    shift += widths[j];
+                                }
+                                std::string part = getOperandExpr(i);
+                                if (shift > 0 && shift < 64) {
+                                    part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
+                                } else if (shift >= 64) {
+                                    part = "0"; // Bits beyond 64 are truncated
+                                }
+                                if (expr.empty()) {
+                                    expr = part;
+                                } else {
+                                    expr = "(" + expr + " | " + part + ")";
+                                }
                             }
+                            setResultExpr(0, expr);
                         }
-                        setResultExpr(0, expr);
                     }
                     break;
                 }
@@ -900,26 +973,38 @@ namespace wolvrix::lib::emit
                         const std::string resultType =
                             !op.results().empty() ? getCppTypeForWidth(graph.valueWidth(op.results()[0])) : "std::uint64_t";
                         int64_t opWidth = graph.valueWidth(op.operands()[0]);
-                        std::string expr;
-                        for (int64_t i = 0; i < count; ++i) {
-                            std::string part = getOperandExpr(0);
-                            int64_t shift = (count - 1 - i) * opWidth;
-                            if (shift > 0 && wideResult) {
-                                part = "(" + resultType + "(" + part + ") << " + std::to_string(shift) + ")";
-                            } else if (shift > 0 && shift < 64) {
-                                part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
-                            } else if (!wideResult && shift >= 64) {
-                                part = "0"; // Bits beyond 64 are truncated
-                            } else if (wideResult) {
-                                part = resultType + "(" + part + ")";
+                        if (wideResult) {
+                            auto storage = reserveMutableResultStorage(0);
+                            if (!storage) {
+                                state.unsupportedOps.push_back(std::string(toString(kind)));
+                                break;
                             }
-                            if (expr.empty()) {
-                                expr = part;
-                            } else {
-                                expr = "(" + expr + " | " + part + ")";
+                            state.combinationalStmts.push_back(
+                                "        " + storage->expr + " = " + storage->cppType + "{};");
+                            for (int64_t i = 0; i < count; ++i) {
+                                state.combinationalStmts.push_back(
+                                    "        " + storage->expr + " = ((" + storage->expr + " << " +
+                                    std::to_string(opWidth) + ") | " + storage->cppType + "(" +
+                                    getOperandExpr(0) + "));");
                             }
+                        } else {
+                            std::string expr;
+                            for (int64_t i = 0; i < count; ++i) {
+                                std::string part = getOperandExpr(0);
+                                int64_t shift = (count - 1 - i) * opWidth;
+                                if (shift > 0 && shift < 64) {
+                                    part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
+                                } else if (shift >= 64) {
+                                    part = "0"; // Bits beyond 64 are truncated
+                                }
+                                if (expr.empty()) {
+                                    expr = part;
+                                } else {
+                                    expr = "(" + expr + " | " + part + ")";
+                                }
+                            }
+                            setResultExpr(0, expr);
                         }
-                        setResultExpr(0, expr);
                     }
                     break;
                 }
@@ -936,15 +1021,33 @@ namespace wolvrix::lib::emit
                     }
                     int64_t width = end - start + 1;
                     if (width <= 0) width = 1;
+                    const int64_t operandWidth = graph.valueWidth(op.operands()[0]);
+                    const bool wideOperand = operandWidth > 64;
+                    const std::string resultType =
+                        !op.results().empty() ? getCppTypeForWidth(graph.valueWidth(op.results()[0])) : "std::uint64_t";
                     if (start == 0 && width >= 64) {
-                        setResultExpr(0, getOperandExpr(0));
+                        if (wideOperand) {
+                            setResultExpr(0, "(static_cast<" + resultType + ">(" + getOperandExpr(0) + "))");
+                        } else {
+                            setResultExpr(0, getOperandExpr(0));
+                        }
                     } else {
                         uint64_t mask = (width >= 64) ? ~uint64_t(0) : ((uint64_t(1) << width) - 1);
                         std::string maskStr = ([&]{ std::ostringstream ss; ss << "0x" << std::hex << mask << "ULL"; return ss.str(); })();
                         if (start == 0) {
-                            setResultExpr(0, "(" + getOperandExpr(0) + " & " + maskStr + ")");
+                            if (wideOperand) {
+                                setResultExpr(0, "(static_cast<" + resultType + ">((" + getOperandExpr(0) + ") & " + maskStr + "))");
+                            } else {
+                                setResultExpr(0, "(" + getOperandExpr(0) + " & " + maskStr + ")");
+                            }
                         } else {
-                            setResultExpr(0, "((" + getOperandExpr(0) + " >> " + std::to_string(start) + ") & " + maskStr + ")");
+                            if (wideOperand) {
+                                setResultExpr(0,
+                                              "(static_cast<" + resultType + ">(((" + getOperandExpr(0) + " >> " +
+                                                  std::to_string(start) + ") & " + maskStr + ")))");
+                            } else {
+                                setResultExpr(0, "((" + getOperandExpr(0) + " >> " + std::to_string(start) + ") & " + maskStr + ")");
+                            }
                         }
                     }
                     break;
@@ -956,12 +1059,26 @@ namespace wolvrix::lib::emit
                     if (widthAttr) {
                         if (auto* intVal = std::get_if<int64_t>(&*widthAttr)) width = *intVal;
                     }
+                    const int64_t operandWidth = graph.valueWidth(op.operands()[0]);
+                    const bool wideOperand = operandWidth > 64;
+                    const std::string resultType =
+                        !op.results().empty() ? getCppTypeForWidth(graph.valueWidth(op.results()[0])) : "std::uint64_t";
                     if (width >= 64) {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ")");
+                        if (wideOperand) {
+                            setResultExpr(0, "(static_cast<" + resultType + ">(" + getOperandExpr(0) + " >> " + getShiftAmountExpr(1) + "))");
+                        } else {
+                            setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getShiftAmountExpr(1) + ")");
+                        }
                     } else {
                         uint64_t mask = (uint64_t(1) << width) - 1;
                         std::string maskStr = ([&]{ std::ostringstream ss; ss << "0x" << std::hex << mask << "ULL"; return ss.str(); })();
-                        setResultExpr(0, "((" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ") & " + maskStr + ")");
+                        if (wideOperand) {
+                            setResultExpr(0,
+                                          "(static_cast<" + resultType + ">(((" + getOperandExpr(0) + " >> " +
+                                              getShiftAmountExpr(1) + ") & " + maskStr + ")))");
+                        } else {
+                            setResultExpr(0, "((" + getOperandExpr(0) + " >> " + getShiftAmountExpr(1) + ") & " + maskStr + ")");
+                        }
                     }
                     break;
                 }
@@ -1145,14 +1262,36 @@ namespace wolvrix::lib::emit
                         break;
                     }
 
+                    std::map<std::string, std::string> outputArgCppTypes;
+                    for (const auto &arg : sig.args)
+                    {
+                        if (arg.direction == "output")
+                        {
+                            outputArgCppTypes.emplace(arg.name, arg.cppType);
+                        }
+                    }
+
                     std::map<std::string, std::string> outputTemps;
                     for (std::size_t resultIndex = outputOffset; resultIndex < op.results().size(); ++resultIndex)
                     {
+                        const auto &argName = outArgName[resultIndex - outputOffset];
+                        const auto typeIt = outputArgCppTypes.find(argName);
+                        if (typeIt == outputArgCppTypes.end())
+                        {
+                            state.unsupportedOps.push_back(
+                                "kDpicCall (" + opName + ": missing DPI output signature for " + argName + ")");
+                            outputTemps.clear();
+                            break;
+                        }
+
                         const auto valueId = op.results()[resultIndex];
-                        const auto type = getCppTypeForWidth(graph.valueWidth(valueId));
                         const auto name = dpiScratchValueName("dpi_out", valueId);
-                        state.combinationalStmts.push_back("        " + type + " " + name + " = 0;");
-                        outputTemps.emplace(outArgName[resultIndex - outputOffset], name);
+                        state.combinationalStmts.push_back("        " + typeIt->second + " " + name + " = 0;");
+                        outputTemps.emplace(argName, name);
+                    }
+                    if (outputTemps.size() != outArgName.size())
+                    {
+                        break;
                     }
 
                     std::string returnTemp;
@@ -1629,6 +1768,32 @@ struct Bits {
             if (bitShift != 0 && index + 1 < kWordCount) {
                 result.words[target] |= value.words[index + 1] << (kWordBits - bitShift);
             }
+        }
+        result.maskUnusedBits();
+        return result;
+    }
+
+    friend constexpr Bits arithmeticShiftRight(Bits value, std::size_t shift) {
+        constexpr std::size_t signBitIndex = Width - 1;
+        const bool sign = ((value.words[signBitIndex / kWordBits] >> (signBitIndex % kWordBits)) & 0x1ULL) != 0;
+        if (shift >= Width) {
+            if (!sign) {
+                return Bits{};
+            }
+            Bits result;
+            for (std::size_t index = 0; index < kWordCount; ++index) {
+                result.words[index] = 0xFFFFFFFFFFFFFFFFULL;
+            }
+            result.maskUnusedBits();
+            return result;
+        }
+
+        Bits result = value >> shift;
+        if (!sign || shift == 0) {
+            return result;
+        }
+        for (std::size_t bitIndex = Width - shift; bitIndex < Width; ++bitIndex) {
+            result.words[bitIndex / kWordBits] |= std::uint64_t{1} << (bitIndex % kWordBits);
         }
         result.maskUnusedBits();
         return result;
@@ -2493,9 +2658,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             for (const auto& decl : state.storageDecls) {
                 os << "    " << decl << "\n";
             }
-            if (state.persistentTemps && state.persistentTempCount != 0) {
-                os << "    std::vector<std::uint64_t> step_tmp_ = std::vector<std::uint64_t>("
-                   << state.persistentTempCount << ", 0);\n";
+            if (state.persistentTemps && !state.persistentTempGroups.empty()) {
+                for (const auto &group : state.persistentTempGroups) {
+                    os << "    std::vector<" << group.cppType << "> " << group.storageName << ";\n";
+                }
             }
 
             // Difftest state
@@ -2573,6 +2739,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "#include <algorithm>\n";
             os << "#include <set>\n\n";
             os << "SSimTop::SSimTop() {\n";
+            for (const auto &group : state.persistentTempGroups)
+            {
+                os << "    " << group.storageName << ".resize(" << group.count << ");\n";
+            }
             os << "    reset();\n";
             os << "}\n\n";
             os << "void SSimTop::reset() {\n";
@@ -2986,7 +3156,6 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 }
             }
 
-            state.persistentTempCount = state.nextPersistentTempSlot;
             return state;
         };
 

@@ -32,6 +32,24 @@ def main() -> int:
     try:
         module = load_module()
 
+        original_which = module.shutil.which
+        module.shutil.which = lambda name: {  # type: ignore[assignment]
+            "clang++": "/usr/bin/clang++",
+            "g++": "/usr/bin/g++",
+        }.get(name)
+        expect(module.pick_cxx() == "/usr/bin/clang++", "clang++ should be preferred when available")
+        module.shutil.which = lambda name: {  # type: ignore[assignment]
+            "g++": "/usr/bin/g++",
+        }.get(name)
+        expect(module.pick_cxx() == "/usr/bin/g++", "g++ should be used when clang++ is unavailable")
+        module.shutil.which = lambda _name: None  # type: ignore[assignment]
+        try:
+            module.pick_cxx()
+            raise RuntimeError("missing compiler should raise RuntimeError")
+        except RuntimeError as ex:
+            expect("need clang++ or g++" in str(ex), f"unexpected compiler error: {ex}")
+        module.shutil.which = original_which  # type: ignore[assignment]
+
         ok = module.run_subprocess_limited(
             [sys.executable, "-c", "print('ok')"],
             timeout_sec=2,

@@ -120,6 +120,30 @@ def run_root_path_print(model_dir: pathlib.Path) -> subprocess.CompletedProcess[
     )
 
 
+def run_root_shard_config_print(override: str | None = None) -> subprocess.CompletedProcess[str]:
+    print_rule = (
+        "print-xs-gsim-shard-config:\n"
+        "\t@printf 'BYTES=%s\\nFRAGMENT=%s\\n' "
+        "'$(XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES)' "
+        "'$(if $(strip $(XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES)),WOLVRIX_XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES=$(XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES),)'"
+    )
+    command = f"source env.sh && make --eval {shlex.quote(print_rule)} print-xs-gsim-shard-config"
+    if override is not None:
+        command += f" XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES={shlex.quote(override)}"
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            command,
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def test_uses_manifest_instead_of_globbing(model_dir: pathlib.Path) -> None:
     canonical_cpp = model_dir / "fixture.cpp"
     shard_cpp = model_dir / "fixture__meta_000.cpp"
@@ -192,6 +216,34 @@ def test_root_make_normalizes_relative_gsim_artifact_paths(model_dir: pathlib.Pa
     )
 
 
+def test_root_make_uses_safe_default_behavior_shard_cap() -> None:
+    result = run_root_shard_config_print()
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"root-level shard config print should succeed: {stdout.strip()}")
+    expect(
+        "BYTES=16777216" in stdout,
+        f"root Makefile should default XiangShan behavior shard cap to 16 MiB: {stdout.strip()}",
+    )
+    expect(
+        "FRAGMENT=WOLVRIX_XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES=16777216" in stdout,
+        f"root Makefile should forward the default shard cap into the XiangShan gsim script env: {stdout.strip()}",
+    )
+
+
+def test_root_make_allows_behavior_shard_cap_override() -> None:
+    result = run_root_shard_config_print("1048576")
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"root-level shard override print should succeed: {stdout.strip()}")
+    expect(
+        "BYTES=1048576" in stdout,
+        f"root Makefile should allow overriding the XiangShan behavior shard cap: {stdout.strip()}",
+    )
+    expect(
+        "FRAGMENT=WOLVRIX_XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES=1048576" in stdout,
+        f"root Makefile should forward the override shard cap into the XiangShan gsim script env: {stdout.strip()}",
+    )
+
+
 def main() -> int:
     try:
         reset_dir(ARTIFACT_ROOT)
@@ -199,6 +251,8 @@ def main() -> int:
         test_fails_without_manifest(ARTIFACT_ROOT / "case_missing_manifest" / "model")
         test_top_make_forwards_manifest(ARTIFACT_ROOT / "case_top_manifest" / "model")
         test_root_make_normalizes_relative_gsim_artifact_paths(ARTIFACT_ROOT / "case_root_relative" / "model")
+        test_root_make_uses_safe_default_behavior_shard_cap()
+        test_root_make_allows_behavior_shard_cap_override()
     except Exception as ex:
         return fail(str(ex))
     return 0

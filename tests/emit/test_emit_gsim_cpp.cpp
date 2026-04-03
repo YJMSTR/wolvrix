@@ -69,6 +69,22 @@ std::vector<std::string> readLines(const std::filesystem::path &path)
     return lines;
 }
 
+std::size_t maxLineLength(const std::filesystem::path &path)
+{
+    std::ifstream stream(path);
+    if (!stream.is_open())
+    {
+        return 0;
+    }
+    std::size_t maxLen = 0;
+    std::string line;
+    while (std::getline(stream, line))
+    {
+        maxLen = std::max(maxLen, line.size());
+    }
+    return maxLen;
+}
+
 std::vector<std::filesystem::path> findMetadataShards(const std::filesystem::path &dir,
                                                       std::string_view baseName)
 {
@@ -403,6 +419,38 @@ Design buildLinearAddChainDesign(std::size_t depth)
     return design;
 }
 
+Design buildWideBehaviorConcatDesign(std::size_t width)
+{
+    Design design;
+    auto &graph = design.createGraph("wide_behavior_top");
+    design.markAsTop("wide_behavior_top");
+
+    std::vector<ValueId> inputs;
+    inputs.reserve(width);
+    for (std::size_t i = 0; i < width; ++i)
+    {
+        const auto value = makeValue(graph, "in_" + std::to_string(i), 1, false);
+        graph.bindInputPort("in_" + std::to_string(i), value);
+        inputs.push_back(value);
+    }
+
+    const auto concatValue = makeValue(graph, "concat_value", static_cast<int32_t>(width), false);
+    const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("wide_concat"));
+    for (const auto value : inputs)
+    {
+        graph.addOperand(concat, value);
+    }
+    graph.addResult(concat, concatValue);
+
+    const auto out = makeValue(graph, "y", static_cast<int32_t>(width), false);
+    graph.bindOutputPort("y", out);
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_wide_concat_out"));
+    graph.addOperand(assign, concatValue);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
 Design buildMemoryBehaviorDesign()
 {
     Design design;
@@ -601,6 +649,49 @@ Design buildDpicReturnOutputDesign()
     return design;
 }
 
+Design buildDpicSignedIntOutputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("dpic_signed_out_top");
+    design.markAsTop("dpic_signed_out_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    const auto out = makeValue(graph, "y", 32, false);
+    graph.bindOutputPort("y", out);
+
+    const auto cond = makeConstant(graph, "dpi_cond", "dpi_signed_cond_const", 1, "1'b1");
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_fill_int"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"output"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{32});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{true});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"int"});
+    graph.setAttr(import, "hasReturn", false);
+    graph.setAttr(import, "returnWidth", static_cast<int64_t>(0));
+    graph.setAttr(import, "returnSigned", false);
+    graph.setAttr(import, "returnType", std::string("void"));
+
+    const auto dpiValue = makeValue(graph, "dpi_value", 32, false);
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_signed_out_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_fill_int"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{"value"});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", false);
+    graph.addOperand(call, cond);
+    graph.addOperand(call, clk);
+    graph.addResult(call, dpiValue);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, dpiValue);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
 Design buildDpicStringInputDesign()
 {
     Design design;
@@ -660,6 +751,139 @@ Design buildUnknownConstantDesign()
     const auto unknownConst = makeConstant(graph, "unknown_const", "unknown_const_op", 8, "8'hxx");
     const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
     graph.addOperand(assign, unknownConst);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
+Design buildWideDynamicShiftDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("wide_shift_top");
+    design.markAsTop("wide_shift_top");
+
+    const auto data = makeValue(graph, "data", 128, false);
+    const auto amount = makeValue(graph, "amount", 128, false);
+    const auto outShl = makeValue(graph, "y_shl", 128, false);
+    const auto outLshr = makeValue(graph, "y_lshr", 128, false);
+    const auto outAshr = makeValue(graph, "y_ashr", 128, false);
+    graph.bindInputPort("data", data);
+    graph.bindInputPort("amount", amount);
+    graph.bindOutputPort("y_shl", outShl);
+    graph.bindOutputPort("y_lshr", outLshr);
+    graph.bindOutputPort("y_ashr", outAshr);
+
+    const auto shlValue = makeValue(graph, "shl_value", 128, false);
+    const auto lshrValue = makeValue(graph, "lshr_value", 128, false);
+    const auto ashrValue = makeValue(graph, "ashr_value", 128, false);
+
+    const auto shl = graph.createOperation(OperationKind::kShl, graph.internSymbol("wide_shl"));
+    graph.addOperand(shl, data);
+    graph.addOperand(shl, amount);
+    graph.addResult(shl, shlValue);
+
+    const auto lshr = graph.createOperation(OperationKind::kLShr, graph.internSymbol("wide_lshr"));
+    graph.addOperand(lshr, data);
+    graph.addOperand(lshr, amount);
+    graph.addResult(lshr, lshrValue);
+
+    const auto ashr = graph.createOperation(OperationKind::kAShr, graph.internSymbol("wide_ashr"));
+    graph.addOperand(ashr, data);
+    graph.addOperand(ashr, amount);
+    graph.addResult(ashr, ashrValue);
+
+    const auto assignShl = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_shl"));
+    graph.addOperand(assignShl, shlValue);
+    graph.addResult(assignShl, outShl);
+
+    const auto assignLshr = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_lshr"));
+    graph.addOperand(assignLshr, lshrValue);
+    graph.addResult(assignLshr, outLshr);
+
+    const auto assignAshr = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_ashr"));
+    graph.addOperand(assignAshr, ashrValue);
+    graph.addResult(assignAshr, outAshr);
+
+    return design;
+}
+
+Design buildWideSliceDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("wide_slice_top");
+    design.markAsTop("wide_slice_top");
+
+    const auto data = makeValue(graph, "data", 136, false);
+    const auto index = makeValue(graph, "index", 8, false);
+    const auto outDynamic = makeValue(graph, "y_dynamic", 64, false);
+    const auto outStatic = makeValue(graph, "y_static", 64, false);
+    graph.bindInputPort("data", data);
+    graph.bindInputPort("index", index);
+    graph.bindOutputPort("y_dynamic", outDynamic);
+    graph.bindOutputPort("y_static", outStatic);
+
+    const auto dynamicValue = makeValue(graph, "dynamic_value", 64, false);
+    const auto dynamicSlice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("wide_slice_dynamic"));
+    graph.addOperand(dynamicSlice, data);
+    graph.addOperand(dynamicSlice, index);
+    graph.addResult(dynamicSlice, dynamicValue);
+    graph.setAttr(dynamicSlice, "sliceWidth", static_cast<int64_t>(64));
+
+    const auto staticValue = makeValue(graph, "static_value", 64, false);
+    const auto staticSlice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("wide_slice_static"));
+    graph.addOperand(staticSlice, data);
+    graph.addResult(staticSlice, staticValue);
+    graph.setAttr(staticSlice, "sliceStart", static_cast<int64_t>(8));
+    graph.setAttr(staticSlice, "sliceEnd", static_cast<int64_t>(71));
+
+    const auto assignDynamic = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_dynamic"));
+    graph.addOperand(assignDynamic, dynamicValue);
+    graph.addResult(assignDynamic, outDynamic);
+
+    const auto assignStatic = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y_static"));
+    graph.addOperand(assignStatic, staticValue);
+    graph.addResult(assignStatic, outStatic);
+
+    return design;
+}
+
+Design buildNarrowBehaviorAshrDesign(std::size_t prefixDepth)
+{
+    Design design;
+    auto &graph = design.createGraph("narrow_ashr_top");
+    design.markAsTop("narrow_ashr_top");
+
+    const auto data = makeValue(graph, "data", 32, false);
+    const auto amount = makeValue(graph, "amount", 5, false);
+    graph.bindInputPort("data", data);
+    graph.bindInputPort("amount", amount);
+
+    ValueId current = data;
+    for (std::size_t i = 0; i < prefixDepth; ++i)
+    {
+        const auto one = makeConstant(graph,
+                                      "ashr_one_" + std::to_string(i),
+                                      "ashr_one_const_" + std::to_string(i),
+                                      32,
+                                      "32'h00000001");
+        const auto next = makeValue(graph, "ashr_prefix_" + std::to_string(i), 32, false);
+        const auto add = graph.createOperation(OperationKind::kAdd, graph.internSymbol("ashr_prefix_add_" + std::to_string(i)));
+        graph.addOperand(add, current);
+        graph.addOperand(add, one);
+        graph.addResult(add, next);
+        current = next;
+    }
+
+    const auto shifted = makeValue(graph, "shifted", 32, false);
+    const auto ashr = graph.createOperation(OperationKind::kAShr, graph.internSymbol("narrow_ashr"));
+    graph.addOperand(ashr, current);
+    graph.addOperand(ashr, amount);
+    graph.addResult(ashr, shifted);
+
+    const auto out = makeValue(graph, "y", 32, false);
+    graph.bindOutputPort("y", out);
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_narrow_ashr_out"));
+    graph.addOperand(assign, shifted);
     graph.addResult(assign, out);
 
     return design;
@@ -1478,7 +1702,7 @@ void testBehaviorShardsManifestAndCompile()
     options.outputDir = dir.string();
     options.outputFilename = std::string("chain_split");
     options.topOverrides = {"chain_top"};
-    options.attributes["behavior_shard_max_bytes"] = "256";
+    options.attributes["behavior_shard_max_bytes"] = "1200";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "behavior-sharded emit should succeed");
@@ -1488,7 +1712,7 @@ void testBehaviorShardsManifestAndCompile()
     expect(!behaviorShards.empty(), "tiny behavior shard threshold should produce step shards");
     for (const auto &shard : behaviorShards)
     {
-        expect(static_cast<std::size_t>(std::filesystem::file_size(shard)) <= 256,
+        expect(static_cast<std::size_t>(std::filesystem::file_size(shard)) <= 1200,
                "behavior shard should stay within the configured byte budget");
     }
 
@@ -1546,6 +1770,69 @@ void testBehaviorShardsRejectUnshardableStatement()
     expect(!result.success, "emit should fail when a single statement cannot fit within the shard budget");
     expect(diags.hasError(), "unshardable behavior statement should produce diagnostics");
     expectDiagnosticsContain(diags, "behavior_shard_max_bytes");
+}
+
+void testWideBehaviorShardsKeepTypedTemps()
+{
+    Design design = buildWideBehaviorConcatDesign(128);
+    runGsim(design, "wide_behavior_top");
+
+    const auto dir = artifactRoot() / "wide_behavior_shards";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_behavior_split");
+    options.topOverrides = {"wide_behavior_top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "wide behavior-sharded emit should succeed");
+    expect(!diags.hasError(), "wide behavior-sharded emit should not emit diagnostics");
+
+    const auto behaviorShards = findBehaviorShards(dir, "wide_behavior_split");
+    expect(!behaviorShards.empty(), "wide behavior design should emit behavior shards");
+
+    const std::string header = readFile(dir / "wide_behavior_split.hpp");
+    expect(!contains(header, "std::vector<std::uint64_t> step_tmp_"),
+           "behavior shards should not store typed temporaries in a uint64_t vector");
+    expect(!contains(header, "wolvrix::gsim::Bits<128> step_tmp_"),
+           "behavior shards should not emit one persistent member per wide temporary");
+    expect(contains(header, "std::vector<wolvrix::gsim::Bits<128>> step_tmp_group_"),
+           "wide behavior shards should preserve wide typed temporaries in grouped storage");
+
+    const std::string source = readFile(dir / "wide_behavior_split.cpp");
+    expect(contains(source, "step_tmp_group_"),
+           "wide behavior shards should size grouped persistent temporary storage in the source");
+
+    std::size_t observedMaxLine = 0;
+    for (const auto &shard : behaviorShards)
+    {
+        observedMaxLine = std::max(observedMaxLine, maxLineLength(shard));
+    }
+    expect(observedMaxLine < 4096,
+           "wide behavior shard lowering should avoid giant single-line expressions");
+
+    const auto manifestLines = readLines(dir / "wide_behavior_split.manifest");
+    expect(!manifestLines.empty(), "wide behavior-sharded emit should still write a manifest");
+
+    const std::filesystem::path wrapperPath = dir / "wide_behavior_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"wide_behavior_split.hpp\"\n";
+        for (const auto &name : manifestLines)
+        {
+            wrapper << "#include \"" << name << "\"\n";
+        }
+        wrapper << "int main() { SSimTop sim; return 0; }\n";
+    }
+
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "wide behavior shard driver should compile");
 }
 
 void testMemoryLoweringBehavior()
@@ -1692,6 +1979,49 @@ void testDpicReturnAndOutputBehavior()
     expect(std::system(exePath.c_str()) == 0, "dpic return/output driver should run successfully");
 }
 
+void testDpicSignedIntOutputBehavior()
+{
+    Design design = buildDpicSignedIntOutputDesign();
+    runGsim(design, "dpic_signed_out_top");
+
+    const auto dir = artifactRoot() / "dpic_signed_out";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_signed_out_sim");
+    options.topOverrides = {"dpic_signed_out_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "signed-int-output dpic emit should succeed");
+    expect(!diags.hasError(), "signed-int-output dpic emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "dpic_signed_out_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"dpic_signed_out_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "extern \"C\" void dpi_fill_int(int *value) { *value = -5; }\n";
+        driver << "#include \"dpic_signed_out_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.step();\n";
+        driver << "    if (sim.get_y() != static_cast<std::uint32_t>(0xfffffffbU)) return 1;\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "dpic_signed_out_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "dpic signed-int-output driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "dpic signed-int-output driver should run successfully");
+}
+
 void testDpicStringInputBehavior()
 {
     Design design = buildDpicStringInputDesign();
@@ -1784,6 +2114,116 @@ void testUnknownConstantBehavior()
     expect(std::system(exePath.c_str()) == 0, "unknown-constant driver should run successfully");
 }
 
+void testWideDynamicShiftCompile()
+{
+    Design design = buildWideDynamicShiftDesign();
+    runGsim(design, "wide_shift_top");
+
+    const auto dir = artifactRoot() / "wide_dynamic_shift";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_shift_sim");
+    options.topOverrides = {"wide_shift_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "wide dynamic shift emit should succeed");
+    expect(!diags.hasError(), "wide dynamic shift emit should not emit diagnostics");
+
+    const std::filesystem::path wrapperPath = dir / "wide_shift_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"wide_shift_sim.hpp\"\n";
+        wrapper << "#include \"wide_shift_sim.cpp\"\n";
+        wrapper << "int main() { SSimTop sim; return 0; }\n";
+    }
+
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "wide dynamic shift driver should compile");
+}
+
+void testWideSliceCompile()
+{
+    Design design = buildWideSliceDesign();
+    runGsim(design, "wide_slice_top");
+
+    const auto dir = artifactRoot() / "wide_slice";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_slice_sim");
+    options.topOverrides = {"wide_slice_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "wide slice emit should succeed");
+    expect(!diags.hasError(), "wide slice emit should not emit diagnostics");
+
+    const std::filesystem::path wrapperPath = dir / "wide_slice_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"wide_slice_sim.hpp\"\n";
+        wrapper << "#include \"wide_slice_sim.cpp\"\n";
+        wrapper << "int main() { SSimTop sim; return 0; }\n";
+    }
+
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "wide slice driver should compile");
+}
+
+void testNarrowBehaviorAshrCompile()
+{
+    Design design = buildNarrowBehaviorAshrDesign(4096);
+    runGsim(design, "narrow_ashr_top");
+
+    const auto dir = artifactRoot() / "narrow_behavior_ashr";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("narrow_ashr_split");
+    options.topOverrides = {"narrow_ashr_top"};
+    options.attributes["behavior_shard_max_bytes"] = "65536";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "narrow behavior ashr emit should succeed");
+    expect(!diags.hasError(), "narrow behavior ashr emit should not emit diagnostics");
+
+    const std::string header = readFile(dir / "narrow_ashr_split.hpp");
+    expect(contains(header, "std::vector<std::uint32_t> step_tmp_group_"),
+           "narrow behavior ashr should use grouped uint32 temporary storage when sharded");
+
+    const auto manifestLines = readLines(dir / "narrow_ashr_split.manifest");
+    expect(!manifestLines.empty(), "narrow behavior ashr should emit a managed source manifest");
+
+    const std::filesystem::path wrapperPath = dir / "narrow_ashr_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"narrow_ashr_split.hpp\"\n";
+        for (const auto &name : manifestLines)
+        {
+            wrapper << "#include \"" << name << "\"\n";
+        }
+        wrapper << "int main() { SSimTop sim; return 0; }\n";
+    }
+
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "narrow behavior ashr source set should compile");
+}
+
 int main()
 {
     try
@@ -1813,8 +2253,13 @@ int main()
         testMemoryLoweringBehavior();
         testDpicSideEffectCallBehavior();
         testDpicReturnAndOutputBehavior();
+        testDpicSignedIntOutputBehavior();
         testDpicStringInputBehavior();
         testUnknownConstantBehavior();
+        testWideDynamicShiftCompile();
+        testWideSliceCompile();
+        testNarrowBehaviorAshrCompile();
+        testWideBehaviorShardsKeepTypedTemps();
     }
     catch (const std::exception &ex)
     {
