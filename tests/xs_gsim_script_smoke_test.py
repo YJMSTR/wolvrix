@@ -32,6 +32,24 @@ endmodule
 """
 
 
+def make_shard_module_text(length: int) -> str:
+    signals = "\n".join(f"    logic [7:0] s{i};" for i in range(length))
+    assigns: list[str] = []
+    for i in range(length):
+        src = "a" if i == 0 else f"s{i - 1}"
+        assigns.append(f"    assign s{i} = {src} + 8'd1;")
+    assigns.append(f"    assign y = s{length - 1};")
+    return (
+        "module SimTop(\n"
+        "    input logic [7:0] a,\n"
+        "    output logic [7:0] y\n"
+        ");\n"
+        f"{signals}\n\n"
+        f"{chr(10).join(assigns)}\n"
+        "endmodule\n"
+    )
+
+
 def fail(message: str) -> int:
     print(f"[xs-gsim-smoke] {message}", file=sys.stderr)
     return 1
@@ -104,6 +122,50 @@ def main() -> int:
         expect('#include "xs_fixture_gsim.hpp"' in compat_text, 'missing compatibility include for emitted header')
         expect('metadata.graph_symbol = "SimTop";' in source_text, "missing graph symbol metadata")
         expect('metadata.scratchpad_namespace = "gsim.SimTop";' in source_text, "missing scratchpad namespace metadata")
+
+        shard_src_dir = ARTIFACT_ROOT / "shard_src"
+        shard_out_dir = ARTIFACT_ROOT / "shard_out"
+        shard_src_dir.mkdir(parents=True, exist_ok=True)
+        shard_out_dir.mkdir(parents=True, exist_ok=True)
+        shard_sv_path = shard_src_dir / "SimTop.sv"
+        shard_filelist_path = shard_src_dir / "fixture.f"
+        shard_read_args_path = shard_src_dir / "read_args.txt"
+        shard_out_base = shard_out_dir / "xs_fixture_gsim_shards"
+        shard_sv_path.write_text(make_shard_module_text(128), encoding="utf-8")
+        shard_filelist_path.write_text(f"{shard_sv_path}\n", encoding="utf-8")
+        shard_read_args_path.write_text("\n", encoding="utf-8")
+
+        shard_env = dict(env)
+        shard_env["WOLVRIX_XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES"] = "256"
+        shard_result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                str(shard_filelist_path),
+                "SimTop",
+                str(shard_out_base),
+                str(shard_read_args_path),
+                "info",
+            ],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=shard_env,
+            check=False,
+        )
+        expect(shard_result.returncode == 0,
+               f"script shard-cap override failed: {shard_result.stderr.strip() or shard_result.stdout.strip()}")
+        shard_manifest_lines = [
+            line.strip()
+            for line in shard_out_base.with_suffix(".manifest").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        shard_paths = [shard_out_dir / line for line in shard_manifest_lines if "__step_" in line]
+        expect(shard_paths, "script should forward env-controlled shard cap and produce step shards")
+        for shard_path in shard_paths:
+            expect(shard_path.stat().st_size <= 256,
+                   f"script-forwarded shard cap should bound emitted shard size: {shard_path}")
     except Exception as ex:
         return fail(str(ex))
     return 0

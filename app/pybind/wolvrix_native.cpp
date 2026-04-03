@@ -1280,9 +1280,12 @@ namespace
         PyObject *target_path_obj = Py_None;
         const char *port_order_str = "";
         PyObject *port_order_names_obj = Py_None;
-        static const char *kwlist[] = {"design", "output", "top", "target_path", "port_order", "port_order_names", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OOsO", const_cast<char **>(kwlist),
-                                         &design_obj, &output, &top_list_obj, &target_path_obj, &port_order_str, &port_order_names_obj))
+        PyObject *emit_attributes_obj = Py_None;
+        static const char *kwlist[] = {
+            "design", "output", "top", "target_path", "port_order", "port_order_names", "emit_attributes", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OOsOO", const_cast<char **>(kwlist),
+                                         &design_obj, &output, &top_list_obj, &target_path_obj,
+                                         &port_order_str, &port_order_names_obj, &emit_attributes_obj))
         {
             return nullptr;
         }
@@ -1385,6 +1388,39 @@ namespace
                 return nullptr;
             }
             options.portOrderNames = std::move(port_order_names);
+        }
+
+        if (emit_attributes_obj != Py_None)
+        {
+            if (!PyDict_Check(emit_attributes_obj))
+            {
+                PyErr_SetString(PyExc_ValueError, "emit_attributes must be a dict[str, str] or None");
+                return nullptr;
+            }
+
+            PyObject *key = nullptr;
+            PyObject *value = nullptr;
+            Py_ssize_t pos = 0;
+            while (PyDict_Next(emit_attributes_obj, &pos, &key, &value))
+            {
+                if (!PyUnicode_Check(key) || !PyUnicode_Check(value))
+                {
+                    PyErr_SetString(PyExc_ValueError, "emit_attributes must be a dict[str, str]");
+                    return nullptr;
+                }
+                const char *key_text = PyUnicode_AsUTF8(key);
+                const char *value_text = PyUnicode_AsUTF8(value);
+                if (!key_text || !value_text)
+                {
+                    return nullptr;
+                }
+                if (key_text[0] == '\0')
+                {
+                    PyErr_SetString(PyExc_ValueError, "emit_attributes keys must be non-empty strings");
+                    return nullptr;
+                }
+                options.attributes[key_text] = value_text;
+            }
         }
 
         wolvrix::lib::emit::EmitResult result;
@@ -1673,7 +1709,7 @@ static PyMethodDef WolvrixMethods[] = {
      METH_VARARGS | METH_KEYWORDS,
      "write_verilator_repcut_package(design, output, top=None)"},
     {"write_gsim_cpp", reinterpret_cast<PyCFunction>(py_write_gsim_cpp), METH_VARARGS | METH_KEYWORDS,
-     "write_gsim_cpp(design, output, top=None, target_path=None, port_order='decl', port_order_names=None)"},
+     "write_gsim_cpp(design, output, top=None, target_path=None, port_order='decl', port_order_names=None, emit_attributes=None)"},
     {"run_pass", reinterpret_cast<PyCFunction>(py_run_pass), METH_VARARGS | METH_KEYWORDS,
      "run_pass(design, name, args=None, dryrun=False, diagnostics='warn', log_level='warn') -> (changed, ok, diagnostics)"},
     {"run_pipeline", reinterpret_cast<PyCFunction>(py_run_pipeline), METH_VARARGS | METH_KEYWORDS,

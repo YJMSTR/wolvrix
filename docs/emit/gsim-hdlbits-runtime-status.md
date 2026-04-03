@@ -1,129 +1,136 @@
-# HDLBits GSim Runtime Status
+# HDLBits GSim Runtime Baseline
 
 ## Scope
 
-This document tracks the HDLBits end-to-end runtime validation status for the `EmitGsimCpp` backend.
+This document records the HDLBits end-to-end runtime validation baseline for the `EmitGsimCpp` backend.
 
-The goal here is stricter than "codegen succeeded". A DUT is counted as **runtime-validated** only when it completes the full path below:
+A DUT counts as **runtime-validated** only if it completes the full path below:
 
 1. `read_sv`
 2. normalize / simplify pipeline
 3. `gsim`
 4. `write_gsim_cpp`
-5. C++ compilation of the emitted model plus a DUT-specific runner with `-std=c++17 -Wall -Wextra -Werror`
-6. execution of the runner with checked outputs
+5. compile the emitted model together with a checker runner using `-std=c++17 -Wall -Wextra -Werror`
+6. execute the runner and check outputs
 
-This is still **not** a Verilator difftest. It is an emitted-model smoke/behavior validation pass over selected HDLBits patterns.
+This is stricter than "code generation succeeded", but it is still not a Verilator difftest. The goal is to prove that the emitted C++ model is runnable and behaviorally checked through the public `reset()`, `step()`, `get_*()`, and `set_*()` interface.
 
-## Latest Verified Baseline
+## Latest Baseline
 
-Latest full runtime probe:
+The branch-local runtime baseline is now complete for the full HDLBits suite:
 
-- Report: `build/artifacts/hdlbits_gsim_runtime_probe10/batch_report.json`
-- Result: `126/126 success`
-- Average elapsed time: `1348.74 ms` per DUT
-- Max elapsed time: `1848.48 ms` (`dut_072`)
-- Total elapsed time: `169947.93 ms`
+- Report: `build/artifacts/hdlbits_gsim_runtime_full162/batch_report.json`
+- Result: `162/162 success`
+- Success rate: `100.0%`
+- Average elapsed time: `1518.16 ms` per DUT
+- Max elapsed time: `22019.92 ms` (`dut_118`)
+- Total elapsed time: `245974.31 ms`
 
-Latest repo-local regression entry points:
+Fresh repo-local regression evidence was re-run after landing the runtime coverage expansion:
 
+- `python3 -S wolvrix/tests/hdlbits_gsim_runtime_full_test.py`
+  - report: `build/artifacts/hdlbits_gsim_runtime_full_test/batch_report.json`
+  - result: `162/162 success`
+  - average elapsed time: `1506.03 ms`
+  - max elapsed time: `21377.75 ms`
+- `python3 -S wolvrix/tests/hdlbits_gsim_runtime_remaining_test.py`
+  - report: `build/artifacts/hdlbits_gsim_runtime_remaining_test/batch_report.json`
+  - result: `28/28 success`
 - `python3 -S wolvrix/tests/hdlbits_gsim_runner_patterns_test.py`
+  - result: exit `0`
 - `python3 -S wolvrix/tests/hdlbits_gsim_batch_runtime_test.py`
+  - report: `build/artifacts/hdlbits_gsim_batch_runtime_test/batch_report.json`
+  - result: `117/117 success`
+  - also verifies forced `sim-failure` classification and tiny-memory failure handling
 
-## Current Coverage
+## Coverage Structure
 
-As of the `hdlbits_gsim_runtime_probe10` run:
+The HDLBits runtime helper is no longer a small hand-written smoke set. It now covers all `162` DUTs through a mix of descriptor-driven and custom runner paths in [`scripts/wolvrix_hdlbits_gsim_run.py`](/home/zhangyangjie/corvusitor/wolvrix-playground/scripts/wolvrix_hdlbits_gsim_run.py):
 
-- Runtime-validated DUTs: `126`
-- Compile-success DUTs from the compile-only batch: `134`
-- Full HDLBits suite size: `162`
+- `COMB_DESCRIPTORS`
+  - pure combinational probes with direct input/output checks
+- `SEQ_DESCRIPTORS`
+  - sequential cases where outputs are sampled from the current state interface
+- `SEQ_LAG_DESCRIPTORS`
+  - sequential cases whose observable outputs lag one `step()`
+- `SEQ_OBSERVABLE_DESCRIPTORS`
+  - sequential probes that validate edge/event observability
+- `CUSTOM_RUNNERS`
+  - `18` DUT-specific runners for the cases that need wide-value helpers, FSM-specific reference models, serial protocols, or intentionally different output-sampling rules
 
-That means:
+The custom runner set is:
 
-- `126 / 134 = 94.03%` of compile-success DUTs now complete the runtime path
-- `126 / 162 = 77.78%` of the full HDLBits suite now complete the runtime path
+- `040 041 042 043 060 071 098 105 106 108 114 116 117 118 139 141 142 162`
 
-The validated runtime set is the current `SUPPORTED_DUTS` set from `scripts/wolvrix_hdlbits_gsim_run.py`, excluding `dut_060`.
+This split matters because HDLBits contains several cases that are too awkward to validate honestly with a single generic runner template. Examples include:
 
-## What Was Added In This Round
+- very wide arithmetic and BCD cases: `041`, `042`, `043`
+- very wide state or packed vectors: `060`, `116`, `117`, `118`
+- protocol / FSM-specific reference models: `098`, `105`, `106`, `114`, `142`, `162`
+- cases whose emitted observable behavior is latch-delayed relative to the original HDLBits testbench sampling point: `139`, `141`
 
-This round extended runtime coverage from the earlier smaller subset to include:
+## Historically Problematic DUTs
 
-- additional counters and event-capture logic: `097 099 100 101 102 103 104 107`
-- additional LFSR / shift-register style DUTs: `110 111 112 113 115`
-- more FSM and decoder-style DUTs: `119 120 121 122 123 124 127 128 129 132 140 145 146 147 148 149 150 158 160 161`
-- serial-receiver style DUTs: `133 134`
-- additional medium-width vector DUTs that still fit the current scalar runtime interface: `062 064 065`
-- remaining runtime-safe arithmetic / combinational smoke coverage now rolls into the 126-DUT probe
+The earlier compile-only batch had five notable problem cases:
 
-## Remaining Compile-Success But Not Runtime-Validated
+- `026`
+- `041`
+- `042`
+- `043`
+- `095`
 
-There are `8` compile-success DUTs that are still outside the runtime-validated set:
+All five now pass the runtime flow in the `162/162` run. That means the previous blocker is no longer the end-to-end simulation path itself. The remaining cost is mostly generated-C++ size plus compiler work, not `gsim` correctness.
 
-- `060`
-- `098`
-- `105`
-- `106`
-- `114`
-- `116`
-- `117`
-- `142`
+## Compiler And Safety Rules
 
-### Current blockers
+Two different compile paths now exist on purpose:
 
-- `dut_060`
-  - The emitted C++ model currently triggers `shift-count-overflow` under `-Werror` during runner compilation.
-  - This needs a codegen fix, not just a new runner descriptor.
+- compile-only batch validation still uses `g++ -fsyntax-only`
+  - this keeps the "generated code must compile cleanly under GCC with `-Werror`" contract for emitted model artifacts
+- runtime runner compilation prefers `clang++`, with `g++` as fallback
+  - this was introduced because GCC was pathologically slow on some generated runtime runners, especially `dut_043`
 
-- `dut_098`
-  - The source uses both `posedge clk` and `negedge clk`.
-  - The current runtime helper does not yet have an honest validation pattern for this dual-edge behavior.
+The batch harness also now kills the full subprocess group on timeout instead of only terminating the parent helper process. This prevents orphaned `g++` / `cc1plus` compiler processes from surviving timeouts and exhausting host memory.
 
-- `dut_105`, `dut_106`, `dut_114`, `dut_142`
-  - These are still missing dedicated runtime models / runner patterns.
-  - They look feasible with the current backend and should be the next batch.
-
-- `dut_116`, `dut_117`
-  - These designs rely on very wide state (`[511:0]`).
-  - The current emitted public interface still truncates widths above 64 bits, so counting them as runtime-validated today would be misleading.
-
-## Important Interpretation Rules
-
-- "compile-success" means the backend emitted C++ that compiled as a model artifact.
-- "runtime-validated" means the emitted model was compiled together with a checker runner and executed successfully.
-- A DUT should not be counted as "fully running simulation" unless it reaches the runtime-validated bar above.
-- The current runtime numbers are intentionally conservative for very wide or dual-edge cases.
+That timeout cleanup lives in [`scripts/wolvrix_hdlbits_gsim_batch.py`](/home/zhangyangjie/corvusitor/wolvrix-playground/scripts/wolvrix_hdlbits_gsim_batch.py).
 
 ## Performance Notes
 
-The current `avg_time_ms` is dominated by per-DUT subprocess startup, emitted-model compilation, and runner compilation.
+The HDLBits runtime numbers are dominated by setup and compilation overhead:
 
-The runtime probe therefore measures:
+- Python process startup
+- `read_sv`
+- normalization passes
+- `gsim`
+- `write_gsim_cpp`
+- emitted-model compile
+- runner compile
+- runner execution
 
-- backend usability for repeated small DUTs
-- emitted-model compile/run stability
+They do not isolate pure simulation-step throughput. For HDLBits-scale DUTs, compile cost is still a large part of the wall clock.
 
-It does **not** isolate pure simulation-step throughput. For small HDLBits DUTs, code generation and compile overhead still dominate the wall-clock number.
+The slowest DUTs in `build/artifacts/hdlbits_gsim_runtime_full162/batch_report.json` were:
 
-The slowest DUTs in `hdlbits_gsim_runtime_probe10` were:
+- `118`: `22019.92 ms`
+- `043`: `13317.43 ms`
+- `041`: `4988.32 ms`
+- `042`: `2979.31 ms`
+- `104`: `2144.44 ms`
+- `102`: `2037.93 ms`
+- `105`: `1899.07 ms`
+- `103`: `1896.21 ms`
+- `026`: `1827.32 ms`
+- `162`: `1702.39 ms`
 
-- `072`: `1848.48 ms`
-- `034`: `1526.53 ms`
-- `145`: `1501.84 ms`
-- `127`: `1496.16 ms`
-- `063`: `1456.26 ms`
+Those timings are useful as a correctness-and-usability baseline for the emitted backend. They should not be treated as a final throughput benchmark for larger designs such as XiangShan.
 
-## Recommended Next Batch
+## Interpretation Rules
 
-If continuing HDLBits runtime expansion before moving back to XiangShan, the next honest targets should be:
+- "runtime-validated" means the full emitted-model flow finished and the runner checked outputs successfully.
+- "162/162 success" means all HDLBits DUTs now complete the runnable C++ simulation path.
+- This does not imply waveform-level equivalence against Verilator on every HDLBits testbench.
+- It does establish that the current backend can generate, compile, run, and behavior-check the entire HDLBits suite through its own emitted C++ interface.
 
-1. `105`
-2. `106`
-3. `114`
-4. `142`
+## Next Step
 
-After that, the next structural items are:
-
-1. fix `dut_060` codegen so the emitted model compiles cleanly under `-Werror`
-2. decide whether dual-edge validation for `dut_098` needs runtime-helper support or emitter changes
-3. add a non-truncating wide-value runtime interface before claiming runtime validation for `dut_116` and `dut_117`
+With HDLBits `162/162` runtime validation complete, the next downstream target is to return to XiangShan end-to-end smoke and timing-baseline work without blocking on HDLBits runner coverage.

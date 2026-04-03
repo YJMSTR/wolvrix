@@ -47,7 +47,7 @@ def main() -> int:
                 "--output-dir",
                 str(ARTIFACT_ROOT),
                 "--dut-ids",
-                "001,004,005,010,011,013,014,016,021,023,024,025,029,030,031,033,034,035,036,038,039,044,045,046,047,048,049,050,051,052,053,054,055,056,057,058,059,061,062,063,064,065,066,067,068,069,070,072,073,074,075,076,077,078,079,080,081,082,083,084,085,086,087,088,089,090,091,092,093,094,096,097,099,100,101,102,103,104,107,110,111,112,113,115,119,120,121,122,123,124,127,128,129,132,133,134,140,145,146,147,148,149,150,152,153,158,159,160,161",
+                "001,004,005,010,011,013,014,016,021,023,024,025,029,030,031,033,034,035,036,038,039,044,045,046,047,048,049,050,051,052,053,054,055,056,057,058,059,060,061,062,063,064,065,066,067,068,069,070,072,073,074,075,076,077,078,079,080,081,082,083,084,085,086,087,088,089,090,091,092,093,094,096,097,098,099,100,101,102,103,104,105,106,107,110,111,112,113,114,115,116,117,119,120,121,122,123,124,127,128,129,132,133,134,140,142,145,146,147,148,149,150,152,153,158,159,160,161",
                 "--execution-mode",
                 "runtime",
                 "--timeout",
@@ -72,8 +72,8 @@ def main() -> int:
         expect(report_path.exists(), "missing batch runtime report")
         report = json.loads(report_path.read_text(encoding="utf-8"))
         summary = report["summary"]
-        expect(summary["total_duts"] == 109, f"expected 109 DUTs, got {summary['total_duts']}")
-        expect(summary["success"] == 109, f"expected 109 successes, got {summary['success']}")
+        expect(summary["total_duts"] == 117, f"expected 117 DUTs, got {summary['total_duts']}")
+        expect(summary["success"] == 117, f"expected 117 successes, got {summary['success']}")
         expect(summary["tool_failure"] == 0, f"expected no tool failures, got {summary['tool_failure']}")
         results = {entry["dut_id"]: entry["result"] for entry in report["dut_results"]}
         expect(results.get("001") == "success", f"unexpected dut_001 result: {results.get('001')}")
@@ -113,6 +113,7 @@ def main() -> int:
         expect(results.get("057") == "success", f"unexpected dut_057 result: {results.get('057')}")
         expect(results.get("058") == "success", f"unexpected dut_058 result: {results.get('058')}")
         expect(results.get("059") == "success", f"unexpected dut_059 result: {results.get('059')}")
+        expect(results.get("060") == "success", f"unexpected dut_060 result: {results.get('060')}")
         expect(results.get("061") == "success", f"unexpected dut_061 result: {results.get('061')}")
         expect(results.get("062") == "success", f"unexpected dut_062 result: {results.get('062')}")
         expect(results.get("063") == "success", f"unexpected dut_063 result: {results.get('063')}")
@@ -148,18 +149,24 @@ def main() -> int:
         expect(results.get("094") == "success", f"unexpected dut_094 result: {results.get('094')}")
         expect(results.get("096") == "success", f"unexpected dut_096 result: {results.get('096')}")
         expect(results.get("097") == "success", f"unexpected dut_097 result: {results.get('097')}")
+        expect(results.get("098") == "success", f"unexpected dut_098 result: {results.get('098')}")
         expect(results.get("099") == "success", f"unexpected dut_099 result: {results.get('099')}")
         expect(results.get("100") == "success", f"unexpected dut_100 result: {results.get('100')}")
         expect(results.get("101") == "success", f"unexpected dut_101 result: {results.get('101')}")
         expect(results.get("102") == "success", f"unexpected dut_102 result: {results.get('102')}")
         expect(results.get("103") == "success", f"unexpected dut_103 result: {results.get('103')}")
         expect(results.get("104") == "success", f"unexpected dut_104 result: {results.get('104')}")
+        expect(results.get("105") == "success", f"unexpected dut_105 result: {results.get('105')}")
+        expect(results.get("106") == "success", f"unexpected dut_106 result: {results.get('106')}")
         expect(results.get("107") == "success", f"unexpected dut_107 result: {results.get('107')}")
         expect(results.get("110") == "success", f"unexpected dut_110 result: {results.get('110')}")
         expect(results.get("111") == "success", f"unexpected dut_111 result: {results.get('111')}")
         expect(results.get("112") == "success", f"unexpected dut_112 result: {results.get('112')}")
         expect(results.get("113") == "success", f"unexpected dut_113 result: {results.get('113')}")
+        expect(results.get("114") == "success", f"unexpected dut_114 result: {results.get('114')}")
         expect(results.get("115") == "success", f"unexpected dut_115 result: {results.get('115')}")
+        expect(results.get("116") == "success", f"unexpected dut_116 result: {results.get('116')}")
+        expect(results.get("117") == "success", f"unexpected dut_117 result: {results.get('117')}")
         expect(results.get("119") == "success", f"unexpected dut_119 result: {results.get('119')}")
         expect(results.get("120") == "success", f"unexpected dut_120 result: {results.get('120')}")
         expect(results.get("121") == "success", f"unexpected dut_121 result: {results.get('121')}")
@@ -173,6 +180,7 @@ def main() -> int:
         expect(results.get("133") == "success", f"unexpected dut_133 result: {results.get('133')}")
         expect(results.get("134") == "success", f"unexpected dut_134 result: {results.get('134')}")
         expect(results.get("140") == "success", f"unexpected dut_140 result: {results.get('140')}")
+        expect(results.get("142") == "success", f"unexpected dut_142 result: {results.get('142')}")
         expect(results.get("145") == "success", f"unexpected dut_145 result: {results.get('145')}")
         expect(results.get("146") == "success", f"unexpected dut_146 result: {results.get('146')}")
         expect(results.get("147") == "success", f"unexpected dut_147 result: {results.get('147')}")

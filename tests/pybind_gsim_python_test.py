@@ -69,6 +69,24 @@ MODULE_TEXT = """module top(
 endmodule
 """
 
+
+def make_chain_module_text(length: int) -> str:
+    signals = "\n".join(f"    logic [7:0] s{i};" for i in range(length))
+    assigns: list[str] = []
+    for i in range(length):
+        src = "a" if i == 0 else f"s{i - 1}"
+        assigns.append(f"    assign s{i} = {src} + 8'd1;")
+    assigns.append(f"    assign y = s{length - 1};")
+    return (
+        "module top(\n"
+        "    input logic [7:0] a,\n"
+        "    output logic [7:0] y\n"
+        ");\n"
+        f"{signals}\n\n"
+        f"{chr(10).join(assigns)}\n"
+        "endmodule\n"
+    )
+
 DUAL_ROOT_MODULE_TEXT = """module leaf(
     input logic [7:0] a,
     input logic [7:0] b,
@@ -311,6 +329,35 @@ def test_port_order_duplicate_name() -> None:
         "duplicate port")
 
 
+def test_emit_attributes_forward_behavior_shard_cap() -> None:
+    root = ARTIFACT_ROOT / "emit_attributes_behavior_shards"
+    source_dir = root / "src"
+    out_dir = root / "out"
+    reset_dir(source_dir)
+    reset_dir(out_dir)
+
+    design = create_design(source_dir, module_text=make_chain_module_text(128))
+    design.run_pipeline([["gsim", ["-path", "top"]]], print_diagnostics_level="off")
+    base = out_dir / "chain_shards"
+    wolvrix.write_gsim_cpp(
+        design,
+        str(base),
+        top=["top"],
+        emit_attributes={"behavior_shard_max_bytes": "256"},
+    )
+
+    manifest_lines = [
+        line.strip()
+        for line in base.with_suffix(".manifest").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    step_paths = [out_dir / line for line in manifest_lines if "__step_" in line]
+    expect(step_paths, "emit_attributes should allow Python callers to request behavior shards")
+    for step_path in step_paths:
+        expect(step_path.stat().st_size <= 256,
+               f"behavior shard should respect forwarded byte cap: {step_path}")
+
+
 def main() -> int:
     try:
         test_same_design_pipeline_flow()
@@ -322,6 +369,7 @@ def main() -> int:
         test_port_order_invalid_strategy()
         test_port_order_nonexistent_name()
         test_port_order_duplicate_name()
+        test_emit_attributes_forward_behavior_shard_cap()
     except Exception as ex:
         return fail(str(ex))
     return 0

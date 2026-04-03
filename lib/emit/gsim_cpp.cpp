@@ -117,7 +117,8 @@ namespace wolvrix::lib::emit
             if (width <= 8) return "std::uint8_t";
             if (width <= 16) return "std::uint16_t";
             if (width <= 32) return "std::uint32_t";
-            return "std::uint64_t";  // Wide values truncated to 64 bits for now
+            if (width <= 64) return "std::uint64_t";
+            return "wolvrix::gsim::Bits<" + std::to_string(width) + ">";
         }
 
         // Convert Verilog-style constant to C++ constant
@@ -129,8 +130,36 @@ namespace wolvrix::lib::emit
                 return ss.str();
             };
 
-            auto parseUnknownTolerantUnsigned = [](std::string_view digits, unsigned base) -> std::optional<std::uint64_t> {
-                std::uint64_t value = 0;
+            auto parseWidth = [](std::string_view text) -> std::optional<int64_t> {
+                if (text.empty())
+                {
+                    return std::nullopt;
+                }
+                int64_t width = 0;
+                for (char ch : text)
+                {
+                    if (ch < '0' || ch > '9')
+                    {
+                        return std::nullopt;
+                    }
+                    width = width * 10 + static_cast<int64_t>(ch - '0');
+                }
+                return width;
+            };
+
+            auto parseUnknownTolerantWords = [](std::string_view digits, unsigned base, int64_t widthBits) -> std::optional<std::vector<std::uint64_t>> {
+                if (base < 2)
+                {
+                    return std::nullopt;
+                }
+
+                std::size_t wordCount = 1;
+                if (widthBits > 0)
+                {
+                    wordCount = static_cast<std::size_t>((widthBits + 63) / 64);
+                }
+                std::vector<std::uint64_t> words(wordCount, 0);
+
                 for (char ch : digits)
                 {
                     if (ch == '_')
@@ -162,14 +191,42 @@ namespace wolvrix::lib::emit
                         return std::nullopt;
                     }
 
-                    value = value * base + digit;
+                    unsigned __int128 carry = digit;
+                    for (std::size_t index = 0; index < words.size(); ++index)
+                    {
+                        const unsigned __int128 accum =
+                            static_cast<unsigned __int128>(words[index]) * base + carry;
+                        words[index] = static_cast<std::uint64_t>(accum);
+                        carry = accum >> 64;
+                    }
                 }
-                return value;
+
+                if (widthBits > 0)
+                {
+                    const auto remainder = static_cast<unsigned>(widthBits % 64);
+                    if (remainder != 0)
+                    {
+                        words.back() &= ((std::uint64_t{1} << remainder) - 1);
+                    }
+                }
+                return words;
+            };
+
+            auto emitWideBitsLiteral = [&](const std::vector<std::uint64_t>& words, int64_t widthBits) -> std::string {
+                std::ostringstream ss;
+                ss << "([]{ " << getCppTypeForWidth(static_cast<int32_t>(widthBits)) << " value; ";
+                for (std::size_t index = 0; index < words.size(); ++index)
+                {
+                    ss << "value.words[" << index << "] = " << lowerHexLiteral(words[index]) << "; ";
+                }
+                ss << "value.maskUnusedBits(); return value; }())";
+                return ss.str();
             };
 
             size_t apostrophe = verilogConst.find('\'');
             if (apostrophe == std::string::npos) return verilogConst;
             if (apostrophe + 2 >= verilogConst.size()) return "0";
+            const auto widthBits = parseWidth(std::string_view(verilogConst).substr(0, apostrophe));
 
             std::size_t basePos = apostrophe + 1;
             if (basePos < verilogConst.size() &&
@@ -187,17 +244,52 @@ namespace wolvrix::lib::emit
 
             switch (base) {
                 case 'h': {
-                    const auto parsed = parseUnknownTolerantUnsigned(value, 16);
-                    return parsed ? lowerHexLiteral(*parsed) : "0";
+                    const auto parsed = parseUnknownTolerantWords(value, 16, widthBits.value_or(0));
+                    if (!parsed)
+                    {
+                        return "0";
+                    }
+                    if (widthBits.has_value() && *widthBits > 64)
+                    {
+                        return emitWideBitsLiteral(*parsed, *widthBits);
+                    }
+                    return lowerHexLiteral(parsed->empty() ? 0 : (*parsed)[0]);
                 }
                 case 'b': {
-                    const auto parsed = parseUnknownTolerantUnsigned(value, 2);
-                    return parsed ? lowerHexLiteral(*parsed) : "0";
+                    const auto parsed = parseUnknownTolerantWords(value, 2, widthBits.value_or(0));
+                    if (!parsed)
+                    {
+                        return "0";
+                    }
+                    if (widthBits.has_value() && *widthBits > 64)
+                    {
+                        return emitWideBitsLiteral(*parsed, *widthBits);
+                    }
+                    return lowerHexLiteral(parsed->empty() ? 0 : (*parsed)[0]);
                 }
-                case 'd': return value;
+                case 'd': {
+                    const auto parsed = parseUnknownTolerantWords(value, 10, widthBits.value_or(0));
+                    if (!parsed)
+                    {
+                        return "0";
+                    }
+                    if (widthBits.has_value() && *widthBits > 64)
+                    {
+                        return emitWideBitsLiteral(*parsed, *widthBits);
+                    }
+                    return parsed->empty() ? "0" : std::to_string((*parsed)[0]);
+                }
                 case 'o': {
-                    const auto parsed = parseUnknownTolerantUnsigned(value, 8);
-                    return parsed ? lowerHexLiteral(*parsed) : "0";
+                    const auto parsed = parseUnknownTolerantWords(value, 8, widthBits.value_or(0));
+                    if (!parsed)
+                    {
+                        return "0";
+                    }
+                    if (widthBits.has_value() && *widthBits > 64)
+                    {
+                        return emitWideBitsLiteral(*parsed, *widthBits);
+                    }
+                    return lowerHexLiteral(parsed->empty() ? 0 : (*parsed)[0]);
                 }
                 default: return "0";
             }
@@ -622,7 +714,15 @@ namespace wolvrix::lib::emit
                     setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
                     break;
                 }
+                case OperationKind::kCaseEq: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                    break;
+                }
                 case OperationKind::kNe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                    break;
+                }
+                case OperationKind::kCaseNe: {
                     setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
                     break;
                 }
@@ -688,18 +788,30 @@ namespace wolvrix::lib::emit
                     if (w > 0 && w <= 64) {
                         uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
                         setResultExpr(0, "((" + getOperandExpr(0) + " & 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL) == 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL ? 1 : 0)");
+                    } else if (w > 64) {
+                        setResultExpr(0, "(wolvrix::gsim::reduceAnd(" + getOperandExpr(0) + "))");
                     } else {
                         setResultExpr(0, "0");
                     }
                     break;
                 }
                 case OperationKind::kReduceOr: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " != 0 ? 1 : 0)");
+                    const int64_t w = graph.valueWidth(op.operands()[0]);
+                    if (w > 64) {
+                        setResultExpr(0, "(wolvrix::gsim::reduceOr(" + getOperandExpr(0) + "))");
+                    } else {
+                        setResultExpr(0, "(" + getOperandExpr(0) + " != 0 ? 1 : 0)");
+                    }
                     break;
                 }
                 case OperationKind::kReduceXor: {
                     // XOR reduction: count set bits, result is parity
-                    setResultExpr(0, "(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + ")))");
+                    const int64_t w = graph.valueWidth(op.operands()[0]);
+                    if (w > 64) {
+                        setResultExpr(0, "(wolvrix::gsim::reduceXor(" + getOperandExpr(0) + "))");
+                    } else {
+                        setResultExpr(0, "(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + ")))");
+                    }
                     break;
                 }
                 case OperationKind::kReduceNand: {
@@ -707,6 +819,8 @@ namespace wolvrix::lib::emit
                     if (w > 0 && w <= 64) {
                         uint64_t mask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
                         setResultExpr(0, "((" + getOperandExpr(0) + " & 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL) == 0x" + ([&]{ std::ostringstream ss; ss << std::hex << mask; return ss.str(); })() + "ULL ? 0 : 1)");
+                    } else if (w > 64) {
+                        setResultExpr(0, "((wolvrix::gsim::reduceAnd(" + getOperandExpr(0) + ")) ? 0 : 1)");
                     } else {
                         setResultExpr(0, "1");
                     }
@@ -717,7 +831,12 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kReduceXnor: {
-                    setResultExpr(0, "(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + ")) ^ 1)");
+                    const int64_t w = graph.valueWidth(op.operands()[0]);
+                    if (w > 64) {
+                        setResultExpr(0, "((wolvrix::gsim::reduceXor(" + getOperandExpr(0) + ")) ^ 1)");
+                    } else {
+                        setResultExpr(0, "(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + ")) ^ 1)");
+                    }
                     break;
                 }
                 // Concat: shift operands and OR together
@@ -727,6 +846,9 @@ namespace wolvrix::lib::emit
                     } else if (op.operands().size() == 1) {
                         setResultExpr(0, getOperandExpr(0));
                     } else {
+                        const bool wideResult = !op.results().empty() && graph.valueWidth(op.results()[0]) > 64;
+                        const std::string resultType =
+                            !op.results().empty() ? getCppTypeForWidth(graph.valueWidth(op.results()[0])) : "std::uint64_t";
                         // Concat: first operand is MSB, operands go high-to-low
                         // result = (op0 << (w1+w2+...)) | (op1 << (w2+w3+...)) | ... | opN
                         std::string expr;
@@ -741,10 +863,14 @@ namespace wolvrix::lib::emit
                                 shift += widths[j];
                             }
                             std::string part = getOperandExpr(i);
-                            if (shift > 0 && shift < 64) {
+                            if (shift > 0 && wideResult) {
+                                part = "(" + resultType + "(" + part + ") << " + std::to_string(shift) + ")";
+                            } else if (shift > 0 && shift < 64) {
                                 part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
-                            } else if (shift >= 64) {
+                            } else if (!wideResult && shift >= 64) {
                                 part = "0"; // Bits beyond 64 are truncated
+                            } else if (wideResult) {
+                                part = resultType + "(" + part + ")";
                             }
                             if (expr.empty()) {
                                 expr = part;
@@ -770,15 +896,22 @@ namespace wolvrix::lib::emit
                     if (count <= 1) {
                         setResultExpr(0, getOperandExpr(0));
                     } else {
+                        const bool wideResult = !op.results().empty() && graph.valueWidth(op.results()[0]) > 64;
+                        const std::string resultType =
+                            !op.results().empty() ? getCppTypeForWidth(graph.valueWidth(op.results()[0])) : "std::uint64_t";
                         int64_t opWidth = graph.valueWidth(op.operands()[0]);
                         std::string expr;
                         for (int64_t i = 0; i < count; ++i) {
                             std::string part = getOperandExpr(0);
                             int64_t shift = (count - 1 - i) * opWidth;
-                            if (shift > 0 && shift < 64) {
+                            if (shift > 0 && wideResult) {
+                                part = "(" + resultType + "(" + part + ") << " + std::to_string(shift) + ")";
+                            } else if (shift > 0 && shift < 64) {
                                 part = "(static_cast<std::uint64_t>(" + part + ") << " + std::to_string(shift) + ")";
-                            } else if (shift >= 64) {
+                            } else if (!wideResult && shift >= 64) {
                                 part = "0"; // Bits beyond 64 are truncated
+                            } else if (wideResult) {
+                                part = resultType + "(" + part + ")";
                             }
                             if (expr.empty()) {
                                 expr = part;
@@ -1163,7 +1296,21 @@ namespace wolvrix::lib::emit
         // Collect register storage declarations
         void collectRegisters(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
         {
-            std::set<std::string> declaredStorage;
+            std::map<std::string, int32_t> storageWidths;
+            std::vector<std::string> storageOrder;
+
+            auto noteStorage = [&](const std::string& storageName, int32_t width) {
+                const int32_t clampedWidth = std::max<int32_t>(1, width);
+                const auto [it, inserted] = storageWidths.emplace(storageName, clampedWidth);
+                if (inserted)
+                {
+                    storageOrder.push_back(storageName);
+                }
+                else if (clampedWidth > it->second)
+                {
+                    it->second = clampedWidth;
+                }
+            };
 
             for (const auto& opId : graph.operations()) {
                 auto op = graph.getOperation(opId);
@@ -1177,11 +1324,7 @@ namespace wolvrix::lib::emit
                         auto val = graph.getValue(op.results()[0]);
                         width = val.width();
                     }
-                    std::string type = getCppTypeForWidth(width);
-                    if (declaredStorage.insert(regName).second) {
-                        state.storageDecls.push_back(type + " " + regName + " = 0;");
-                        state.resetStmts.push_back("        " + regName + " = 0;");
-                    }
+                    noteStorage(regName, width);
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = regName;
                     }
@@ -1196,11 +1339,7 @@ namespace wolvrix::lib::emit
                         auto val = graph.getValue(op.results()[0]);
                         width = val.width();
                     }
-                    std::string type = getCppTypeForWidth(width);
-                    if (declaredStorage.insert(latchName).second) {
-                        state.storageDecls.push_back(type + " " + latchName + " = 0;");
-                        state.resetStmts.push_back("        " + latchName + " = 0;");
-                    }
+                    noteStorage(latchName, width);
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = latchName;
                     }
@@ -1215,16 +1354,13 @@ namespace wolvrix::lib::emit
                     }
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
-                        if (declaredStorage.insert(regName).second) {
-                            int32_t width = 32;
-                            if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadPort && !op.results().empty()) {
-                                width = graph.getValue(op.results()[0]).width();
-                            } else if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort && op.operands().size() > 1) {
-                                width = graph.valueWidth(op.operands()[1]);
-                            }
-                            state.storageDecls.push_back(getCppTypeForWidth(width) + " " + regName + " = 0;");
-                            state.resetStmts.push_back("        " + regName + " = 0;");
+                        int32_t width = 32;
+                        if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterReadPort && !op.results().empty()) {
+                            width = graph.getValue(op.results()[0]).width();
+                        } else if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort && op.operands().size() > 1) {
+                            width = graph.valueWidth(op.operands()[1]);
                         }
+                        noteStorage(regName, width);
                     }
                 }
                 if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort ||
@@ -1236,18 +1372,26 @@ namespace wolvrix::lib::emit
                     }
                     if (!sym.empty()) {
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
-                        if (declaredStorage.insert(latchName).second) {
-                            int32_t width = 32;
-                            if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort && !op.results().empty()) {
-                                width = graph.getValue(op.results()[0]).width();
-                            } else if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort && op.operands().size() > 1) {
-                                width = graph.valueWidth(op.operands()[1]);
-                            }
-                            state.storageDecls.push_back(getCppTypeForWidth(width) + " " + latchName + " = 0;");
-                            state.resetStmts.push_back("        " + latchName + " = 0;");
+                        int32_t width = 32;
+                        if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort && !op.results().empty()) {
+                            width = graph.getValue(op.results()[0]).width();
+                        } else if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort && op.operands().size() > 1) {
+                            width = graph.valueWidth(op.operands()[1]);
                         }
+                        noteStorage(latchName, width);
                     }
                 }
+            }
+
+            for (const auto& storageName : storageOrder)
+            {
+                const auto widthIt = storageWidths.find(storageName);
+                if (widthIt == storageWidths.end())
+                {
+                    continue;
+                }
+                state.storageDecls.push_back(getCppTypeForWidth(widthIt->second) + " " + storageName + " = 0;");
+                state.resetStmts.push_back("        " + storageName + " = 0;");
             }
         }
 
@@ -1333,8 +1477,227 @@ namespace wolvrix::lib::emit
             return out;
         }
 
+        std::string renderWideBitsSupport()
+        {
+            return R"cpp(namespace wolvrix::gsim {
+
+template <std::size_t Width>
+struct Bits {
+    static_assert(Width > 0, "Bits width must be positive");
+    static constexpr std::size_t kWordBits = 64;
+    static constexpr std::size_t kWordCount = (Width + kWordBits - 1) / kWordBits;
+
+    std::array<std::uint64_t, kWordCount> words{};
+
+    constexpr Bits() = default;
+
+    constexpr Bits(std::uint64_t value) {
+        words.fill(0);
+        words[0] = value;
+        maskUnusedBits();
+    }
+
+    template <std::size_t OtherWidth>
+    constexpr Bits(const Bits<OtherWidth>& other) {
+        words.fill(0);
+        constexpr std::size_t copyCount = kWordCount < Bits<OtherWidth>::kWordCount ? kWordCount : Bits<OtherWidth>::kWordCount;
+        for (std::size_t index = 0; index < copyCount; ++index) {
+            words[index] = other.words[index];
+        }
+        maskUnusedBits();
+    }
+
+    constexpr void maskUnusedBits() {
+        constexpr std::size_t remainder = Width % kWordBits;
+        if constexpr (remainder != 0) {
+            words[kWordCount - 1] &= ((std::uint64_t{1} << remainder) - 1);
+        }
+    }
+
+    constexpr explicit operator bool() const {
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            if (words[index] != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    constexpr explicit operator std::uint64_t() const {
+        return words[0];
+    }
+
+    friend constexpr bool operator==(const Bits& lhs, const Bits& rhs) {
+        return lhs.words == rhs.words;
+    }
+
+    friend constexpr bool operator!=(const Bits& lhs, const Bits& rhs) {
+        return !(lhs == rhs);
+    }
+
+    friend constexpr bool operator<(const Bits& lhs, const Bits& rhs) {
+        for (std::size_t index = kWordCount; index-- > 0;) {
+            if (lhs.words[index] != rhs.words[index]) {
+                return lhs.words[index] < rhs.words[index];
+            }
+        }
+        return false;
+    }
+
+    friend constexpr bool operator<=(const Bits& lhs, const Bits& rhs) {
+        return !(rhs < lhs);
+    }
+
+    friend constexpr bool operator>(const Bits& lhs, const Bits& rhs) {
+        return rhs < lhs;
+    }
+
+    friend constexpr bool operator>=(const Bits& lhs, const Bits& rhs) {
+        return !(lhs < rhs);
+    }
+
+    friend constexpr Bits operator~(Bits value) {
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            value.words[index] = ~value.words[index];
+        }
+        value.maskUnusedBits();
+        return value;
+    }
+
+    friend constexpr Bits operator|(Bits lhs, const Bits& rhs) {
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            lhs.words[index] |= rhs.words[index];
+        }
+        lhs.maskUnusedBits();
+        return lhs;
+    }
+
+    friend constexpr Bits operator&(Bits lhs, const Bits& rhs) {
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            lhs.words[index] &= rhs.words[index];
+        }
+        lhs.maskUnusedBits();
+        return lhs;
+    }
+
+    friend constexpr std::uint64_t operator&(Bits lhs, std::uint64_t rhs) {
+        return lhs.words[0] & rhs;
+    }
+
+    friend constexpr Bits operator^(Bits lhs, const Bits& rhs) {
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            lhs.words[index] ^= rhs.words[index];
+        }
+        lhs.maskUnusedBits();
+        return lhs;
+    }
+
+    friend constexpr Bits operator<<(Bits value, std::size_t shift) {
+        if (shift >= Width) {
+            return Bits{};
+        }
+        Bits result;
+        const std::size_t wordShift = shift / kWordBits;
+        const std::size_t bitShift = shift % kWordBits;
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            if (value.words[index] == 0) {
+                continue;
+            }
+            const std::size_t target = index + wordShift;
+            if (target >= kWordCount) {
+                continue;
+            }
+            result.words[target] |= value.words[index] << bitShift;
+            if (bitShift != 0 && target + 1 < kWordCount) {
+                result.words[target + 1] |= value.words[index] >> (kWordBits - bitShift);
+            }
+        }
+        result.maskUnusedBits();
+        return result;
+    }
+
+    friend constexpr Bits operator>>(Bits value, std::size_t shift) {
+        if (shift >= Width) {
+            return Bits{};
+        }
+        Bits result;
+        const std::size_t wordShift = shift / kWordBits;
+        const std::size_t bitShift = shift % kWordBits;
+        for (std::size_t index = wordShift; index < kWordCount; ++index) {
+            const std::size_t target = index - wordShift;
+            result.words[target] |= value.words[index] >> bitShift;
+            if (bitShift != 0 && index + 1 < kWordCount) {
+                result.words[target] |= value.words[index + 1] << (kWordBits - bitShift);
+            }
+        }
+        result.maskUnusedBits();
+        return result;
+    }
+
+    friend constexpr Bits operator+(const Bits& lhs, const Bits& rhs) {
+        Bits result;
+        unsigned __int128 carry = 0;
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            const unsigned __int128 sum =
+                static_cast<unsigned __int128>(lhs.words[index]) +
+                static_cast<unsigned __int128>(rhs.words[index]) +
+                carry;
+            result.words[index] = static_cast<std::uint64_t>(sum);
+            carry = sum >> kWordBits;
+        }
+        result.maskUnusedBits();
+        return result;
+    }
+
+    friend constexpr Bits operator-(const Bits& lhs, const Bits& rhs) {
+        Bits result;
+        std::uint64_t borrow = 0;
+        for (std::size_t index = 0; index < kWordCount; ++index) {
+            const std::uint64_t rhsWord = rhs.words[index] + borrow;
+            borrow = (lhs.words[index] < rhsWord) ? 1 : 0;
+            result.words[index] = lhs.words[index] - rhsWord;
+        }
+        result.maskUnusedBits();
+        return result;
+    }
+};
+
+template <std::size_t Width>
+constexpr std::uint8_t reduceOr(const Bits<Width>& value) {
+    return static_cast<std::uint8_t>(static_cast<bool>(value));
+}
+
+template <std::size_t Width>
+constexpr std::uint8_t reduceXor(const Bits<Width>& value) {
+    std::uint8_t parity = 0;
+    for (std::size_t wordIndex = 0; wordIndex < Bits<Width>::kWordCount; ++wordIndex) {
+        parity ^= static_cast<std::uint8_t>(__builtin_parityll(value.words[wordIndex]));
+    }
+    return parity & 0x1u;
+}
+
+template <std::size_t Width>
+constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
+    for (std::size_t wordIndex = 0; wordIndex + 1 < Bits<Width>::kWordCount; ++wordIndex) {
+        if (value.words[wordIndex] != 0xFFFFFFFFFFFFFFFFULL) {
+            return 0;
+        }
+    }
+    constexpr std::size_t remainder = Width % Bits<Width>::kWordBits;
+    if constexpr (remainder == 0) {
+        return value.words[Bits<Width>::kWordCount - 1] == 0xFFFFFFFFFFFFFFFFULL ? 1 : 0;
+    }
+    const std::uint64_t mask = (std::uint64_t{1} << remainder) - 1;
+    return (value.words[Bits<Width>::kWordCount - 1] & mask) == mask ? 1 : 0;
+}
+
+} // namespace wolvrix::gsim
+
+)cpp";
+        }
+
         constexpr std::size_t kDefaultMetadataShardMaxBytes = 16u * 1024u * 1024u;
-        constexpr std::size_t kDefaultBehaviorShardMaxBytes = 512u * 1024u * 1024u;
+        constexpr std::size_t kDefaultBehaviorShardMaxBytes = 256u * 1024u * 1024u;
 
         std::optional<std::size_t> parseMetadataShardMaxBytes(const EmitOptions &options,
                                                               EmitDiagnostics *diagnostics)
@@ -1612,6 +1975,26 @@ namespace wolvrix::lib::emit
             return statement.size() + 1;
         }
 
+        constexpr std::size_t behaviorShardEpilogueBytes()
+        {
+            return sizeof("}\n") - 1;
+        }
+
+        std::size_t behaviorShardPreambleBytes(std::string_view headerFilename,
+                                               std::string_view methodName)
+        {
+            return std::string("#include \"").size() + headerFilename.size() +
+                   std::string("\"\n\n").size() +
+                   std::string("void SSimTop::").size() + methodName.size() +
+                   std::string("() {\n").size();
+        }
+
+        std::size_t behaviorShardWrapperBytes(std::string_view headerFilename,
+                                              std::string_view methodName)
+        {
+            return behaviorShardPreambleBytes(headerFilename, methodName) + behaviorShardEpilogueBytes();
+        }
+
         std::size_t estimateBehaviorStatementBytes(const std::vector<std::string> &statements)
         {
             std::size_t total = 0;
@@ -1622,15 +2005,16 @@ namespace wolvrix::lib::emit
             return total;
         }
 
-        std::vector<BehaviorShardPlan> planBehaviorShards(const std::string &baseName,
-                                                          const std::vector<std::string> &statements,
-                                                          std::size_t maxBytes)
+        std::optional<std::vector<BehaviorShardPlan>> planBehaviorShards(const std::string &baseName,
+                                                                         std::string_view headerFilename,
+                                                                         const std::vector<std::string> &statements,
+                                                                         std::size_t maxBytes)
         {
             std::vector<BehaviorShardPlan> plans;
             std::size_t currentBytes = 0;
             std::size_t shardIndex = 0;
 
-            auto openNextPlan = [&]() {
+            auto openNextPlan = [&]() -> bool {
                 std::ostringstream indexText;
                 indexText << std::setw(3) << std::setfill('0') << shardIndex++;
                 const std::string suffix = indexText.str();
@@ -1638,7 +2022,8 @@ namespace wolvrix::lib::emit
                     baseName + "__step_" + suffix + ".cpp",
                     "run_step_shard_" + suffix,
                 });
-                currentBytes = 0;
+                currentBytes = behaviorShardWrapperBytes(headerFilename, plans.back().methodName);
+                return currentBytes <= maxBytes;
             };
 
             for (const auto &statement : statements)
@@ -1646,11 +2031,21 @@ namespace wolvrix::lib::emit
                 const auto bytes = statementEmitBytes(statement);
                 if (plans.empty())
                 {
-                    openNextPlan();
+                    if (!openNextPlan())
+                    {
+                        return std::nullopt;
+                    }
                 }
-                if (currentBytes != 0 && currentBytes + bytes > maxBytes)
+                if (currentBytes + bytes > maxBytes)
                 {
-                    openNextPlan();
+                    if (!openNextPlan())
+                    {
+                        return std::nullopt;
+                    }
+                    if (currentBytes + bytes > maxBytes)
+                    {
+                        return std::nullopt;
+                    }
                 }
                 currentBytes += bytes;
             }
@@ -2024,11 +2419,14 @@ namespace wolvrix::lib::emit
             const std::string structName = "GsimMetadata_" + ns;
             os << "#pragma once\n\n";
             os << "#include <algorithm>\n";
+            os << "#include <array>\n";
+            os << "#include <cstddef>\n";
             os << "#include <cstdint>\n";
             os << "#include <map>\n";
             os << "#include <stdexcept>\n";
             os << "#include <string>\n";
             os << "#include <vector>\n\n";
+            os << renderWideBitsSupport();
             if (!state.dpiForwardDecls.empty())
             {
                 os << "extern \"C\" {\n";
@@ -2346,7 +2744,7 @@ namespace wolvrix::lib::emit
                     shardStream << "void SSimTop::" << plan.methodName << "() {\n";
                     managedSourceFiles.push_back(plan.filename);
                     artifactPaths.push_back((outputDir / plan.filename).string());
-                    shardBytes = 0;
+                    shardBytes = behaviorShardWrapperBytes(headerFilename, plan.methodName);
                     return true;
                 };
 
@@ -2358,7 +2756,7 @@ namespace wolvrix::lib::emit
                 for (const auto &statement : stepStatements)
                 {
                     const auto bytes = statementEmitBytes(statement);
-                    if (shardBytes != 0 && shardBytes + bytes > behaviorShardMaxBytes)
+                    if (shardBytes + bytes > behaviorShardMaxBytes)
                     {
                         if (!finishShard())
                         {
@@ -2366,6 +2764,15 @@ namespace wolvrix::lib::emit
                         }
                         if (shardIndex >= behaviorShardPlans.size() || !startShard())
                         {
+                            return false;
+                        }
+                        if (shardBytes + bytes > behaviorShardMaxBytes)
+                        {
+                            if (diagnostics != nullptr)
+                            {
+                                diagnostics->error("behavior_shard_max_bytes is too small to fit an emitted behavior statement",
+                                                   std::to_string(behaviorShardMaxBytes));
+                            }
                             return false;
                         }
                     }
@@ -2632,6 +3039,7 @@ namespace wolvrix::lib::emit
                                          : defaultBaseName(*target);
         const std::filesystem::path headerPath = outputDir / (baseName + ".hpp");
         const std::filesystem::path sourcePath = outputDir / (baseName + ".cpp");
+        const auto headerFilename = headerPath.filename().string();
         const auto behaviorShardMaxBytes = parseBehaviorShardMaxBytes(options, diagnostics());
         const auto metadataShardMaxBytes = parseMetadataShardMaxBytes(options, diagnostics());
         if (!behaviorShardMaxBytes || !metadataShardMaxBytes)
@@ -2648,10 +3056,20 @@ namespace wolvrix::lib::emit
             }
             behaviorStatements = collectStepStatements(state);
         }
-        const auto behaviorShardPlans =
-            estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes
-                ? planBehaviorShards(baseName, behaviorStatements, *behaviorShardMaxBytes)
-                : std::vector<BehaviorShardPlan>{};
+        std::vector<BehaviorShardPlan> behaviorShardPlans;
+        if (estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes)
+        {
+            auto plannedBehaviorShards =
+                planBehaviorShards(baseName, headerFilename, behaviorStatements, *behaviorShardMaxBytes);
+            if (!plannedBehaviorShards)
+            {
+                reportError("behavior_shard_max_bytes is too small to fit an emitted behavior statement",
+                            std::to_string(*behaviorShardMaxBytes));
+                result.success = false;
+                return result;
+            }
+            behaviorShardPlans = std::move(*plannedBehaviorShards);
+        }
 
         auto header = openOutputFile(headerPath);
         auto source = openOutputFile(sourcePath);
@@ -2669,7 +3087,7 @@ namespace wolvrix::lib::emit
                          *target,
                          *metadata,
                          state,
-                         headerPath.filename().string(),
+                         headerFilename,
                          *behaviorShardMaxBytes,
                          behaviorShardPlans,
                          *metadataShardMaxBytes,

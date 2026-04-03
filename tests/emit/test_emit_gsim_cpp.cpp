@@ -1486,6 +1486,11 @@ void testBehaviorShardsManifestAndCompile()
 
     const auto behaviorShards = findBehaviorShards(dir, "chain_split");
     expect(!behaviorShards.empty(), "tiny behavior shard threshold should produce step shards");
+    for (const auto &shard : behaviorShards)
+    {
+        expect(static_cast<std::size_t>(std::filesystem::file_size(shard)) <= 256,
+               "behavior shard should stay within the configured byte budget");
+    }
 
     const auto manifestLines = readLines(dir / "chain_split.manifest");
     expect(!manifestLines.empty(), "behavior-sharded emit should still write a manifest");
@@ -1519,6 +1524,28 @@ void testBehaviorShardsManifestAndCompile()
         " -o " + exePath + " " + wrapperPath.string() + " 2>&1";
     expect(std::system(compileCmd.c_str()) == 0, "behavior-sharded source set should compile");
     expect(std::system(exePath.c_str()) == 0, "behavior-sharded source set should run");
+}
+
+void testBehaviorShardsRejectUnshardableStatement()
+{
+    Design design = buildLinearAddChainDesign(8);
+    runGsim(design, "chain_top");
+
+    const auto dir = artifactRoot() / "behavior_shards_reject_tiny";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chain_tiny_cap");
+    options.topOverrides = {"chain_top"};
+    options.attributes["behavior_shard_max_bytes"] = "8";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "emit should fail when a single statement cannot fit within the shard budget");
+    expect(diags.hasError(), "unshardable behavior statement should produce diagnostics");
+    expectDiagnosticsContain(diags, "behavior_shard_max_bytes");
 }
 
 void testMemoryLoweringBehavior()
@@ -1782,6 +1809,7 @@ int main()
         testReplicateSignExtendBehavior();
         testLargeCombinationalChainUsesMaterializedTemporaries();
         testBehaviorShardsManifestAndCompile();
+        testBehaviorShardsRejectUnshardableStatement();
         testMemoryLoweringBehavior();
         testDpicSideEffectCallBehavior();
         testDpicReturnAndOutputBehavior();
