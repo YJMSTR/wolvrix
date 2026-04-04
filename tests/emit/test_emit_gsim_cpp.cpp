@@ -257,6 +257,77 @@ Design buildNamedResetPassthroughDesign()
     return design;
 }
 
+Design buildNamedResetRegisterCycleDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("reset_reg_top");
+    design.markAsTop("reset_reg_top");
+
+    const auto resetIn = makeValue(graph, "reset", 1, false);
+    graph.bindInputPort("reset", resetIn);
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.setAttr(regOp, "width", static_cast<int64_t>(8));
+    graph.setAttr(regOp, "isSigned", false);
+    graph.setAttr(regOp, "initValue", std::string("8'h00"));
+
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    graph.addResult(readOp, readVal);
+
+    const auto assignY = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assignY, readVal);
+    graph.addResult(assignY, outY);
+
+    const auto zero = makeConstant(graph, "zero", "zero_c", 8, "8'h00");
+    const auto one = makeConstant(graph, "one", "one_c", 8, "8'h01");
+    const auto regNext = makeValue(graph, "state_next", 8, false);
+    const auto add = graph.createOperation(OperationKind::kAdd, graph.internSymbol("state_inc"));
+    graph.addOperand(add, readVal);
+    graph.addOperand(add, one);
+    graph.addResult(add, regNext);
+
+    const auto writeVal = makeValue(graph, "state_write", 8, false);
+    const auto mux = graph.createOperation(OperationKind::kMux, graph.internSymbol("state_sel"));
+    graph.addOperand(mux, resetIn);
+    graph.addOperand(mux, zero);
+    graph.addOperand(mux, regNext);
+    graph.addResult(mux, writeVal);
+
+    const auto writeEnable = makeConstant(graph, "write_enable", "write_enable_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 8, "8'hff");
+    const auto clk = makeConstant(graph, "clk_const", "clk_const_c", 1, "1'b1");
+    makeRegisterWrite(graph, "state_wp", writeEnable, writeVal, mask, clk, "state");
+
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture_state"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"logic"});
+    graph.setAttr(import, "hasReturn", false);
+    graph.setAttr(import, "returnWidth", static_cast<int64_t>(0));
+    graph.setAttr(import, "returnSigned", false);
+    graph.setAttr(import, "returnType", std::string("void"));
+
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_capture_state_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_capture_state"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", false);
+    graph.addOperand(call, writeEnable);
+    graph.addOperand(call, readVal);
+    graph.addOperand(call, clk);
+
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -1860,11 +1931,10 @@ void testRegisterLatencyBehavior()
         driver << "    // After reset, output should be 0\n";
         driver << "    if (sim.get_y() != 0) { printf(\"FAIL: after reset y=%d expected 0\\n\", sim.get_y()); return 1; }\n";
         driver << "    sim.set_a(42); sim.step();\n";
-        driver << "    // Register captures 42, but output shows old value (0) due to 1-cycle latency\n";
-        driver << "    if (sim.get_y() != 0) { printf(\"FAIL: step1 y=%d expected 0\\n\", sim.get_y()); return 1; }\n";
-        driver << "    sim.step();\n";
-        driver << "    // Now output should show captured value (42)\n";
-        driver << "    if (sim.get_y() != 42) { printf(\"FAIL: step2 y=%d expected 42\\n\", sim.get_y()); return 1; }\n";
+        driver << "    // A step models one clocked cycle, so outputs should reflect the updated register state.\n";
+        driver << "    if (sim.get_y() != 42) { printf(\"FAIL: step1 y=%d expected 42\\n\", sim.get_y()); return 1; }\n";
+        driver << "    sim.set_a(7); sim.step();\n";
+        driver << "    if (sim.get_y() != 7) { printf(\"FAIL: step2 y=%d expected 7\\n\", sim.get_y()); return 1; }\n";
         driver << "    printf(\"REGISTER LATENCY PASS\\n\");\n";
         driver << "    return 0;\n";
         driver << "}\n";
@@ -2016,6 +2086,53 @@ void testBootstrapResetFirstStepBehavior()
     expect(std::system(compileCmd.c_str()) == 0, "bootstrap reset driver should compile");
     expect(std::system(exePath.c_str()) == 0,
            "first step after reset() should execute reset-controlled sequential logic");
+}
+
+void testNamedResetClockedRegisterAdvancesOnReleaseStep()
+{
+    Design design = buildNamedResetRegisterCycleDesign();
+    runGsim(design, "reset_reg_top");
+
+    const auto dir = artifactRoot() / "named_reset_register_cycle";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("named_reset_reg_sim");
+    options.topOverrides = {"reset_reg_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "named reset register emit should succeed");
+    expect(!diags.hasError(), "named reset register emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "named_reset_reg_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"named_reset_reg_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "static std::uint32_t g_dpi_calls = 0;\n";
+        driver << "static std::uint32_t g_dpi_last = 0xffffffffU;\n";
+        driver << "extern \"C\" void dpi_capture_state(std::uint8_t value) { ++g_dpi_calls; g_dpi_last = value; }\n";
+        driver << "#include \"named_reset_reg_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    if (g_dpi_calls != 1 || g_dpi_last != 0) return 1;\n";
+        driver << "    sim.set_reset(0); sim.step();\n";
+        driver << "    if (g_dpi_calls != 2 || g_dpi_last != 1) return 2;\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "named_reset_reg_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "named reset register driver should compile");
+    expect(std::system(exePath.c_str()) == 0,
+           "release step should expose the updated clocked state to posedge side effects");
 }
 
 void testLargeCombinationalChainUsesMaterializedTemporaries()
@@ -2704,6 +2821,7 @@ int main()
         testReplicateSignExtendBehavior();
         testRegisterInitValueBehavior();
         testBootstrapResetFirstStepBehavior();
+        testNamedResetClockedRegisterAdvancesOnReleaseStep();
         testLargeCombinationalChainUsesMaterializedTemporaries();
         testBehaviorShardsManifestAndCompile();
         testBehaviorShardsRejectUnshardableStatement();

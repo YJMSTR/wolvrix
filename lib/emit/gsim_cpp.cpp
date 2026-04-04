@@ -92,6 +92,8 @@ namespace wolvrix::lib::emit
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             // Combinational statements that drive outputs in step()
             std::vector<std::string> combinationalStmts;
+            // Public output assignments emitted after state updates.
+            std::vector<std::string> outputStmts;
             // Port declarations
             std::vector<std::pair<std::string, std::string>> inputPorts;
             std::vector<std::pair<std::string, std::string>> outputPorts;
@@ -114,10 +116,12 @@ namespace wolvrix::lib::emit
             };
 
             bool persistentTemps = false;
+            std::string persistentTempPrefix = "step_tmp_group_";
             std::vector<PersistentTempGroup> persistentTempGroups;
             std::map<std::string, std::size_t> persistentTempGroupIndices;
             // Track unsupported operations
             std::vector<std::string> unsupportedOps;
+            bool hasResetInput = false;
         };
 
         // Get C++ type for a value based on its width
@@ -417,7 +421,7 @@ namespace wolvrix::lib::emit
                 const auto groupIndex = state.persistentTempGroups.size();
                 CodegenState::PersistentTempGroup group;
                 group.cppType = cppType;
-                group.storageName = "step_tmp_group_" + std::to_string(groupIndex) + "_";
+                group.storageName = state.persistentTempPrefix + std::to_string(groupIndex) + "_";
                 groupIt = state.persistentTempGroupIndices.emplace(cppType, groupIndex).first;
                 state.persistentTempGroups.push_back(std::move(group));
             }
@@ -640,6 +644,23 @@ namespace wolvrix::lib::emit
             }
         }
 
+        bool isPostSequentialSideEffectDpiCall(const wolvrix::lib::grh::Operation &op)
+        {
+            using namespace wolvrix::lib::grh;
+
+            if (op.kind() != OperationKind::kDpicCall)
+            {
+                return false;
+            }
+
+            const bool hasReturn = getAttrAs<bool>(op, "hasReturn").value_or(false);
+            const auto outArgName =
+                getAttrAs<std::vector<std::string>>(op, "outArgName").value_or(std::vector<std::string>{});
+            const auto eventEdge =
+                getAttrAs<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
+            return !hasReturn && outArgName.empty() && !eventEdge.empty();
+        }
+
         // Forward declare sanitizeIdentifier for use in lowerOperation
         // (already defined above)
 
@@ -733,7 +754,9 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kAssign: {
-                    setResultExpr(0, getOperandExpr(0));
+                    if (!op.results().empty()) {
+                        state.valueExprs[op.results()[0]] = getOperandExpr(0);
+                    }
                     break;
                 }
                 case OperationKind::kAdd: {
@@ -1148,6 +1171,9 @@ namespace wolvrix::lib::emit
                     std::string addr = getOperandExpr(1);
                     std::string data = getOperandExpr(2);
                     std::string mask = getOperandExpr(3);
+                    if (state.hasResetInput) {
+                        condition = "(!input_reset_ && (" + condition + "))";
+                    }
 
                     auto memSymAttr = op.attr("memSymbol");
                     std::string sym;
@@ -1178,7 +1204,9 @@ namespace wolvrix::lib::emit
                     if (sym.empty()) sym = std::string(op.symbolText());
                     if (!sym.empty()) {
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
-                        setResultExpr(0, latchName);
+                        if (!op.results().empty()) {
+                            state.valueExprs[op.results()[0]] = latchName;
+                        }
                     }
                     break;
                 }
@@ -1211,7 +1239,9 @@ namespace wolvrix::lib::emit
                     if (sym.empty()) sym = std::string(op.symbolText());
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
-                        setResultExpr(0, regName);
+                        if (!op.results().empty()) {
+                            state.valueExprs[op.results()[0]] = regName;
+                        }
                     }
                     break;
                 }
@@ -1219,6 +1249,9 @@ namespace wolvrix::lib::emit
                     std::string condition = getOperandExpr(0);
                     std::string nextValue = getOperandExpr(1);
                     std::string mask = getOperandExpr(2);
+                    if (state.hasResetInput) {
+                        condition = "(!input_reset_ && (" + condition + "))";
+                    }
 
                     auto regSymAttr = op.attr("regSymbol");
                     std::string sym;
@@ -1452,6 +1485,10 @@ namespace wolvrix::lib::emit
                 std::string portExpr = "input_" + sanitizeIdentifier(port.name) + "_";
                 state.valueExprs[port.value] = portExpr;
                 state.inputValueNames[port.value] = sanitizeIdentifier(port.name);
+                if (sanitizeIdentifier(port.name) == "reset")
+                {
+                    state.hasResetInput = true;
+                }
             }
 
             for (const auto& port : graph.outputPorts()) {
@@ -2618,6 +2655,8 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
         }
 
         std::optional<std::vector<BehaviorShardPlan>> planBehaviorShards(const std::string &baseName,
+                                                                         std::string_view fileTag,
+                                                                         std::string_view methodPrefix,
                                                                          std::string_view headerFilename,
                                                                          const CodegenState &state,
                                                                          const std::vector<std::string> &statements,
@@ -2632,8 +2671,8 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 indexText << std::setw(3) << std::setfill('0') << shardIndex++;
                 const std::string suffix = indexText.str();
                 plans.push_back(BehaviorShardPlan{
-                    baseName + "__step_" + suffix + ".cpp",
-                    "run_step_shard_" + suffix,
+                    baseName + "__" + std::string(fileTag) + "_" + suffix + ".cpp",
+                    std::string(methodPrefix) + suffix,
                 });
                 currentBytes = behaviorShardWrapperBytes(headerFilename, state, plans.back().methodName);
                 return currentBytes <= maxBytes;
@@ -3026,7 +3065,9 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
                          const CodegenState& state,
+                         const CodegenState& postState,
                          const std::vector<BehaviorShardPlan> &behaviorShardPlans,
+                         const std::vector<BehaviorShardPlan> &postBehaviorShardPlans,
                          bool emitMetadata)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
@@ -3096,7 +3137,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             for (const auto &plan : behaviorShardPlans) {
                 os << "    void " << plan.methodName << "();\n";
             }
-            if (!behaviorShardPlans.empty()) {
+            for (const auto &plan : postBehaviorShardPlans) {
+                os << "    void " << plan.methodName << "();\n";
+            }
+            if (!behaviorShardPlans.empty() || !postBehaviorShardPlans.empty()) {
                 os << "\n";
             }
 
@@ -3116,6 +3160,11 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             }
             if (state.persistentTemps && !state.persistentTempGroups.empty()) {
                 for (const auto &group : state.persistentTempGroups) {
+                    os << "    std::vector<" << group.cppType << "> " << group.storageName << ";\n";
+                }
+            }
+            if (postState.persistentTemps && !postState.persistentTempGroups.empty()) {
+                for (const auto &group : postState.persistentTempGroups) {
                     os << "    std::vector<" << group.cppType << "> " << group.storageName << ";\n";
                 }
             }
@@ -3174,9 +3223,11 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
                          const CodegenState &state,
+                         const CodegenState &postState,
                          std::string_view headerFilename,
                          std::size_t behaviorShardMaxBytes,
                          const std::vector<BehaviorShardPlan> &behaviorShardPlans,
+                         const std::vector<BehaviorShardPlan> &postBehaviorShardPlans,
                          std::size_t metadataShardMaxBytes,
                          bool emitMetadata,
                          std::vector<std::string> &managedSourceFiles,
@@ -3198,6 +3249,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 metadataBytes = estimateMetadataStatementsBytes(metadataStatements);
             }
             const auto stepStatements = collectStepStatements(state);
+            const auto postStepStatements = collectStepStatements(postState);
             std::vector<MetadataShardPlan> shardPlans;
             if (emitMetadata)
             {
@@ -3227,6 +3279,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 os << stmt << "\n";
             }
             for (const auto &group : state.persistentTempGroups)
+            {
+                os << "    " << group.storageName << ".resize(" << group.count << ");\n";
+            }
+            for (const auto &group : postState.persistentTempGroups)
             {
                 os << "    " << group.storageName << ".resize(" << group.count << ");\n";
             }
@@ -3260,6 +3316,29 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             else
             {
                 for (const auto &plan : behaviorShardPlans)
+                {
+                    os << "    " << plan.methodName << "();\n";
+                }
+            }
+            for (const auto &stmt : state.outputStmts)
+            {
+                os << stmt << "\n";
+            }
+            if (postBehaviorShardPlans.empty())
+            {
+                if (!postStepStatements.empty())
+                {
+                    os << "    {\n";
+                    for (const auto &stmt : postStepStatements)
+                    {
+                        os << stmt << "\n";
+                    }
+                    os << "    }\n";
+                }
+            }
+            else
+            {
+                for (const auto &plan : postBehaviorShardPlans)
                 {
                     os << "    " << plan.methodName << "();\n";
                 }
@@ -3363,8 +3442,14 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             managedSourceFiles.push_back(std::string(baseName) + ".cpp");
             artifactPaths.push_back((outputDir / (std::string(baseName) + ".cpp")).string());
 
-            if (!behaviorShardPlans.empty())
-            {
+            auto writeBehaviorShards = [&](const CodegenState &shardState,
+                                           const std::vector<BehaviorShardPlan> &plans,
+                                           const std::vector<std::string> &statements) -> bool {
+                if (plans.empty())
+                {
+                    return true;
+                }
+
                 std::size_t shardIndex = 0;
                 std::size_t shardBytes = 0;
                 std::ofstream shardStream;
@@ -3380,7 +3465,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                         if (diagnostics != nullptr)
                         {
                             diagnostics->error("failed to finalize gsim behavior shard",
-                                               (outputDir / behaviorShardPlans[shardIndex].filename).string());
+                                               (outputDir / plans[shardIndex].filename).string());
                         }
                         return false;
                     }
@@ -3391,7 +3476,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 };
 
                 auto startShard = [&]() -> bool {
-                    const auto &plan = behaviorShardPlans[shardIndex];
+                    const auto &plan = plans[shardIndex];
                     shardStream = std::ofstream(outputDir / plan.filename, std::ios::trunc);
                     if (!shardStream)
                     {
@@ -3403,11 +3488,11 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                         return false;
                     }
                     shardStream << "#include \"" << headerFilename << "\"\n\n";
-                    writeLocalDpiForwardDecls(shardStream, state);
+                    writeLocalDpiForwardDecls(shardStream, shardState);
                     shardStream << "void SSimTop::" << plan.methodName << "() {\n";
                     managedSourceFiles.push_back(plan.filename);
                     artifactPaths.push_back((outputDir / plan.filename).string());
-                    shardBytes = behaviorShardWrapperBytes(headerFilename, state, plan.methodName);
+                    shardBytes = behaviorShardWrapperBytes(headerFilename, shardState, plan.methodName);
                     return true;
                 };
 
@@ -3416,7 +3501,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                     return false;
                 }
 
-                for (const auto &statement : stepStatements)
+                for (const auto &statement : statements)
                 {
                     const auto bytes = statementEmitBytes(statement);
                     if (shardBytes + bytes > behaviorShardMaxBytes)
@@ -3425,7 +3510,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                         {
                             return false;
                         }
-                        if (shardIndex >= behaviorShardPlans.size() || !startShard())
+                        if (shardIndex >= plans.size() || !startShard())
                         {
                             return false;
                         }
@@ -3446,17 +3531,23 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                         if (diagnostics != nullptr)
                         {
                             diagnostics->error("failed to write gsim behavior shard",
-                                               (outputDir / behaviorShardPlans[shardIndex].filename).string());
+                                               (outputDir / plans[shardIndex].filename).string());
                         }
                         return false;
                     }
                     shardBytes += bytes;
                 }
 
-                if (!finishShard())
-                {
-                    return false;
-                }
+                return finishShard();
+            };
+
+            if (!writeBehaviorShards(state, behaviorShardPlans, stepStatements))
+            {
+                return false;
+            }
+            if (!writeBehaviorShards(postState, postBehaviorShardPlans, postStepStatements))
+            {
+                return false;
             }
 
             if (emitMetadata && !shardPlans.empty())
@@ -3628,59 +3719,131 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             operationIdsByIndex[opId.index] = opId;
         }
 
-        auto buildCodegenState = [&](bool persistentTemps) {
+        std::unordered_set<int64_t> postSequentialSideEffectOpIndices;
+        std::unordered_set<int64_t> postSequentialSliceOpIndices;
+        std::vector<int64_t> postSequentialWorklist;
+        for (int64_t opIdx : metadata->topoOrder)
+        {
+            if (opIdx < 0 || static_cast<std::size_t>(opIdx) >= operationIdsByIndex.size())
+            {
+                continue;
+            }
+            const auto opId = operationIdsByIndex[static_cast<std::size_t>(opIdx)];
+            if (!opId.valid())
+            {
+                continue;
+            }
+            const auto op = target->graph->getOperation(opId);
+            if (!isPostSequentialSideEffectDpiCall(op))
+            {
+                continue;
+            }
+            postSequentialSideEffectOpIndices.insert(opIdx);
+            if (postSequentialSliceOpIndices.insert(opIdx).second)
+            {
+                postSequentialWorklist.push_back(opIdx);
+            }
+        }
+        while (!postSequentialWorklist.empty())
+        {
+            const auto current = postSequentialWorklist.back();
+            postSequentialWorklist.pop_back();
+            const auto predIt = metadata->predecessors.find(current);
+            if (predIt == metadata->predecessors.end())
+            {
+                continue;
+            }
+            for (const auto predecessor : predIt->second)
+            {
+                if (predecessor < 0)
+                {
+                    continue;
+                }
+                if (postSequentialSliceOpIndices.insert(predecessor).second)
+                {
+                    postSequentialWorklist.push_back(predecessor);
+                }
+            }
+        }
+
+        auto buildCodegenState = [&](bool persistentTemps,
+                                     const std::unordered_set<int64_t> *includedOpIndices,
+                                     const std::unordered_set<int64_t> *excludedOpIndices,
+                                     bool emitOutputs,
+                                     std::string_view persistentTempPrefix) {
             CodegenState state;
             state.persistentTemps = persistentTemps;
+            state.persistentTempPrefix = std::string(persistentTempPrefix);
             collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
             collectRegisters(*target->graph, state);
             collectMemories(*target->graph, state);
             collectDpiImports(*target->graph, state);
 
             for (int64_t opIdx : metadata->topoOrder) {
-                if (opIdx >= 0 && static_cast<std::size_t>(opIdx) < operationIdsByIndex.size()) {
-                    const auto opId = operationIdsByIndex[static_cast<std::size_t>(opIdx)];
-                    if (opId.valid())
-                    {
-                        auto op = target->graph->getOperation(opId);
-                        lowerOperation(*target->graph, op, state);
-                    }
-                }
-            }
-
-            for (const auto& port : target->graph->outputPorts()) {
-                auto it = state.outputValueNames.find(port.value);
-                if (it == state.outputValueNames.end()) {
+                if (opIdx < 0 || static_cast<std::size_t>(opIdx) >= operationIdsByIndex.size()) {
                     continue;
                 }
-                const std::string& sanitizedName = it->second;
-                auto exprIt = state.valueExprs.find(port.value);
-                if (exprIt != state.valueExprs.end()) {
-                    state.combinationalStmts.push_back(
-                        "        output_" + sanitizedName + "_ = " + exprIt->second + ";");
+                if (includedOpIndices != nullptr && includedOpIndices->count(opIdx) == 0) {
+                    continue;
+                }
+                if (excludedOpIndices != nullptr && excludedOpIndices->count(opIdx) != 0) {
+                    continue;
+                }
+                const auto opId = operationIdsByIndex[static_cast<std::size_t>(opIdx)];
+                if (!opId.valid())
+                {
+                    continue;
+                }
+                auto op = target->graph->getOperation(opId);
+                lowerOperation(*target->graph, op, state);
+            }
+
+            if (emitOutputs)
+            {
+                for (const auto& port : target->graph->outputPorts()) {
+                    auto it = state.outputValueNames.find(port.value);
+                    if (it == state.outputValueNames.end()) {
+                        continue;
+                    }
+                    const std::string& sanitizedName = it->second;
+                    auto exprIt = state.valueExprs.find(port.value);
+                    if (exprIt != state.valueExprs.end()) {
+                        state.outputStmts.push_back(
+                            "        output_" + sanitizedName + "_ = " + exprIt->second + ";");
+                    }
                 }
             }
 
             return state;
         };
 
-        auto reportUnsupportedOps = [&](const CodegenState &state) -> bool {
-            if (state.unsupportedOps.empty()) {
+        auto reportUnsupportedOps = [&](std::vector<std::string> unsupportedOps) -> bool {
+            if (unsupportedOps.empty()) {
                 return false;
             }
             std::string msg = "unsupported operations encountered: ";
-            for (size_t i = 0; i < state.unsupportedOps.size() && i < 5; ++i) {
+            for (size_t i = 0; i < unsupportedOps.size() && i < 5; ++i) {
                 if (i > 0) msg += ", ";
-                msg += state.unsupportedOps[i];
+                msg += unsupportedOps[i];
             }
-            if (state.unsupportedOps.size() > 5) {
-                msg += " and " + std::to_string(state.unsupportedOps.size() - 5) + " more";
+            if (unsupportedOps.size() > 5) {
+                msg += " and " + std::to_string(unsupportedOps.size() - 5) + " more";
             }
             reportError(msg, target->graph->symbol());
             result.success = false;
             return true;
         };
 
-        CodegenState state = buildCodegenState(false);
+        CodegenState state = buildCodegenState(false,
+                                               nullptr,
+                                               &postSequentialSideEffectOpIndices,
+                                               true,
+                                               "step_tmp_group_");
+        CodegenState postState = buildCodegenState(false,
+                                                   &postSequentialSliceOpIndices,
+                                                   nullptr,
+                                                   false,
+                                                   "post_step_tmp_group_");
 
         // Validate custom port order names
         if (options.portOrderStrategy == PortOrderStrategy::Custom && !options.portOrderNames.empty()) {
@@ -3702,7 +3865,9 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             }
         }
 
-        if (reportUnsupportedOps(state)) {
+        std::vector<std::string> unsupportedOps = state.unsupportedOps;
+        unsupportedOps.insert(unsupportedOps.end(), postState.unsupportedOps.begin(), postState.unsupportedOps.end());
+        if (reportUnsupportedOps(std::move(unsupportedOps))) {
             return result;
         }
 
@@ -3722,19 +3887,40 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             return result;
         }
         auto behaviorStatements = collectStepStatements(state);
+        auto postBehaviorStatements = collectStepStatements(postState);
         if (estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes)
         {
-            state = buildCodegenState(true);
-            if (reportUnsupportedOps(state)) {
+            state = buildCodegenState(true,
+                                      nullptr,
+                                      &postSequentialSideEffectOpIndices,
+                                      true,
+                                      "step_tmp_group_");
+            std::vector<std::string> rebuiltUnsupportedOps = state.unsupportedOps;
+            rebuiltUnsupportedOps.insert(rebuiltUnsupportedOps.end(), postState.unsupportedOps.begin(), postState.unsupportedOps.end());
+            if (reportUnsupportedOps(std::move(rebuiltUnsupportedOps))) {
                 return result;
             }
             behaviorStatements = collectStepStatements(state);
+        }
+        if (estimateBehaviorStatementBytes(postBehaviorStatements) > *behaviorShardMaxBytes)
+        {
+            postState = buildCodegenState(true,
+                                          &postSequentialSliceOpIndices,
+                                          nullptr,
+                                          false,
+                                          "post_step_tmp_group_");
+            std::vector<std::string> rebuiltUnsupportedOps = state.unsupportedOps;
+            rebuiltUnsupportedOps.insert(rebuiltUnsupportedOps.end(), postState.unsupportedOps.begin(), postState.unsupportedOps.end());
+            if (reportUnsupportedOps(std::move(rebuiltUnsupportedOps))) {
+                return result;
+            }
+            postBehaviorStatements = collectStepStatements(postState);
         }
         std::vector<BehaviorShardPlan> behaviorShardPlans;
         if (estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes)
         {
             auto plannedBehaviorShards =
-                planBehaviorShards(baseName, headerFilename, state, behaviorStatements, *behaviorShardMaxBytes);
+                planBehaviorShards(baseName, "step", "run_step_shard_", headerFilename, state, behaviorStatements, *behaviorShardMaxBytes);
             if (!plannedBehaviorShards)
             {
                 reportError("behavior_shard_max_bytes is too small to fit an emitted behavior statement",
@@ -3743,6 +3929,20 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 return result;
             }
             behaviorShardPlans = std::move(*plannedBehaviorShards);
+        }
+        std::vector<BehaviorShardPlan> postBehaviorShardPlans;
+        if (estimateBehaviorStatementBytes(postBehaviorStatements) > *behaviorShardMaxBytes)
+        {
+            auto plannedBehaviorShards =
+                planBehaviorShards(baseName, "post", "run_post_shard_", headerFilename, postState, postBehaviorStatements, *behaviorShardMaxBytes);
+            if (!plannedBehaviorShards)
+            {
+                reportError("behavior_shard_max_bytes is too small to fit an emitted post-sequential behavior statement",
+                            std::to_string(*behaviorShardMaxBytes));
+                result.success = false;
+                return result;
+            }
+            postBehaviorShardPlans = std::move(*plannedBehaviorShards);
         }
 
         auto header = openOutputFile(headerPath);
@@ -3753,7 +3953,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             return result;
         }
 
-        writeHeader(*header, *target, *metadata, state, behaviorShardPlans, emitMetadata);
+        writeHeader(*header, *target, *metadata, state, postState, behaviorShardPlans, postBehaviorShardPlans, emitMetadata);
         std::vector<std::string> managedSourceFiles;
         if (!writeSource(*source,
                          outputDir,
@@ -3761,9 +3961,11 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                          *target,
                          *metadata,
                          state,
+                         postState,
                          headerFilename,
                          *behaviorShardMaxBytes,
                          behaviorShardPlans,
+                         postBehaviorShardPlans,
                          *metadataShardMaxBytes,
                          emitMetadata,
                          managedSourceFiles,
