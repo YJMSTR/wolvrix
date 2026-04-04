@@ -731,6 +731,19 @@ namespace wolvrix::lib::emit
             auto getShiftAmountExpr = [&](size_t idx) -> std::string {
                 return "(static_cast<std::size_t>(static_cast<std::uint64_t>(" + getOperandExpr(idx) + ")))";
             };
+            auto setComparisonResultExpr = [&](std::string_view compareOp) {
+                const std::string lhs = getOperandExpr(0);
+                const std::string rhs = getOperandExpr(1);
+                if (lhs == rhs) {
+                    if (compareOp == "==" || compareOp == "<=" || compareOp == ">=") {
+                        setResultExpr(0, "1");
+                    } else {
+                        setResultExpr(0, "0");
+                    }
+                    return;
+                }
+                setResultExpr(0, "(" + lhs + " " + std::string(compareOp) + " " + rhs + ")");
+            };
 
             switch (kind) {
                 case OperationKind::kConstant: {
@@ -815,35 +828,35 @@ namespace wolvrix::lib::emit
                 }
                 // Comparison operations
                 case OperationKind::kEq: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr("==");
                     break;
                 }
                 case OperationKind::kCaseEq: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr("==");
                     break;
                 }
                 case OperationKind::kNe: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr("!=");
                     break;
                 }
                 case OperationKind::kCaseNe: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr("!=");
                     break;
                 }
                 case OperationKind::kLt: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " < " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr("<");
                     break;
                 }
                 case OperationKind::kLe: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " <= " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr("<=");
                     break;
                 }
                 case OperationKind::kGt: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " > " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr(">");
                     break;
                 }
                 case OperationKind::kGe: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " >= " + getOperandExpr(1) + ")");
+                    setComparisonResultExpr(">=");
                     break;
                 }
                 // Logical operations

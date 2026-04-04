@@ -54,11 +54,11 @@ auto y = sim.get_y(); // Read output
 
 Each call to `step()`:
 1. Increments the internal step counter
-2. If reset is active: clears state and returns
-3. Evaluates all combinational logic (drives output ports)
-4. Applies sequential updates (register writes)
+2. If reset is active: reapplies the emitted reset state before continuing through the cycle
+3. Evaluates the current cycle's logic and applies sequential updates
+4. Updates public outputs from the post-step state
 
-Combinational outputs reflect the **current** cycle's inputs. Register values visible through outputs reflect the **previous** cycle's captured state (1-cycle latency).
+For combinational DUTs, one `step()` after input changes is enough to observe the new outputs. For stateful DUTs, values visible through `get_*()` reflect the state after that `step()` completes; a reset-active step leaves outputs at the reset state instead of returning early.
 
 ## Generated Source Set
 

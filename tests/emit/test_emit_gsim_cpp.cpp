@@ -474,6 +474,31 @@ Design buildReplicateSignExtendDesign()
     return design;
 }
 
+Design buildSelfCompareEqDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("self_eq_top");
+    design.markAsTop("self_eq_top");
+
+    const auto in = makeValue(graph, "a", 8, false);
+    graph.bindInputPort("a", in);
+
+    const auto eqValue = makeValue(graph, "eq_value", 1, false);
+    const auto out = makeValue(graph, "y", 1, false);
+    graph.bindOutputPort("y", out);
+
+    const auto eq = graph.createOperation(OperationKind::kEq, graph.internSymbol("self_eq"));
+    graph.addOperand(eq, in);
+    graph.addOperand(eq, in);
+    graph.addResult(eq, eqValue);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, eqValue);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
 Design buildLinearAddChainDesign(std::size_t depth)
 {
     Design design;
@@ -2194,6 +2219,40 @@ void testNamedResetClockedRegisterReassertsToResetState()
            "reasserted reset should return clocked state and posedge side effects to the reset value");
 }
 
+void testSelfCompareDoesNotEmitClangTautologyWarning()
+{
+    Design design = buildSelfCompareEqDesign();
+    runGsim(design, "self_eq_top");
+
+    const auto dir = artifactRoot() / "self_compare_warning";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("self_compare_sim");
+    options.topOverrides = {"self_eq_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "self-compare warning emit should succeed");
+    expect(!diags.hasError(), "self-compare warning emit should not emit diagnostics");
+
+    const std::filesystem::path wrapperPath = dir / "self_compare_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"self_compare_sim.hpp\"\n";
+        wrapper << "#include \"self_compare_sim.cpp\"\n";
+        wrapper << "int main() { SSimTop sim; sim.set_a(7); sim.step(); return sim.get_y() == 1 ? 0 : 1; }\n";
+    }
+
+    const std::string compileCmd =
+        "clang++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0,
+           "self-compare lowering should compile without clang tautology warnings");
+}
+
 void testLargeCombinationalChainUsesMaterializedTemporaries()
 {
     Design design = buildLinearAddChainDesign(128);
@@ -2882,6 +2941,7 @@ int main()
         testBootstrapResetFirstStepBehavior();
         testNamedResetClockedRegisterAdvancesOnReleaseStep();
         testNamedResetClockedRegisterReassertsToResetState();
+        testSelfCompareDoesNotEmitClangTautologyWarning();
         testLargeCombinationalChainUsesMaterializedTemporaries();
         testBehaviorShardsManifestAndCompile();
         testBehaviorShardsRejectUnshardableStatement();
