@@ -3306,6 +3306,15 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "        bootstrap_reset_pending_ = false;\n";
             os << "        difftest_exit_ = 0;\n";
             os << "    }\n";
+            if (state.hasResetInput)
+            {
+                os << "    if (input_reset_) {\n";
+                for (const auto &stmt : state.resetStmts)
+                {
+                    os << stmt << "\n";
+                }
+                os << "    }\n";
+            }
             if (behaviorShardPlans.empty())
             {
                 for (const auto &stmt : stepStatements)

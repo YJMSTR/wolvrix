@@ -2135,6 +2135,65 @@ void testNamedResetClockedRegisterAdvancesOnReleaseStep()
            "release step should expose the updated clocked state to posedge side effects");
 }
 
+void testNamedResetClockedRegisterReassertsToResetState()
+{
+    Design design = buildNamedResetRegisterCycleDesign();
+    runGsim(design, "reset_reg_top");
+
+    const auto dir = artifactRoot() / "named_reset_register_reassert";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("named_reset_reg_reassert_sim");
+    options.topOverrides = {"reset_reg_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "named reset register reassert emit should succeed");
+    expect(!diags.hasError(), "named reset register reassert emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "named_reset_reg_reassert_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"named_reset_reg_reassert_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "#include <cstdio>\n";
+        driver << "static std::uint32_t g_dpi_calls = 0;\n";
+        driver << "static std::uint32_t g_dpi_last = 0xffffffffU;\n";
+        driver << "extern \"C\" void dpi_capture_state(std::uint8_t value) { ++g_dpi_calls; g_dpi_last = value; }\n";
+        driver << "#include \"named_reset_reg_reassert_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    if (g_dpi_calls != 1 || g_dpi_last != 0 || sim.get_y() != 0) {\n";
+        driver << "        std::printf(\"FAIL: first reset calls=%u last=%u y=%u\\n\", g_dpi_calls, g_dpi_last, static_cast<unsigned>(sim.get_y()));\n";
+        driver << "        return 1;\n";
+        driver << "    }\n";
+        driver << "    sim.set_reset(0); sim.step();\n";
+        driver << "    if (g_dpi_calls != 2 || g_dpi_last != 1 || sim.get_y() != 1) {\n";
+        driver << "        std::printf(\"FAIL: release calls=%u last=%u y=%u\\n\", g_dpi_calls, g_dpi_last, static_cast<unsigned>(sim.get_y()));\n";
+        driver << "        return 2;\n";
+        driver << "    }\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    if (g_dpi_calls != 3 || g_dpi_last != 0 || sim.get_y() != 0) {\n";
+        driver << "        std::printf(\"FAIL: reassert calls=%u last=%u y=%u\\n\", g_dpi_calls, g_dpi_last, static_cast<unsigned>(sim.get_y()));\n";
+        driver << "        return 3;\n";
+        driver << "    }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "named_reset_reg_reassert_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "named reset register reassert driver should compile");
+    expect(std::system(exePath.c_str()) == 0,
+           "reasserted reset should return clocked state and posedge side effects to the reset value");
+}
+
 void testLargeCombinationalChainUsesMaterializedTemporaries()
 {
     Design design = buildLinearAddChainDesign(128);
@@ -2822,6 +2881,7 @@ int main()
         testRegisterInitValueBehavior();
         testBootstrapResetFirstStepBehavior();
         testNamedResetClockedRegisterAdvancesOnReleaseStep();
+        testNamedResetClockedRegisterReassertsToResetState();
         testLargeCombinationalChainUsesMaterializedTemporaries();
         testBehaviorShardsManifestAndCompile();
         testBehaviorShardsRejectUnshardableStatement();
