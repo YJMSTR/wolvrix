@@ -239,6 +239,24 @@ Design buildSingleGraphDesign()
     return design;
 }
 
+Design buildNamedResetPassthroughDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("reset_top");
+    design.markAsTop("reset_top");
+
+    const auto resetIn = makeValue(graph, "reset", 1, false);
+    const auto outY = makeValue(graph, "y", 1, false);
+    graph.bindInputPort("reset", resetIn);
+    graph.bindOutputPort("y", outY);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, resetIn);
+    graph.addResult(assign, outY);
+
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -502,6 +520,45 @@ Design buildMemoryBehaviorDesign()
     graph.addOperand(memWrite, wdata);
     graph.addOperand(memWrite, memMask);
     graph.addOperand(memWrite, clk);
+
+    return design;
+}
+
+Design buildDivideByZeroBehaviorDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("div_top");
+    design.markAsTop("div_top");
+
+    const auto lhs = makeValue(graph, "lhs", 8, false);
+    const auto rhs = makeValue(graph, "rhs", 8, false);
+    graph.bindInputPort("lhs", lhs);
+    graph.bindInputPort("rhs", rhs);
+
+    const auto divValue = makeValue(graph, "div_value", 8, false);
+    const auto modValue = makeValue(graph, "mod_value", 8, false);
+    const auto outQ = makeValue(graph, "q", 8, false);
+    const auto outR = makeValue(graph, "r", 8, false);
+    graph.bindOutputPort("q", outQ);
+    graph.bindOutputPort("r", outR);
+
+    const auto divOp = graph.createOperation(OperationKind::kDiv, graph.internSymbol("div"));
+    graph.addOperand(divOp, lhs);
+    graph.addOperand(divOp, rhs);
+    graph.addResult(divOp, divValue);
+
+    const auto modOp = graph.createOperation(OperationKind::kMod, graph.internSymbol("mod"));
+    graph.addOperand(modOp, lhs);
+    graph.addOperand(modOp, rhs);
+    graph.addResult(modOp, modValue);
+
+    const auto assignQ = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_q"));
+    graph.addOperand(assignQ, divValue);
+    graph.addResult(assignQ, outQ);
+
+    const auto assignR = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_r"));
+    graph.addOperand(assignR, modValue);
+    graph.addResult(assignR, outR);
 
     return design;
 }
@@ -889,6 +946,32 @@ Design buildNarrowBehaviorAshrDesign(std::size_t prefixDepth)
     return design;
 }
 
+Design buildRegisterInitValueDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("reg_init_top");
+    design.markAsTop("reg_init_top");
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.setAttr(regOp, "width", static_cast<int64_t>(8));
+    graph.setAttr(regOp, "isSigned", false);
+    graph.setAttr(regOp, "initValue", std::string("8'h2a"));
+
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    graph.addResult(readOp, readVal);
+
+    const auto assignY = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assignY, readVal);
+    graph.addResult(assignY, outY);
+
+    return design;
+}
+
 void runGsim(Design &design, const std::string &path)
 {
     PassManager manager;
@@ -975,8 +1058,12 @@ void testHappyPathAfterRunningGsim()
     expect(contains(source, "metadata.scratchpad_namespace = \"gsim.top\";"), "source should embed scratchpad namespace");
     expect(contains(source, "metadata.schedule_kind = \"activity-v1\";"), "source should emit concrete schedule contract kind");
     expect(contains(source, "metadata.hypergraph_kind = \"activity-connectivity-v1\";"), "source should emit concrete hypergraph contract kind");
-    expect(contains(source, "metadata.schedule_activity_order = {"), "source should serialize schedule activity ordering");
-    expect(contains(source, "metadata.hypergraph_edge_sinks = {"), "source should serialize hypergraph sink metadata");
+    expect(contains(source, "metadata.schedule_activity_order.clear();"), "source should serialize schedule activity ordering");
+    expect(contains(source, "metadata.schedule_activity_order.insert(metadata.schedule_activity_order.end(), {"),
+           "source should serialize schedule activity ordering with chunked inserts");
+    expect(contains(source, "metadata.hypergraph_edge_sinks.clear();"), "source should serialize hypergraph sink metadata");
+    expect(contains(source, "metadata.hypergraph_edge_sinks["),
+           "source should materialize hypergraph sink entries without monolithic initializers");
     expect(contains(source, "bool validate_top_metadata"), "source should emit validation helper");
 
     // Compile verification: generated C++ must compile with strict flags
@@ -1126,7 +1213,7 @@ void testMetadataShardManifestAndCleanup()
     options.outputDir = dir.string();
     options.outputFilename = std::string("split_metadata");
     options.topOverrides = {"top"};
-    options.attributes["metadata_shard_max_bytes"] = "128";
+    options.attributes["metadata_shard_max_bytes"] = "1024";
 
     const EmitResult splitResult = emitter.emit(design, options);
     expect(splitResult.success, "EmitGsimCpp split metadata emission should succeed");
@@ -1152,7 +1239,7 @@ void testMetadataShardManifestAndCleanup()
     }
 
     const std::string source = readFile(sourcePath);
-    expect(!contains(source, "metadata.schedule_activity_order = {"),
+    expect(!contains(source, "metadata.schedule_activity_order.insert(metadata.schedule_activity_order.end(), {"),
            "canonical source should stay lightweight when metadata is sharded");
 
     {
@@ -1187,6 +1274,160 @@ void testMetadataShardManifestAndCleanup()
     const auto rerunManifestLines = readLines(manifestPath);
     expect(rerunManifestLines.size() == 1 && rerunManifestLines.front() == "split_metadata.cpp",
            "rerun manifest should only keep the canonical source when no shards are needed");
+}
+
+void testMetadataShardsKeepAssignmentsWhole()
+{
+    Design design = buildLinearAddChainDesign(256);
+    runGsim(design, "chain_top");
+
+    const auto dir = artifactRoot() / "metadata_shards_large";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chain_metadata_split");
+    options.topOverrides = {"chain_top"};
+    options.attributes["metadata_shard_max_bytes"] = "4096";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "large metadata sharded emit should succeed");
+    expect(!diags.hasError(), "large metadata sharded emit should not emit diagnostics");
+
+    const auto manifestLines = readLines(dir / "chain_metadata_split.manifest");
+    expect(!manifestLines.empty(), "large metadata sharded emit should write a manifest");
+    expect(!findMetadataShards(dir, "chain_metadata_split").empty(),
+           "large metadata fixture should produce metadata shards");
+
+    const std::filesystem::path wrapperPath = dir / "chain_metadata_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"chain_metadata_split.hpp\"\n";
+        for (const auto &name : manifestLines)
+        {
+            wrapper << "#include \"" << name << "\"\n";
+        }
+        wrapper << "int main() { auto metadata = wolvrix::gsim::make_chain_top_metadata(); return metadata.op_count < 0; }\n";
+    }
+
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0,
+           "metadata shards should keep each metadata assignment whole enough for strict compilation");
+}
+
+void testMetadataShardsRespectByteBudgetForLargeMetadata()
+{
+    constexpr std::size_t metadataShardMaxBytes = 4096;
+    constexpr std::uintmax_t shardFileSlackBytes = 2048;
+    constexpr std::size_t maxMetadataStatementLineBytes = 4096;
+
+    Design design = buildLinearAddChainDesign(4096);
+    runGsim(design, "chain_top");
+
+    const auto dir = artifactRoot() / "metadata_shards_budget";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chain_metadata_budget");
+    options.topOverrides = {"chain_top"};
+    options.attributes["metadata_shard_max_bytes"] = std::to_string(metadataShardMaxBytes);
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "large metadata budget emit should succeed");
+    expect(!diags.hasError(), "large metadata budget emit should not emit diagnostics");
+
+    const auto shards = findMetadataShards(dir, "chain_metadata_budget");
+    expect(!shards.empty(), "large metadata budget fixture should produce metadata shards");
+    for (const auto &shard : shards)
+    {
+        const auto bytes = std::filesystem::file_size(shard);
+        expect(bytes <= metadataShardMaxBytes + shardFileSlackBytes,
+               "metadata shard should stay near the configured byte budget even with large metadata maps");
+
+        std::ifstream shardStream(shard);
+        std::string line;
+        std::size_t longestLineBytes = 0;
+        while (std::getline(shardStream, line))
+        {
+            longestLineBytes = std::max(longestLineBytes, line.size());
+        }
+        expect(longestLineBytes <= maxMetadataStatementLineBytes,
+               "large metadata budget emit should avoid pathological single-line metadata statements");
+    }
+
+    const auto manifestLines = readLines(dir / "chain_metadata_budget.manifest");
+    const std::filesystem::path wrapperPath = dir / "chain_metadata_budget_compile.cpp";
+    {
+        std::ofstream wrapper(wrapperPath);
+        wrapper << "#include \"chain_metadata_budget.hpp\"\n";
+        for (const auto &name : manifestLines)
+        {
+            wrapper << "#include \"" << name << "\"\n";
+        }
+        wrapper << "int main() { auto metadata = wolvrix::gsim::make_chain_top_metadata(); return metadata.op_count < 0; }\n";
+    }
+
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -fsyntax-only " + wrapperPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0,
+           "large metadata budget source set should still compile with strict flags");
+}
+
+void testMetadataStatementsStaySmallUnderLargeShardBudget()
+{
+    constexpr std::size_t metadataShardMaxBytes = 1024 * 1024;
+    constexpr std::size_t maxMetadataStatementLineBytes = 4096;
+
+    Design design = buildLinearAddChainDesign(4096);
+    runGsim(design, "chain_top");
+
+    const auto dir = artifactRoot() / "metadata_statement_budget";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chain_metadata_stmt_budget");
+    options.topOverrides = {"chain_top"};
+    options.attributes["metadata_shard_max_bytes"] = std::to_string(metadataShardMaxBytes);
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "large shard budget emit should succeed");
+    expect(!diags.hasError(), "large shard budget emit should not emit diagnostics");
+
+    const auto shards = findMetadataShards(dir, "chain_metadata_stmt_budget");
+    expect(!shards.empty(), "large shard budget fixture should still produce metadata shards");
+    bool sawArrayLoopLowering = false;
+    for (const auto &shard : shards)
+    {
+        const std::string shardSource = readFile(shard);
+        expect(!contains(shardSource, "metadata.classifications.insert({{"),
+               "large shard budget emit should avoid bulk map initializer inserts for classifications metadata");
+        expect(!contains(shardSource, ".insert(metadata.predecessors["),
+               "large shard budget emit should avoid predecessor vector insert initializers");
+        sawArrayLoopLowering = sawArrayLoopLowering || contains(shardSource, "static constexpr std::int64_t values[] = {");
+
+        std::ifstream shardStream(shard);
+        std::string line;
+        std::size_t longestLineBytes = 0;
+        while (std::getline(shardStream, line))
+        {
+            longestLineBytes = std::max(longestLineBytes, line.size());
+        }
+        expect(longestLineBytes <= maxMetadataStatementLineBytes,
+               "large shard budget emit should keep metadata statements bounded to avoid pathological compile hotspots");
+    }
+    expect(sawArrayLoopLowering,
+           "large shard budget emit should lower at least one vector metadata shard through compact array loops");
 }
 
 void testGraphOnlyAndMultiHopTargetSelectionConsistency()
@@ -1324,6 +1565,57 @@ void testBehavioralCompileAndRun()
 
     const std::string runCmd = exePath + " 2>&1";
     expect(std::system(runCmd.c_str()) == 0, "behavioral driver should run and pass");
+}
+
+void testResetPortNamedResetUsesInputSetter()
+{
+    Design design = buildNamedResetPassthroughDesign();
+    runGsim(design, "reset_top");
+
+    const auto dir = artifactRoot() / "named_reset_passthrough";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("named_reset_sim");
+    options.topOverrides = {"reset_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "named reset passthrough emit should succeed");
+    expect(!diags.hasError(), "named reset passthrough emit should not emit diagnostics");
+
+    const std::string header = readFile(dir / "named_reset_sim.hpp");
+    expect(contains(header, "void set_reset("), "named reset passthrough should still expose set_reset");
+
+    const std::filesystem::path driverPath = dir / "named_reset_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"named_reset_sim.hpp\"\n";
+        driver << "#include \"named_reset_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    unsigned rst = 0;\n";
+        driver << "    sim.step();\n";
+        driver << "    rst = 1;\n";
+        driver << "    sim.set_reset(rst);\n";
+        driver << "    sim.step();\n";
+        driver << "    if (sim.get_y() != 1) { std::printf(\"FAIL reset-high y=%u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    rst = 0;\n";
+        driver << "    sim.set_reset(rst);\n";
+        driver << "    sim.step();\n";
+        driver << "    if (sim.get_y() != 0) { std::printf(\"FAIL reset-low y=%u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "named_reset_driver").string();
+    const std::string compileCmd = "g++ -std=c++17 -Wall -Wextra -Werror -I " +
+        dir.string() + " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "named reset driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "named reset driver should observe the reset input");
 }
 
 void testPortOrderDecl()
@@ -1635,6 +1927,97 @@ void testReplicateSignExtendBehavior()
     expect(std::system(exePath.c_str()) == 0, "replicate sign-extend driver should pass");
 }
 
+void testRegisterInitValueBehavior()
+{
+    Design design = buildRegisterInitValueDesign();
+    runGsim(design, "reg_init_top");
+
+    const auto dir = artifactRoot() / "reg_init_value";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reg_init_sim");
+    options.topOverrides = {"reg_init_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "register initValue emit should succeed");
+    expect(!diags.hasError(), "register initValue emit should not emit diagnostics");
+
+    const std::string source = readFile(dir / "reg_init_sim.cpp");
+    expect(contains(source, "reg_state = 0x2aULL;"),
+           "generated reset should preserve non-zero register initValue");
+
+    const std::filesystem::path driverPath = dir / "reg_init_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"reg_init_sim.hpp\"\n";
+        driver << "#include \"reg_init_sim.cpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_reset(0); sim.step();\n";
+        driver << "    return sim.get_y() == static_cast<std::uint8_t>(42) ? 0 : 1;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "reg_init_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "register initValue driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "register initValue driver should preserve non-zero initValue");
+}
+
+void testBootstrapResetFirstStepBehavior()
+{
+    Design design = buildNamedResetPassthroughDesign();
+    runGsim(design, "reset_top");
+
+    const auto dir = artifactRoot() / "bootstrap_reset_cycle";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("bootstrap_reset_sim");
+    options.topOverrides = {"reset_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "bootstrap reset regression emit should succeed");
+    expect(!diags.hasError(), "bootstrap reset regression should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "bootstrap_reset_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"bootstrap_reset_sim.hpp\"\n";
+        driver << "#include \"bootstrap_reset_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1);\n";
+        driver << "    sim.step();\n";
+        driver << "    if (sim.get_y() != 1) {\n";
+        driver << "        std::printf(\"FAIL: first reset step y=%u expected=1\\n\", static_cast<unsigned>(sim.get_y()));\n";
+        driver << "        return 1;\n";
+        driver << "    }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "bootstrap_reset_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "bootstrap reset driver should compile");
+    expect(std::system(exePath.c_str()) == 0,
+           "first step after reset() should execute reset-controlled sequential logic");
+}
+
 void testLargeCombinationalChainUsesMaterializedTemporaries()
 {
     Design design = buildLinearAddChainDesign(128);
@@ -1858,6 +2241,12 @@ void testMemoryLoweringBehavior()
     const std::string source = readFile(dir / "mem_sim.cpp");
     expect(contains(header, "std::vector<std::uint8_t> mem_mem0_"),
            "memory lowering should declare vector-backed storage");
+    expect(contains(header, "std::vector<std::uint8_t> mem_mem0_;"),
+           "memory lowering should leave vector-backed storage default-constructed in the header");
+    expect(!contains(header, "std::vector<std::uint8_t> mem_mem0_ = std::vector<std::uint8_t>(4, 0);"),
+           "memory lowering should not rely on in-class vector default initializers");
+    expect(contains(source, "mem_mem0_.resize(4);"),
+           "memory lowering should allocate vector-backed storage in the constructor");
     expect(contains(source, "std::fill(mem_mem0_.begin(), mem_mem0_.end(), 0);"),
            "memory lowering should reset vector-backed storage in the emitted source");
 
@@ -1886,6 +2275,57 @@ void testMemoryLoweringBehavior()
     expect(std::system(exePath.c_str()) == 0, "memory lowering driver should run successfully");
 }
 
+void testDivideByZeroBehavior()
+{
+    Design design = buildDivideByZeroBehaviorDesign();
+    runGsim(design, "div_top");
+
+    const auto dir = artifactRoot() / "divide_by_zero_behavior";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("div_sim");
+    options.topOverrides = {"div_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "divide-by-zero lowering emit should succeed");
+    expect(!diags.hasError(), "divide-by-zero lowering emit should not emit diagnostics");
+
+    const std::filesystem::path driverPath = dir / "div_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"div_sim.hpp\"\n";
+        driver << "#include \"div_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    sim.set_reset(0);\n";
+        driver << "    sim.set_lhs(9); sim.set_rhs(0); sim.step();\n";
+        driver << "    if (sim.get_q() != 0 || sim.get_r() != 0) {\n";
+        driver << "        std::printf(\"FAIL zero-div %u %u\\n\", static_cast<unsigned>(sim.get_q()), static_cast<unsigned>(sim.get_r()));\n";
+        driver << "        return 1;\n";
+        driver << "    }\n";
+        driver << "    sim.set_rhs(4); sim.step();\n";
+        driver << "    if (sim.get_q() != 2 || sim.get_r() != 1) {\n";
+        driver << "        std::printf(\"FAIL normal-div %u %u\\n\", static_cast<unsigned>(sim.get_q()), static_cast<unsigned>(sim.get_r()));\n";
+        driver << "        return 1;\n";
+        driver << "    }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "div_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "divide-by-zero driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "divide-by-zero driver should run successfully");
+}
+
 void testDpicSideEffectCallBehavior()
 {
     Design design = buildDpicIgnoredDesign();
@@ -1905,6 +2345,15 @@ void testDpicSideEffectCallBehavior()
     expect(result.success, "dpic-ignored emit should succeed");
     expect(!diags.hasError(), "dpic-ignored emit should not emit diagnostics");
 
+    const std::string headerText = readFile(dir / "dpic_sim.hpp");
+    const std::string sourceText = readFile(dir / "dpic_sim.cpp");
+    expect(headerText.find("dpi_capture(") == std::string::npos,
+           "dpic side-effect header should not expose DPI forward declarations");
+    expect(sourceText.find("extern \"C\"") != std::string::npos,
+           "dpic side-effect source should keep local DPI forward declarations");
+    expect(sourceText.find("dpi_capture(") != std::string::npos,
+           "dpic side-effect source should declare the imported DPI symbol");
+
     const std::filesystem::path driverPath = dir / "dpic_driver.cpp";
     {
         std::ofstream driver(driverPath);
@@ -1917,9 +2366,11 @@ void testDpicSideEffectCallBehavior()
         driver << "int main() {\n";
         driver << "    SSimTop sim;\n";
         driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    if (g_dpi_calls != 1 || g_dpi_last != 0) return 1;\n";
+        driver << "    sim.set_reset(0);\n";
         driver << "    sim.set_in(7); sim.step();\n";
-        driver << "    if (sim.get_y() != 7) return 1;\n";
-        driver << "    if (g_dpi_calls != 1 || g_dpi_last != 7) return 2;\n";
+        driver << "    if (sim.get_y() != 7) return 2;\n";
+        driver << "    if (g_dpi_calls != 2 || g_dpi_last != 7) return 3;\n";
         driver << "    return 0;\n";
         driver << "}\n";
     }
@@ -2238,6 +2689,7 @@ int main()
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
         testBehavioralCompileAndRun();
+        testResetPortNamedResetUsesInputSetter();
         testPortOrderDecl();
         testPortOrderAlpha();
         testPortOrderCustom();
@@ -2245,12 +2697,18 @@ int main()
         testPortOrderDuplicateName();
         testVersionMismatchRejection();
         testHypergraphVersionMismatchRejection();
+        testMetadataShardsKeepAssignmentsWhole();
+        testMetadataShardsRespectByteBudgetForLargeMetadata();
+        testMetadataStatementsStaySmallUnderLargeShardBudget();
         testRegisterLatencyBehavior();
         testReplicateSignExtendBehavior();
+        testRegisterInitValueBehavior();
+        testBootstrapResetFirstStepBehavior();
         testLargeCombinationalChainUsesMaterializedTemporaries();
         testBehaviorShardsManifestAndCompile();
         testBehaviorShardsRejectUnshardableStatement();
         testMemoryLoweringBehavior();
+        testDivideByZeroBehavior();
         testDpicSideEffectCallBehavior();
         testDpicReturnAndOutputBehavior();
         testDpicSignedIntOutputBehavior();

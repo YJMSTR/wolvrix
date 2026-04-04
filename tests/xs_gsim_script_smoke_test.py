@@ -31,6 +31,14 @@ MODULE_TEXT = """module SimTop(
 endmodule
 """
 
+RESET_NAMED_MODULE_TEXT = """module SimTop(
+    input logic reset,
+    output logic y
+);
+    assign y = reset;
+endmodule
+"""
+
 
 def make_shard_module_text(length: int) -> str:
     signals = "\n".join(f"    logic [7:0] s{i};" for i in range(length))
@@ -123,6 +131,47 @@ def main() -> int:
         expect('metadata.graph_symbol = "SimTop";' in source_text, "missing graph symbol metadata")
         expect('metadata.scratchpad_namespace = "gsim.SimTop";' in source_text, "missing scratchpad namespace metadata")
 
+        reset_named_src_dir = ARTIFACT_ROOT / "reset_named_src"
+        reset_named_out_dir = ARTIFACT_ROOT / "reset_named_out"
+        reset_named_src_dir.mkdir(parents=True, exist_ok=True)
+        reset_named_out_dir.mkdir(parents=True, exist_ok=True)
+        reset_named_sv_path = reset_named_src_dir / "SimTop.sv"
+        reset_named_filelist_path = reset_named_src_dir / "fixture.f"
+        reset_named_read_args_path = reset_named_src_dir / "read_args.txt"
+        reset_named_out_base = reset_named_out_dir / "xs_fixture_reset_named"
+
+        reset_named_sv_path.write_text(RESET_NAMED_MODULE_TEXT, encoding="utf-8")
+        reset_named_filelist_path.write_text(f"{reset_named_sv_path}\n", encoding="utf-8")
+        reset_named_read_args_path.write_text("\n", encoding="utf-8")
+
+        reset_named_result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                str(reset_named_filelist_path),
+                "SimTop",
+                str(reset_named_out_base),
+                str(reset_named_read_args_path),
+                "info",
+            ],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            check=False,
+        )
+        expect(
+            reset_named_result.returncode == 0,
+            f"script reset-named smoke failed: {reset_named_result.stderr.strip() or reset_named_result.stdout.strip()}",
+        )
+        reset_named_header_text = reset_named_out_base.with_suffix(".hpp").read_text(encoding="utf-8")
+        expect(reset_named_header_text.count("void set_reset(") == 1, "reset-named model should expose exactly one set_reset overload")
+        expect(
+            "void set_reset(unsigned reset) { input_reset_ = static_cast<std::uint8_t>(reset); }" in reset_named_header_text,
+            "reset-named model should route set_reset(unsigned) into the emitted reset input storage",
+        )
+
         shard_src_dir = ARTIFACT_ROOT / "shard_src"
         shard_out_dir = ARTIFACT_ROOT / "shard_out"
         shard_src_dir.mkdir(parents=True, exist_ok=True)
@@ -166,6 +215,57 @@ def main() -> int:
         for shard_path in shard_paths:
             expect(shard_path.stat().st_size <= 256,
                    f"script-forwarded shard cap should bound emitted shard size: {shard_path}")
+
+        runtime_src_dir = ARTIFACT_ROOT / "runtime_only_src"
+        runtime_out_dir = ARTIFACT_ROOT / "runtime_only_out"
+        runtime_src_dir.mkdir(parents=True, exist_ok=True)
+        runtime_out_dir.mkdir(parents=True, exist_ok=True)
+        runtime_sv_path = runtime_src_dir / "SimTop.sv"
+        runtime_filelist_path = runtime_src_dir / "fixture.f"
+        runtime_read_args_path = runtime_src_dir / "read_args.txt"
+        runtime_out_base = runtime_out_dir / "xs_fixture_gsim_runtime_only"
+        runtime_sv_path.write_text(MODULE_TEXT, encoding="utf-8")
+        runtime_filelist_path.write_text(f"{runtime_sv_path}\n", encoding="utf-8")
+        runtime_read_args_path.write_text("\n", encoding="utf-8")
+
+        runtime_env = dict(env)
+        runtime_env["WOLVRIX_XS_GSIM_EMIT_METADATA"] = "0"
+        runtime_result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                str(runtime_filelist_path),
+                "SimTop",
+                str(runtime_out_base),
+                str(runtime_read_args_path),
+                "info",
+            ],
+            cwd=str(REPO_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=runtime_env,
+            check=False,
+        )
+        expect(runtime_result.returncode == 0,
+               f"script runtime-only metadata suppression failed: {runtime_result.stderr.strip() or runtime_result.stdout.strip()}")
+        runtime_header_text = runtime_out_base.with_suffix(".hpp").read_text(encoding="utf-8")
+        runtime_source_text = runtime_out_base.with_suffix(".cpp").read_text(encoding="utf-8")
+        runtime_manifest_lines = [
+            line.strip()
+            for line in runtime_out_base.with_suffix(".manifest").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        expect("GsimMetadata_" not in runtime_header_text,
+               "runtime-only XiangShan script mode should omit metadata structs from the public header")
+        expect("make_SimTop_metadata" not in runtime_source_text,
+               "runtime-only XiangShan script mode should omit metadata constructors from emitted source")
+        expect("validate_SimTop_metadata" not in runtime_source_text,
+               "runtime-only XiangShan script mode should omit metadata validators from emitted source")
+        expect(
+            all("__meta_" not in line for line in runtime_manifest_lines),
+            "runtime-only XiangShan script mode should not emit metadata shard sources",
+        )
     except Exception as ex:
         return fail(str(ex))
     return 0

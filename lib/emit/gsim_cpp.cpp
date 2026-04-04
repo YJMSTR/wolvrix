@@ -84,6 +84,8 @@ namespace wolvrix::lib::emit
             std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
             // Storage declarations for registers/latches
             std::vector<std::string> storageDecls;
+            // Explicit constructor-time allocation / setup statements.
+            std::vector<std::string> ctorStmts;
             // Explicit reset statements for stateful storage
             std::vector<std::string> resetStmts;
             // Sequential update statements (posedge_clock, combinational latch)
@@ -343,6 +345,30 @@ namespace wolvrix::lib::emit
                 return std::nullopt;
             }
             return it->second;
+        }
+
+        bool boolAttrValue(const EmitOptions &options, std::string_view key, bool defaultValue)
+        {
+            const auto value = attrValue(options, key);
+            if (!value)
+            {
+                return defaultValue;
+            }
+
+            std::string lowered = *value;
+            std::transform(lowered.begin(),
+                           lowered.end(),
+                           lowered.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+            if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off")
+            {
+                return false;
+            }
+            if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on")
+            {
+                return true;
+            }
+            return defaultValue;
         }
 
         std::string sanitizeIdentifier(std::string_view text)
@@ -723,7 +749,11 @@ namespace wolvrix::lib::emit
                     break;
                 }
                 case OperationKind::kDiv: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " / " + getOperandExpr(1) + ")");
+                    const auto resultType = getCppTypeForWidth(graph.valueWidth(op.results()[0]));
+                    const auto zero = resultType + "(0)";
+                    setResultExpr(0,
+                                  "((" + getOperandExpr(1) + ") == " + zero + " ? " + zero + " : (" +
+                                  getOperandExpr(0) + " / " + getOperandExpr(1) + "))");
                     break;
                 }
                 case OperationKind::kAnd: {
@@ -817,7 +847,11 @@ namespace wolvrix::lib::emit
                 }
                 // Arithmetic
                 case OperationKind::kMod: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " % " + getOperandExpr(1) + ")");
+                    const auto resultType = getCppTypeForWidth(graph.valueWidth(op.results()[0]));
+                    const auto zero = resultType + "(0)";
+                    setResultExpr(0,
+                                  "((" + getOperandExpr(1) + ") == " + zero + " ? " + zero + " : (" +
+                                  getOperandExpr(0) + " % " + getOperandExpr(1) + "))");
                     break;
                 }
                 // Shift operations
@@ -1436,6 +1470,7 @@ namespace wolvrix::lib::emit
         void collectRegisters(const wolvrix::lib::grh::Graph& graph, CodegenState& state)
         {
             std::map<std::string, int32_t> storageWidths;
+            std::map<std::string, std::string> storageInitExprs;
             std::vector<std::string> storageOrder;
 
             auto noteStorage = [&](const std::string& storageName, int32_t width) {
@@ -1449,6 +1484,19 @@ namespace wolvrix::lib::emit
                 {
                     it->second = clampedWidth;
                 }
+            };
+            auto noteStorageInit = [&](const std::string& storageName, const std::string& initValue) {
+                if (initValue.empty())
+                {
+                    return;
+                }
+
+                std::string initExpr = "0";
+                if (!initValue.empty() && initValue.front() != '$')
+                {
+                    initExpr = convertVerilogConstant(initValue);
+                }
+                storageInitExprs.emplace(storageName, std::move(initExpr));
             };
 
             for (const auto& opId : graph.operations()) {
@@ -1464,6 +1512,13 @@ namespace wolvrix::lib::emit
                         width = val.width();
                     }
                     noteStorage(regName, width);
+                    if (auto initValueAttr = op.attr("initValue"))
+                    {
+                        if (auto* initValue = std::get_if<std::string>(&*initValueAttr))
+                        {
+                            noteStorageInit(regName, *initValue);
+                        }
+                    }
                     if (!op.results().empty()) {
                         state.valueExprs[op.results()[0]] = regName;
                     }
@@ -1529,8 +1584,10 @@ namespace wolvrix::lib::emit
                 {
                     continue;
                 }
-                state.storageDecls.push_back(getCppTypeForWidth(widthIt->second) + " " + storageName + " = 0;");
-                state.resetStmts.push_back("        " + storageName + " = 0;");
+                const auto initExprIt = storageInitExprs.find(storageName);
+                const std::string initExpr = initExprIt == storageInitExprs.end() ? "0" : initExprIt->second;
+                state.storageDecls.push_back(getCppTypeForWidth(widthIt->second) + " " + storageName + " = " + initExpr + ";");
+                state.resetStmts.push_back("        " + storageName + " = " + initExpr + ";");
             }
         }
 
@@ -1579,9 +1636,9 @@ namespace wolvrix::lib::emit
                 state.memoryRows[sym] = rows;
                 if (declaredStorage.insert(memName).second) {
                     const std::string type = getCppTypeForWidth(static_cast<int32_t>(width));
-                    state.storageDecls.push_back(
-                        "std::vector<" + type + "> " + memName + " = std::vector<" + type + ">(" +
-                        std::to_string(rows) + ", 0);");
+                    state.storageDecls.push_back("std::vector<" + type + "> " + memName + ";");
+                    state.ctorStmts.push_back(
+                        "    " + memName + ".resize(" + std::to_string(rows) + ");");
                     state.resetStmts.push_back(
                         "        std::fill(" + memName + ".begin(), " + memName + ".end(), 0);");
                 }
@@ -1928,152 +1985,504 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             }
         }
 
-        template <typename Sink>
-        void emitMetadataAssignments(Sink &&sink, const GsimScratchpadMetadata &metadata)
+        // Keep metadata statements materially smaller than shard budgets. Very long
+        // insert(...) expressions compile poorly on large XiangShan metadata shards.
+        constexpr std::size_t kDefaultMetadataStatementTargetBytes = 4u * 1024u;
+        constexpr std::size_t kMetadataStatementTerminatorBytes = 1;
+
+        std::size_t chooseMetadataStatementTargetBytes(std::size_t shardMaxBytes)
         {
-            sink("    metadata.roots = {" + joinInts(metadata.roots, ", ") + "};\n");
-            sink("    metadata.topo_order = {" + joinInts(metadata.topoOrder, ", ") + "};\n");
-
-            std::ostringstream groupNames;
-            groupNames << "    metadata.event_group_names = {";
-            for (std::size_t i = 0; i < metadata.eventGroupNames.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    groupNames << ", ";
-                }
-                groupNames << '"' << metadata.eventGroupNames[i] << '"';
-            }
-            groupNames << "};\n";
-            sink(groupNames.str());
-
-            sink("    metadata.event_groups = {\n");
-            for (const auto &[name, ids] : metadata.eventGroups)
-            {
-                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
-            }
-            sink("    };\n");
-
-            std::ostringstream activityOrder;
-            activityOrder << "    metadata.schedule_activity_order = {";
-            for (std::size_t i = 0; i < metadata.scheduleActivityOrder.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    activityOrder << ", ";
-                }
-                activityOrder << '"' << metadata.scheduleActivityOrder[i] << '"';
-            }
-            activityOrder << "};\n";
-            sink(activityOrder.str());
-
-            sink("    metadata.schedule_activity_members = {\n");
-            for (const auto &[name, ids] : metadata.scheduleActivityMembers)
-            {
-                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
-            }
-            sink("    };\n");
-
-            sink("    metadata.schedule_activity_classes = {\n");
-            for (const auto &[name, activityClass] : metadata.scheduleActivityClasses)
-            {
-                sink("        {\"" + name + "\", \"" + activityClass + "\"},\n");
-            }
-            sink("    };\n");
-
-            std::ostringstream nodeNames;
-            nodeNames << "    metadata.hypergraph_node_names = {";
-            for (std::size_t i = 0; i < metadata.hypergraphNodeNames.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    nodeNames << ", ";
-                }
-                nodeNames << '"' << metadata.hypergraphNodeNames[i] << '"';
-            }
-            nodeNames << "};\n";
-            sink(nodeNames.str());
-
-            sink("    metadata.hypergraph_node_members = {\n");
-            for (const auto &[name, ids] : metadata.hypergraphNodeMembers)
-            {
-                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
-            }
-            sink("    };\n");
-
-            std::ostringstream edgeNames;
-            edgeNames << "    metadata.hypergraph_edge_names = {";
-            for (std::size_t i = 0; i < metadata.hypergraphEdgeNames.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    edgeNames << ", ";
-                }
-                edgeNames << '"' << metadata.hypergraphEdgeNames[i] << '"';
-            }
-            edgeNames << "};\n";
-            sink(edgeNames.str());
-
-            sink("    metadata.hypergraph_edge_sources = {\n");
-            for (const auto &[name, sourceName] : metadata.hypergraphEdgeSources)
-            {
-                sink("        {\"" + name + "\", \"" + sourceName + "\"},\n");
-            }
-            sink("    };\n");
-
-            sink("    metadata.hypergraph_edge_targets = {\n");
-            for (const auto &[name, targetName] : metadata.hypergraphEdgeTargets)
-            {
-                sink("        {\"" + name + "\", \"" + targetName + "\"},\n");
-            }
-            sink("    };\n");
-
-            sink("    metadata.hypergraph_edge_sinks = {\n");
-            for (const auto &[name, ids] : metadata.hypergraphEdgeSinks)
-            {
-                sink("        {\"" + name + "\", {" + joinInts(ids, ", ") + "} },\n");
-            }
-            sink("    };\n");
-
-            sink("    metadata.classifications = {\n");
-            for (const auto &[id, className] : metadata.classifications)
-            {
-                sink("        {" + std::to_string(id) + ", \"" + className + "\"},\n");
-            }
-            sink("    };\n");
-
-            sink("    metadata.predecessors = {\n");
-            for (const auto &[id, ids] : metadata.predecessors)
-            {
-                sink("        {" + std::to_string(id) + ", {" + joinInts(ids, ", ") + "} },\n");
-            }
-            sink("    };\n");
-
-            sink("    metadata.successors = {\n");
-            for (const auto &[id, ids] : metadata.successors)
-            {
-                sink("        {" + std::to_string(id) + ", {" + joinInts(ids, ", ") + "} },\n");
-            }
-            sink("    };\n");
-
-            std::ostringstream descriptors;
-            descriptors << "    metadata.op_descriptors = {";
-            for (std::size_t i = 0; i < metadata.opDescriptors.size(); ++i)
-            {
-                if (i != 0)
-                {
-                    descriptors << ", ";
-                }
-                descriptors << '"' << metadata.opDescriptors[i] << '"';
-            }
-            descriptors << "};\n";
-            sink(descriptors.str());
+            return std::min(shardMaxBytes, kDefaultMetadataStatementTargetBytes);
         }
 
-        std::size_t estimateMetadataAssignmentBytes(const GsimScratchpadMetadata &metadata)
+        void appendMetadataStatement(std::vector<std::string> &statements, std::string statement)
+        {
+            if (statement.empty())
+            {
+                return;
+            }
+            if (statement.back() != '\n')
+            {
+                statement.push_back('\n');
+            }
+            statements.push_back(std::move(statement));
+        }
+
+        template <typename Iter, typename RenderItem>
+        void appendChunkedMetadataInsertStatements(std::vector<std::string> &statements,
+                                                  std::string_view prefix,
+                                                  std::string_view suffix,
+                                                  std::size_t targetBytes,
+                                                  Iter begin,
+                                                  Iter end,
+                                                  RenderItem &&renderItem)
+        {
+            if (begin == end)
+            {
+                return;
+            }
+
+            std::string current(prefix);
+            bool hasItems = false;
+            for (auto it = begin; it != end; ++it)
+            {
+                std::string item = renderItem(*it);
+                const std::size_t separatorBytes = hasItems ? 2 : 0;
+                if (hasItems &&
+                    current.size() + separatorBytes + item.size() + suffix.size() + kMetadataStatementTerminatorBytes > targetBytes)
+                {
+                    current.append(suffix);
+                    appendMetadataStatement(statements, std::move(current));
+                    current = std::string(prefix);
+                    hasItems = false;
+                }
+
+                if (hasItems)
+                {
+                    current.append(", ");
+                }
+                current.append(item);
+                hasItems = true;
+            }
+
+            current.append(suffix);
+            appendMetadataStatement(statements, std::move(current));
+        }
+
+        template <typename Iter, typename RenderItem>
+        void appendChunkedMetadataArrayLoopStatements(std::vector<std::string> &statements,
+                                                     std::string_view blockPrefix,
+                                                     std::string_view blockSuffix,
+                                                     std::size_t targetBytes,
+                                                     Iter begin,
+                                                     Iter end,
+                                                     RenderItem &&renderItem)
+        {
+            if (begin == end)
+            {
+                return;
+            }
+
+            std::string current(blockPrefix);
+            bool hasItems = false;
+            for (auto it = begin; it != end; ++it)
+            {
+                std::string item = renderItem(*it);
+                const std::size_t separatorBytes = hasItems ? 2 : 0;
+                if (hasItems &&
+                    current.size() + separatorBytes + item.size() + blockSuffix.size() +
+                            kMetadataStatementTerminatorBytes >
+                        targetBytes)
+                {
+                    current.append(blockSuffix);
+                    appendMetadataStatement(statements, std::move(current));
+                    current = std::string(blockPrefix);
+                    hasItems = false;
+                }
+
+                if (hasItems)
+                {
+                    current.append(", ");
+                }
+                current.append(item);
+                hasItems = true;
+            }
+
+            current.append(blockSuffix);
+            appendMetadataStatement(statements, std::move(current));
+        }
+
+        void emitIntVectorMetadataStatements(std::vector<std::string> &statements,
+                                            std::string_view target,
+                                            const std::vector<int64_t> &items,
+                                            std::size_t targetBytes)
+        {
+            const std::string targetExpr(target);
+            appendMetadataStatement(statements, "    " + targetExpr + ".clear();");
+            appendChunkedMetadataArrayLoopStatements(
+                statements,
+                "    {\n"
+                "        static constexpr std::int64_t values[] = {",
+                "};\n"
+                "        for (const auto value : values) {\n"
+                "            " +
+                    targetExpr + ".push_back(value);\n"
+                "        }\n"
+                "    }",
+                targetBytes,
+                items.begin(),
+                items.end(),
+                [&](int64_t item) { return std::to_string(item); });
+        }
+
+        void emitStringVectorMetadataStatements(std::vector<std::string> &statements,
+                                               std::string_view target,
+                                               const std::vector<std::string> &items,
+                                               std::size_t targetBytes)
+        {
+            const std::string targetExpr(target);
+            appendMetadataStatement(statements, "    " + targetExpr + ".clear();");
+
+            const std::string insertPrefix = "    " + targetExpr + ".insert(" + targetExpr + ".end(), {";
+            const std::string insertSuffix = "});";
+
+            auto appendStringChunks = [&](std::string_view value, std::string_view appendTarget) {
+                const std::string appendPrefix = "    " + std::string(appendTarget) + " += ";
+                const std::string appendSuffix = ";";
+                std::string chunk;
+                auto flushChunk = [&]() {
+                    if (chunk.empty())
+                    {
+                        return;
+                    }
+                    appendMetadataStatement(statements, appendPrefix + cppStringLiteral(chunk) + appendSuffix);
+                    chunk.clear();
+                };
+
+                for (char ch : value)
+                {
+                    std::string candidate = chunk;
+                    candidate.push_back(ch);
+                    if (!chunk.empty() &&
+                        appendPrefix.size() + cppStringLiteral(candidate).size() + appendSuffix.size() +
+                            kMetadataStatementTerminatorBytes > targetBytes)
+                    {
+                        flushChunk();
+                    }
+                    chunk.push_back(ch);
+                }
+                flushChunk();
+            };
+
+            std::string current(insertPrefix);
+            bool hasItems = false;
+            auto flushInsert = [&]() {
+                if (!hasItems)
+                {
+                    return;
+                }
+                current.append(insertSuffix);
+                appendMetadataStatement(statements, std::move(current));
+                current = insertPrefix;
+                hasItems = false;
+            };
+
+            for (const auto &item : items)
+            {
+                const std::string rendered = cppStringLiteral(item);
+                if (insertPrefix.size() + rendered.size() + insertSuffix.size() + kMetadataStatementTerminatorBytes > targetBytes)
+                {
+                    flushInsert();
+                    appendMetadataStatement(statements, "    " + targetExpr + ".emplace_back();");
+                    appendStringChunks(item, targetExpr + ".back()");
+                    continue;
+                }
+
+                if (hasItems &&
+                    current.size() + 2 + rendered.size() + insertSuffix.size() + kMetadataStatementTerminatorBytes > targetBytes)
+                {
+                    flushInsert();
+                }
+
+                if (hasItems)
+                {
+                    current.append(", ");
+                }
+                current.append(rendered);
+                hasItems = true;
+            }
+
+            flushInsert();
+        }
+
+        template <typename Entries, typename RenderKey>
+        void emitVectorMapMetadataStatements(std::vector<std::string> &statements,
+                                            std::string_view target,
+                                            const Entries &entries,
+                                            std::size_t targetBytes,
+                                            RenderKey &&renderKey)
+        {
+            const std::string targetExpr(target);
+            appendMetadataStatement(statements, "    " + targetExpr + ".clear();");
+            for (const auto &[key, ids] : entries)
+            {
+                const std::string keyExpr = renderKey(key);
+                const std::string valueTarget = targetExpr + "[" + keyExpr + "]";
+                emitIntVectorMetadataStatements(statements, valueTarget, ids, targetBytes);
+            }
+        }
+
+        template <typename Entries, typename RenderEntry>
+        void emitMapInsertMetadataStatements(std::vector<std::string> &statements,
+                                            std::string_view target,
+                                            const Entries &entries,
+                                            std::size_t targetBytes,
+                                            RenderEntry &&renderEntry)
+        {
+            const std::string targetExpr(target);
+            appendMetadataStatement(statements, "    " + targetExpr + ".clear();");
+            appendChunkedMetadataInsertStatements(
+                statements,
+                "    " + targetExpr + ".insert({",
+                "});",
+                targetBytes,
+                entries.begin(),
+                entries.end(),
+                [&](const auto &entry) { return renderEntry(entry); });
+        }
+
+        template <typename Entries, typename RenderKey>
+        void emitStringValueMapMetadataStatements(std::vector<std::string> &statements,
+                                                 std::string_view target,
+                                                 const Entries &entries,
+                                                 std::size_t targetBytes,
+                                                 RenderKey &&renderKey)
+        {
+            const std::string targetExpr(target);
+            appendMetadataStatement(statements, "    " + targetExpr + ".clear();");
+
+            const std::string insertPrefix = "    " + targetExpr + ".insert({";
+            const std::string insertSuffix = "});";
+
+            auto appendStringChunks = [&](std::string_view value, std::string_view appendTarget) {
+                const std::string appendPrefix = "    " + std::string(appendTarget) + " += ";
+                const std::string appendSuffix = ";";
+                std::string chunk;
+                auto flushChunk = [&]() {
+                    if (chunk.empty())
+                    {
+                        return;
+                    }
+                    appendMetadataStatement(statements, appendPrefix + cppStringLiteral(chunk) + appendSuffix);
+                    chunk.clear();
+                };
+
+                for (char ch : value)
+                {
+                    std::string candidate = chunk;
+                    candidate.push_back(ch);
+                    if (!chunk.empty() &&
+                        appendPrefix.size() + cppStringLiteral(candidate).size() + appendSuffix.size() +
+                            kMetadataStatementTerminatorBytes > targetBytes)
+                    {
+                        flushChunk();
+                    }
+                    chunk.push_back(ch);
+                }
+                flushChunk();
+            };
+
+            std::string current(insertPrefix);
+            bool hasItems = false;
+            auto flushInsert = [&]() {
+                if (!hasItems)
+                {
+                    return;
+                }
+                current.append(insertSuffix);
+                appendMetadataStatement(statements, std::move(current));
+                current = insertPrefix;
+                hasItems = false;
+            };
+
+            for (const auto &[key, value] : entries)
+            {
+                const std::string keyExpr = renderKey(key);
+                const std::string rendered = "{" + keyExpr + ", " + cppStringLiteral(value) + "}";
+                if (insertPrefix.size() + rendered.size() + insertSuffix.size() + kMetadataStatementTerminatorBytes > targetBytes)
+                {
+                    flushInsert();
+                    const std::string valueTarget = targetExpr + "[" + keyExpr + "]";
+                    appendMetadataStatement(statements, "    " + valueTarget + ".clear();");
+                    appendStringChunks(value, valueTarget);
+                    continue;
+                }
+
+                if (hasItems &&
+                    current.size() + 2 + rendered.size() + insertSuffix.size() + kMetadataStatementTerminatorBytes > targetBytes)
+                {
+                    flushInsert();
+                }
+
+                if (hasItems)
+                {
+                    current.append(", ");
+                }
+                current.append(rendered);
+                hasItems = true;
+            }
+
+            flushInsert();
+        }
+
+        void emitGroupedIntKeyStringValueMetadataStatements(std::vector<std::string> &statements,
+                                                            std::string_view target,
+                                                            const std::map<int64_t, std::string> &entries,
+                                                            std::size_t targetBytes,
+                                                            std::string_view groupNamePrefix)
+        {
+            const std::string targetExpr(target);
+            appendMetadataStatement(statements, "    " + targetExpr + ".clear();");
+
+            std::map<std::string, std::vector<int64_t>> idsByValue;
+            for (const auto &[key, value] : entries)
+            {
+                idsByValue[value].push_back(key);
+            }
+
+            std::size_t groupIndex = 0;
+            for (const auto &[value, ids] : idsByValue)
+            {
+                const std::string valueExpr = cppStringLiteral(value);
+                const std::string arrayName = sanitizeIdentifier(std::string(groupNamePrefix)) + "_" + std::to_string(groupIndex++);
+                const std::string blockPrefix =
+                    "    {\n"
+                    "        static constexpr std::int64_t " +
+                    arrayName + "[] = {";
+                const std::string blockSuffix =
+                    "};\n"
+                    "        for (const auto id : " +
+                    arrayName + ") {\n"
+                    "            " +
+                    targetExpr + ".emplace(id, " + valueExpr + ");\n"
+                    "        }\n"
+                    "    }";
+
+                std::string current(blockPrefix);
+                bool hasItems = false;
+                auto flushBlock = [&]() {
+                    if (!hasItems)
+                    {
+                        return;
+                    }
+                    current.append(blockSuffix);
+                    appendMetadataStatement(statements, current);
+                    current = blockPrefix;
+                    hasItems = false;
+                };
+
+                for (const auto id : ids)
+                {
+                    const std::string idExpr = std::to_string(id);
+                    if (blockPrefix.size() + idExpr.size() + blockSuffix.size() + kMetadataStatementTerminatorBytes > targetBytes)
+                    {
+                        flushBlock();
+                        appendMetadataStatement(statements, "    " + targetExpr + ".emplace(" + idExpr + ", " + valueExpr + ");");
+                        continue;
+                    }
+
+                    if (hasItems &&
+                        current.size() + 2 + idExpr.size() + blockSuffix.size() + kMetadataStatementTerminatorBytes >
+                            targetBytes)
+                    {
+                        flushBlock();
+                    }
+
+                    if (hasItems)
+                    {
+                        current.append(", ");
+                    }
+                    current.append(idExpr);
+                    hasItems = true;
+                }
+
+                flushBlock();
+            }
+        }
+
+        std::vector<std::string> collectMetadataStatements(const GsimScratchpadMetadata &metadata,
+                                                           std::size_t targetBytes)
+        {
+            std::vector<std::string> statements;
+            emitIntVectorMetadataStatements(statements, "metadata.roots", metadata.roots, targetBytes);
+            emitIntVectorMetadataStatements(statements, "metadata.topo_order", metadata.topoOrder, targetBytes);
+            emitStringVectorMetadataStatements(statements, "metadata.event_group_names", metadata.eventGroupNames, targetBytes);
+            emitVectorMapMetadataStatements(
+                statements,
+                "metadata.event_groups",
+                metadata.eventGroups,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitStringVectorMetadataStatements(
+                statements,
+                "metadata.schedule_activity_order",
+                metadata.scheduleActivityOrder,
+                targetBytes);
+            emitVectorMapMetadataStatements(
+                statements,
+                "metadata.schedule_activity_members",
+                metadata.scheduleActivityMembers,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitStringValueMapMetadataStatements(
+                statements,
+                "metadata.schedule_activity_classes",
+                metadata.scheduleActivityClasses,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitStringVectorMetadataStatements(
+                statements,
+                "metadata.hypergraph_node_names",
+                metadata.hypergraphNodeNames,
+                targetBytes);
+            emitVectorMapMetadataStatements(
+                statements,
+                "metadata.hypergraph_node_members",
+                metadata.hypergraphNodeMembers,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitStringVectorMetadataStatements(
+                statements,
+                "metadata.hypergraph_edge_names",
+                metadata.hypergraphEdgeNames,
+                targetBytes);
+            emitStringValueMapMetadataStatements(
+                statements,
+                "metadata.hypergraph_edge_sources",
+                metadata.hypergraphEdgeSources,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitStringValueMapMetadataStatements(
+                statements,
+                "metadata.hypergraph_edge_targets",
+                metadata.hypergraphEdgeTargets,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitVectorMapMetadataStatements(
+                statements,
+                "metadata.hypergraph_edge_sinks",
+                metadata.hypergraphEdgeSinks,
+                targetBytes,
+                [](const std::string &key) { return cppStringLiteral(key); });
+            emitGroupedIntKeyStringValueMetadataStatements(
+                statements,
+                "metadata.classifications",
+                metadata.classifications,
+                targetBytes,
+                "classification_ids");
+            emitVectorMapMetadataStatements(
+                statements,
+                "metadata.predecessors",
+                metadata.predecessors,
+                targetBytes,
+                [](int64_t key) { return std::to_string(key); });
+            emitVectorMapMetadataStatements(
+                statements,
+                "metadata.successors",
+                metadata.successors,
+                targetBytes,
+                [](int64_t key) { return std::to_string(key); });
+            emitStringVectorMetadataStatements(statements, "metadata.op_descriptors", metadata.opDescriptors, targetBytes);
+            return statements;
+        }
+
+        std::size_t estimateMetadataStatementsBytes(const std::vector<std::string> &statements)
         {
             std::size_t total = 0;
-            emitMetadataAssignments([&](const std::string &line) { total += line.size(); }, metadata);
+            for (const auto &statement : statements)
+            {
+                total += statement.size();
+            }
             return total;
         }
 
@@ -2089,9 +2498,9 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             std::string methodName;
         };
 
-        std::vector<MetadataShardPlan> planMetadataShards(const std::string &baseName,
-                                                          const GsimScratchpadMetadata &metadata,
-                                                          std::size_t maxBytes)
+        std::optional<std::vector<MetadataShardPlan>> planMetadataShards(const std::string &baseName,
+                                                                         const std::vector<std::string> &statements,
+                                                                         std::size_t maxBytes)
         {
             std::vector<MetadataShardPlan> plans;
             std::size_t currentBytes = 0;
@@ -2108,17 +2517,22 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 currentBytes = 0;
             };
 
-            emitMetadataAssignments([&](const std::string &line) {
+            for (const auto &statement : statements)
+            {
+                if (statement.size() > maxBytes)
+                {
+                    return std::nullopt;
+                }
                 if (plans.empty())
                 {
                     openNextPlan();
                 }
-                if (currentBytes != 0 && currentBytes + line.size() > maxBytes)
+                if (currentBytes != 0 && currentBytes + statement.size() > maxBytes)
                 {
                     openNextPlan();
                 }
-                currentBytes += line.size();
-            }, metadata);
+                currentBytes += statement.size();
+            }
             return plans;
         }
 
@@ -2145,19 +2559,52 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             return sizeof("}\n") - 1;
         }
 
+        std::size_t dpiForwardDeclBlockBytes(const CodegenState &state)
+        {
+            if (state.dpiForwardDecls.empty())
+            {
+                return 0;
+            }
+
+            std::size_t total = sizeof("extern \"C\" {\n") - 1 + sizeof("}\n\n") - 1;
+            for (const auto &decl : state.dpiForwardDecls)
+            {
+                total += decl.size() + 1;
+            }
+            return total;
+        }
+
+        void writeLocalDpiForwardDecls(std::ostream &os, const CodegenState &state)
+        {
+            if (state.dpiForwardDecls.empty())
+            {
+                return;
+            }
+
+            os << "extern \"C\" {\n";
+            for (const auto &decl : state.dpiForwardDecls)
+            {
+                os << decl << "\n";
+            }
+            os << "}\n\n";
+        }
+
         std::size_t behaviorShardPreambleBytes(std::string_view headerFilename,
+                                               const CodegenState &state,
                                                std::string_view methodName)
         {
             return std::string("#include \"").size() + headerFilename.size() +
                    std::string("\"\n\n").size() +
+                   dpiForwardDeclBlockBytes(state) +
                    std::string("void SSimTop::").size() + methodName.size() +
                    std::string("() {\n").size();
         }
 
         std::size_t behaviorShardWrapperBytes(std::string_view headerFilename,
+                                              const CodegenState &state,
                                               std::string_view methodName)
         {
-            return behaviorShardPreambleBytes(headerFilename, methodName) + behaviorShardEpilogueBytes();
+            return behaviorShardPreambleBytes(headerFilename, state, methodName) + behaviorShardEpilogueBytes();
         }
 
         std::size_t estimateBehaviorStatementBytes(const std::vector<std::string> &statements)
@@ -2172,6 +2619,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
 
         std::optional<std::vector<BehaviorShardPlan>> planBehaviorShards(const std::string &baseName,
                                                                          std::string_view headerFilename,
+                                                                         const CodegenState &state,
                                                                          const std::vector<std::string> &statements,
                                                                          std::size_t maxBytes)
         {
@@ -2187,7 +2635,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                     baseName + "__step_" + suffix + ".cpp",
                     "run_step_shard_" + suffix,
                 });
-                currentBytes = behaviorShardWrapperBytes(headerFilename, plans.back().methodName);
+                currentBytes = behaviorShardWrapperBytes(headerFilename, state, plans.back().methodName);
                 return currentBytes <= maxBytes;
             };
 
@@ -2578,10 +3026,16 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
                          const CodegenState& state,
-                         const std::vector<BehaviorShardPlan> &behaviorShardPlans)
+                         const std::vector<BehaviorShardPlan> &behaviorShardPlans,
+                         bool emitMetadata)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
+            auto resetPortIt = std::find_if(state.inputPorts.begin(), state.inputPorts.end(),
+                                            [](const auto &entry)
+                                            {
+                                                return sanitizeIdentifier(entry.first) == "reset";
+                                            });
             os << "#pragma once\n\n";
             os << "#include <algorithm>\n";
             os << "#include <array>\n";
@@ -2592,26 +3046,28 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "#include <string>\n";
             os << "#include <vector>\n\n";
             os << renderWideBitsSupport();
-            if (!state.dpiForwardDecls.empty())
-            {
-                os << "extern \"C\" {\n";
-                for (const auto &decl : state.dpiForwardDecls)
-                {
-                    os << decl << "\n";
-                }
-                os << "}\n\n";
-            }
             os << "class SSimTop {\n";
             os << "public:\n";
             os << "    SSimTop();\n";
             os << "    ~SSimTop() = default;\n\n";
-            os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
+            if (resetPortIt != state.inputPorts.end())
+            {
+                os << "    void set_reset(unsigned reset) { input_reset_ = static_cast<" << resetPortIt->second
+                   << ">(reset); }\n\n";
+            }
+            else
+            {
+                os << "    void set_reset(unsigned reset) { bootstrap_reset_pending_ = (reset != 0); }\n\n";
+            }
             os << "    void reset();\n\n";
             os << "    void step();\n\n";
 
             // Input port setters
             for (const auto& [name, type] : state.inputPorts) {
                 std::string methodName = "set_" + sanitizeIdentifier(name);
+                if (methodName == "set_reset") {
+                    continue;
+                }
                 os << "    void " << methodName << "(" << type << " value) { input_" << sanitizeIdentifier(name) << "_ = value; }\n";
             }
             if (!state.inputPorts.empty()) os << "\n";
@@ -2636,7 +3092,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "    void set_difftest__DOT__logCtrl__DOT__end(std::uint64_t end) { log_end_ = end; }\n\n";
 
             os << "private:\n";
-            os << "    bool reset_ = false;\n";
+            os << "    bool bootstrap_reset_pending_ = false;\n";
             for (const auto &plan : behaviorShardPlans) {
                 os << "    void " << plan.methodName << "();\n";
             }
@@ -2671,41 +3127,44 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "    unsigned perf_dump_ = 0;\n";
             os << "    std::uint64_t log_begin_ = 0;\n";
             os << "    std::uint64_t log_end_ = 0;\n";
-            os << "};\n\n";
-            os << "namespace wolvrix::gsim {\n\n";
-            os << "struct " << structName << " {\n";
-            os << "    std::string graph_symbol;\n";
-            os << "    std::string selection_path;\n";
-            os << "    std::string scratchpad_namespace;\n";
-            os << "    std::int64_t op_count = 0;\n";
-            os << "    std::int64_t graph_revision = 0;\n";
-            os << "    std::vector<std::int64_t> roots;\n";
-            os << "    std::vector<std::int64_t> topo_order;\n";
-            os << "    std::vector<std::string> event_group_names;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> event_groups;\n";
-            os << "    std::vector<std::string> schedule_activity_order;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> schedule_activity_members;\n";
-            os << "    std::map<std::string, std::string> schedule_activity_classes;\n";
-            os << "    std::vector<std::string> hypergraph_node_names;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_node_members;\n";
-            os << "    std::vector<std::string> hypergraph_edge_names;\n";
-            os << "    std::map<std::string, std::string> hypergraph_edge_sources;\n";
-            os << "    std::map<std::string, std::string> hypergraph_edge_targets;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_edge_sinks;\n";
-            os << "    std::map<std::int64_t, std::string> classifications;\n";
-            os << "    std::map<std::int64_t, std::vector<std::int64_t>> predecessors;\n";
-            os << "    std::map<std::int64_t, std::vector<std::int64_t>> successors;\n";
-            os << "    std::vector<std::string> op_descriptors;\n";
-            os << "    std::string schedule_kind;\n";
-            os << "    std::int64_t schedule_version = 0;\n";
-            os << "    std::string schedule_contract;\n";
-            os << "    std::string hypergraph_kind;\n";
-            os << "    std::int64_t hypergraph_version = 0;\n";
-            os << "    std::string hypergraph_contract;\n";
-            os << "};\n\n";
-            os << structName << " make_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata();\n";
-            os << "bool validate_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata(const " << structName << "& metadata);\n\n";
-            os << "} // namespace wolvrix::gsim\n";
+            os << "};\n";
+            if (emitMetadata)
+            {
+                os << "\nnamespace wolvrix::gsim {\n\n";
+                os << "struct " << structName << " {\n";
+                os << "    std::string graph_symbol;\n";
+                os << "    std::string selection_path;\n";
+                os << "    std::string scratchpad_namespace;\n";
+                os << "    std::int64_t op_count = 0;\n";
+                os << "    std::int64_t graph_revision = 0;\n";
+                os << "    std::vector<std::int64_t> roots;\n";
+                os << "    std::vector<std::int64_t> topo_order;\n";
+                os << "    std::vector<std::string> event_group_names;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> event_groups;\n";
+                os << "    std::vector<std::string> schedule_activity_order;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> schedule_activity_members;\n";
+                os << "    std::map<std::string, std::string> schedule_activity_classes;\n";
+                os << "    std::vector<std::string> hypergraph_node_names;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_node_members;\n";
+                os << "    std::vector<std::string> hypergraph_edge_names;\n";
+                os << "    std::map<std::string, std::string> hypergraph_edge_sources;\n";
+                os << "    std::map<std::string, std::string> hypergraph_edge_targets;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_edge_sinks;\n";
+                os << "    std::map<std::int64_t, std::string> classifications;\n";
+                os << "    std::map<std::int64_t, std::vector<std::int64_t>> predecessors;\n";
+                os << "    std::map<std::int64_t, std::vector<std::int64_t>> successors;\n";
+                os << "    std::vector<std::string> op_descriptors;\n";
+                os << "    std::string schedule_kind;\n";
+                os << "    std::int64_t schedule_version = 0;\n";
+                os << "    std::string schedule_contract;\n";
+                os << "    std::string hypergraph_kind;\n";
+                os << "    std::int64_t hypergraph_version = 0;\n";
+                os << "    std::string hypergraph_contract;\n";
+                os << "};\n\n";
+                os << structName << " make_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata();\n";
+                os << "bool validate_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata(const " << structName << "& metadata);\n\n";
+                os << "} // namespace wolvrix::gsim\n";
+            }
             (void)metadata;
         }
 
@@ -2719,6 +3178,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                          std::size_t behaviorShardMaxBytes,
                          const std::vector<BehaviorShardPlan> &behaviorShardPlans,
                          std::size_t metadataShardMaxBytes,
+                         bool emitMetadata,
                          std::vector<std::string> &managedSourceFiles,
                          std::vector<std::string> &artifactPaths,
                          EmitDiagnostics *diagnostics)
@@ -2729,16 +3189,43 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             const std::string validateName = "validate_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
             const auto manifestPath = outputDir / (std::string(baseName) + ".manifest");
             const auto previousManagedFiles = readManagedSourceManifest(manifestPath);
-            const auto metadataBytes = estimateMetadataAssignmentBytes(metadata);
+            std::vector<std::string> metadataStatements;
+            std::size_t metadataBytes = 0;
+            if (emitMetadata)
+            {
+                const auto metadataStatementTargetBytes = chooseMetadataStatementTargetBytes(metadataShardMaxBytes);
+                metadataStatements = collectMetadataStatements(metadata, metadataStatementTargetBytes);
+                metadataBytes = estimateMetadataStatementsBytes(metadataStatements);
+            }
             const auto stepStatements = collectStepStatements(state);
-            const bool shardMetadata = metadataBytes > metadataShardMaxBytes;
-            const auto shardPlans =
-                shardMetadata ? planMetadataShards(std::string(baseName), metadata, metadataShardMaxBytes) : std::vector<MetadataShardPlan>{};
+            std::vector<MetadataShardPlan> shardPlans;
+            if (emitMetadata)
+            {
+                const bool shardMetadata = metadataBytes > metadataShardMaxBytes;
+                const auto shardPlansResult =
+                    shardMetadata ? planMetadataShards(std::string(baseName), metadataStatements, metadataShardMaxBytes)
+                                  : std::optional<std::vector<MetadataShardPlan>>(std::vector<MetadataShardPlan>{});
+                if (!shardPlansResult)
+                {
+                    if (diagnostics != nullptr)
+                    {
+                        diagnostics->error("metadata_shard_max_bytes is too small to fit an emitted metadata statement",
+                                           std::to_string(metadataShardMaxBytes));
+                    }
+                    return false;
+                }
+                shardPlans = *shardPlansResult;
+            }
 
             os << "#include \"" << headerFilename << "\"\n\n";
+            writeLocalDpiForwardDecls(os, state);
             os << "#include <algorithm>\n";
             os << "#include <set>\n\n";
             os << "SSimTop::SSimTop() {\n";
+            for (const auto &stmt : state.ctorStmts)
+            {
+                os << stmt << "\n";
+            }
             for (const auto &group : state.persistentTempGroups)
             {
                 os << "    " << group.storageName << ".resize(" << group.count << ");\n";
@@ -2746,7 +3233,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "    reset();\n";
             os << "}\n\n";
             os << "void SSimTop::reset() {\n";
-            os << "    reset_ = true;\n";
+            os << "    bootstrap_reset_pending_ = true;\n";
             for (const auto &stmt : state.resetStmts)
             {
                 os << stmt << "\n";
@@ -2759,10 +3246,9 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "}\n\n";
             os << "void SSimTop::step() {\n";
             os << "    ++difftest_step_;\n";
-            os << "    if (reset_) {\n";
-            os << "        reset_ = false;\n";
+            os << "    if (bootstrap_reset_pending_) {\n";
+            os << "        bootstrap_reset_pending_ = false;\n";
             os << "        difftest_exit_ = 0;\n";
-            os << "        return;\n";
             os << "    }\n";
             if (behaviorShardPlans.empty())
             {
@@ -2780,93 +3266,99 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             }
             os << "    difftest_exit_ = 0;\n";
             os << "}\n\n";
-            os << "namespace wolvrix::gsim {\n\n";
-            os << "namespace {\n";
-            os << "template <typename T>\n";
-            os << "bool has_duplicate_values(const std::vector<T>& values) {\n";
-            os << "    return std::set<T>(values.begin(), values.end()).size() != values.size();\n";
-            os << "}\n";
-            os << "} // namespace\n\n";
-            for (const auto &plan : shardPlans)
+            if (emitMetadata)
             {
-                os << "void " << plan.functionName << "(" << structName << "& metadata);\n";
-            }
-            if (!shardPlans.empty())
-            {
-                os << "\n";
-            }
-            os << structName << " " << factoryName << "() {\n";
-            os << "    " << structName << " metadata;\n";
-            os << "    metadata.graph_symbol = \"" << target.scratchGraphSymbol << "\";\n";
-            os << "    metadata.selection_path = \"" << target.selectionPath << "\";\n";
-            os << "    metadata.scratchpad_namespace = \"" << target.namespacePath << "\";\n";
-            os << "    metadata.op_count = " << metadata.opCount << ";\n";
-            os << "    metadata.graph_revision = " << metadata.graphRevision << ";\n";
-            os << "    metadata.schedule_kind = \"" << metadata.scheduleKind << "\";\n";
-            os << "    metadata.schedule_version = " << metadata.scheduleVersion << ";\n";
-            os << "    metadata.schedule_contract = \"" << metadata.scheduleContract << "\";\n";
-            os << "    metadata.hypergraph_kind = \"" << metadata.hypergraphKind << "\";\n";
-            os << "    metadata.hypergraph_version = " << metadata.hypergraphVersion << ";\n";
-            os << "    metadata.hypergraph_contract = \"" << metadata.hypergraphContract << "\";\n";
-            if (shardPlans.empty())
-            {
-                emitMetadataAssignments([&](const std::string &line) { os << line; }, metadata);
-            }
-            else
-            {
+                os << "namespace wolvrix::gsim {\n\n";
+                os << "namespace {\n";
+                os << "template <typename T>\n";
+                os << "bool has_duplicate_values(const std::vector<T>& values) {\n";
+                os << "    return std::set<T>(values.begin(), values.end()).size() != values.size();\n";
+                os << "}\n";
+                os << "} // namespace\n\n";
                 for (const auto &plan : shardPlans)
                 {
-                    os << "    " << plan.functionName << "(metadata);\n";
+                    os << "void " << plan.functionName << "(" << structName << "& metadata);\n";
                 }
+                if (!shardPlans.empty())
+                {
+                    os << "\n";
+                }
+                os << structName << " " << factoryName << "() {\n";
+                os << "    " << structName << " metadata;\n";
+                os << "    metadata.graph_symbol = \"" << target.scratchGraphSymbol << "\";\n";
+                os << "    metadata.selection_path = \"" << target.selectionPath << "\";\n";
+                os << "    metadata.scratchpad_namespace = \"" << target.namespacePath << "\";\n";
+                os << "    metadata.op_count = " << metadata.opCount << ";\n";
+                os << "    metadata.graph_revision = " << metadata.graphRevision << ";\n";
+                os << "    metadata.schedule_kind = \"" << metadata.scheduleKind << "\";\n";
+                os << "    metadata.schedule_version = " << metadata.scheduleVersion << ";\n";
+                os << "    metadata.schedule_contract = \"" << metadata.scheduleContract << "\";\n";
+                os << "    metadata.hypergraph_kind = \"" << metadata.hypergraphKind << "\";\n";
+                os << "    metadata.hypergraph_version = " << metadata.hypergraphVersion << ";\n";
+                os << "    metadata.hypergraph_contract = \"" << metadata.hypergraphContract << "\";\n";
+                if (shardPlans.empty())
+                {
+                    for (const auto &statement : metadataStatements)
+                    {
+                        os << statement;
+                    }
+                }
+                else
+                {
+                    for (const auto &plan : shardPlans)
+                    {
+                        os << "    " << plan.functionName << "(metadata);\n";
+                    }
+                }
+                os << "    return metadata;\n";
+                os << "}\n\n";
+                os << "bool " << validateName << "(const " << structName << "& metadata) {\n";
+                os << "    if (metadata.graph_symbol != \"" << target.scratchGraphSymbol << "\") return false;\n";
+                os << "    if (metadata.scratchpad_namespace != \"" << target.namespacePath << "\") return false;\n";
+                os << "    if (metadata.selection_path.empty()) return false;\n";
+                os << "    if (metadata.graph_revision < 0) return false;\n";
+                os << "    if (metadata.op_count < 0) return false;\n";
+                os << "    if (metadata.schedule_kind != \"activity-v1\") return false;\n";
+                os << "    if (metadata.schedule_contract != \"gsim.activity.schedule.v1\") return false;\n";
+                os << "    if (metadata.hypergraph_kind != \"activity-connectivity-v1\") return false;\n";
+                os << "    if (metadata.hypergraph_contract != \"gsim.activity.hypergraph.v1\") return false;\n";
+                os << "    if (metadata.schedule_version != 1 || metadata.hypergraph_version != 1) return false;\n";
+                os << "    if (metadata.topo_order.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
+                os << "    if (metadata.classifications.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
+                os << "    if (metadata.predecessors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
+                os << "    if (metadata.successors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
+                os << "    if (metadata.op_descriptors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
+                os << "    if (metadata.schedule_activity_order.size() != metadata.event_group_names.size()) return false;\n";
+                os << "    if (metadata.hypergraph_node_names.size() != metadata.event_group_names.size()) return false;\n";
+                os << "    if (metadata.hypergraph_edge_names.size() != metadata.event_group_names.size()) return false;\n";
+                os << "    if (has_duplicate_values(metadata.topo_order)) return false;\n";
+                os << "    if (has_duplicate_values(metadata.schedule_activity_order)) return false;\n";
+                os << "    if (has_duplicate_values(metadata.hypergraph_node_names)) return false;\n";
+                os << "    if (has_duplicate_values(metadata.hypergraph_edge_names)) return false;\n";
+                os << "    for (const auto& name : metadata.event_group_names) {\n";
+                os << "        if (metadata.event_groups.find(name) == metadata.event_groups.end()) return false;\n";
+                os << "    }\n";
+                os << "    for (const auto& activity : metadata.schedule_activity_order) {\n";
+                os << "        if (metadata.schedule_activity_members.find(activity) == metadata.schedule_activity_members.end()) return false;\n";
+                os << "        if (metadata.schedule_activity_classes.find(activity) == metadata.schedule_activity_classes.end()) return false;\n";
+                os << "    }\n";
+                os << "    for (const auto& node : metadata.hypergraph_node_names) {\n";
+                os << "        if (metadata.hypergraph_node_members.find(node) == metadata.hypergraph_node_members.end()) return false;\n";
+                os << "    }\n";
+                os << "    for (const auto& edge : metadata.hypergraph_edge_names) {\n";
+                os << "        if (metadata.hypergraph_edge_sources.find(edge) == metadata.hypergraph_edge_sources.end()) return false;\n";
+                os << "        if (metadata.hypergraph_edge_targets.find(edge) == metadata.hypergraph_edge_targets.end()) return false;\n";
+                os << "        if (metadata.hypergraph_edge_sinks.find(edge) == metadata.hypergraph_edge_sinks.end()) return false;\n";
+                os << "    }\n";
+                os << "    for (std::int64_t id : metadata.topo_order) {\n";
+                os << "        if (metadata.classifications.find(id) == metadata.classifications.end()) return false;\n";
+                os << "        if (metadata.predecessors.find(id) == metadata.predecessors.end()) return false;\n";
+                os << "        if (metadata.successors.find(id) == metadata.successors.end()) return false;\n";
+                os << "    }\n";
+                os << "    return true;\n";
+                os << "}\n\n";
+                os << "} // namespace wolvrix::gsim\n";
             }
-            os << "    return metadata;\n";
-            os << "}\n\n";
-            os << "bool " << validateName << "(const " << structName << "& metadata) {\n";
-            os << "    if (metadata.graph_symbol != \"" << target.scratchGraphSymbol << "\") return false;\n";
-            os << "    if (metadata.scratchpad_namespace != \"" << target.namespacePath << "\") return false;\n";
-            os << "    if (metadata.selection_path.empty()) return false;\n";
-            os << "    if (metadata.graph_revision < 0) return false;\n";
-            os << "    if (metadata.op_count < 0) return false;\n";
-            os << "    if (metadata.schedule_kind != \"activity-v1\") return false;\n";
-            os << "    if (metadata.schedule_contract != \"gsim.activity.schedule.v1\") return false;\n";
-            os << "    if (metadata.hypergraph_kind != \"activity-connectivity-v1\") return false;\n";
-            os << "    if (metadata.hypergraph_contract != \"gsim.activity.hypergraph.v1\") return false;\n";
-            os << "    if (metadata.schedule_version != 1 || metadata.hypergraph_version != 1) return false;\n";
-            os << "    if (metadata.topo_order.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
-            os << "    if (metadata.classifications.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
-            os << "    if (metadata.predecessors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
-            os << "    if (metadata.successors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
-            os << "    if (metadata.op_descriptors.size() != static_cast<std::size_t>(metadata.op_count)) return false;\n";
-            os << "    if (metadata.schedule_activity_order.size() != metadata.event_group_names.size()) return false;\n";
-            os << "    if (metadata.hypergraph_node_names.size() != metadata.event_group_names.size()) return false;\n";
-            os << "    if (metadata.hypergraph_edge_names.size() != metadata.event_group_names.size()) return false;\n";
-            os << "    if (has_duplicate_values(metadata.topo_order)) return false;\n";
-            os << "    if (has_duplicate_values(metadata.schedule_activity_order)) return false;\n";
-            os << "    if (has_duplicate_values(metadata.hypergraph_node_names)) return false;\n";
-            os << "    if (has_duplicate_values(metadata.hypergraph_edge_names)) return false;\n";
-            os << "    for (const auto& name : metadata.event_group_names) {\n";
-            os << "        if (metadata.event_groups.find(name) == metadata.event_groups.end()) return false;\n";
-            os << "    }\n";
-            os << "    for (const auto& activity : metadata.schedule_activity_order) {\n";
-            os << "        if (metadata.schedule_activity_members.find(activity) == metadata.schedule_activity_members.end()) return false;\n";
-            os << "        if (metadata.schedule_activity_classes.find(activity) == metadata.schedule_activity_classes.end()) return false;\n";
-            os << "    }\n";
-            os << "    for (const auto& node : metadata.hypergraph_node_names) {\n";
-            os << "        if (metadata.hypergraph_node_members.find(node) == metadata.hypergraph_node_members.end()) return false;\n";
-            os << "    }\n";
-            os << "    for (const auto& edge : metadata.hypergraph_edge_names) {\n";
-            os << "        if (metadata.hypergraph_edge_sources.find(edge) == metadata.hypergraph_edge_sources.end()) return false;\n";
-            os << "        if (metadata.hypergraph_edge_targets.find(edge) == metadata.hypergraph_edge_targets.end()) return false;\n";
-            os << "        if (metadata.hypergraph_edge_sinks.find(edge) == metadata.hypergraph_edge_sinks.end()) return false;\n";
-            os << "    }\n";
-            os << "    for (std::int64_t id : metadata.topo_order) {\n";
-            os << "        if (metadata.classifications.find(id) == metadata.classifications.end()) return false;\n";
-            os << "        if (metadata.predecessors.find(id) == metadata.predecessors.end()) return false;\n";
-            os << "        if (metadata.successors.find(id) == metadata.successors.end()) return false;\n";
-            os << "    }\n";
-            os << "    return true;\n";
-            os << "}\n\n";
-            os << "} // namespace wolvrix::gsim\n";
 
             managedSourceFiles.push_back(std::string(baseName) + ".cpp");
             artifactPaths.push_back((outputDir / (std::string(baseName) + ".cpp")).string());
@@ -2911,10 +3403,11 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                         return false;
                     }
                     shardStream << "#include \"" << headerFilename << "\"\n\n";
+                    writeLocalDpiForwardDecls(shardStream, state);
                     shardStream << "void SSimTop::" << plan.methodName << "() {\n";
                     managedSourceFiles.push_back(plan.filename);
                     artifactPaths.push_back((outputDir / plan.filename).string());
-                    shardBytes = behaviorShardWrapperBytes(headerFilename, plan.methodName);
+                    shardBytes = behaviorShardWrapperBytes(headerFilename, state, plan.methodName);
                     return true;
                 };
 
@@ -2966,7 +3459,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 }
             }
 
-            if (!shardPlans.empty())
+            if (emitMetadata && !shardPlans.empty())
             {
                 std::size_t shardIndex = 0;
                 std::size_t shardBytes = 0;
@@ -3020,25 +3513,36 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 }
 
                 bool shardWriteOk = true;
-                emitMetadataAssignments([&](const std::string &line) {
+                for (const auto &statement : metadataStatements)
+                {
                     if (!shardWriteOk)
                     {
-                        return;
+                        break;
                     }
-                    if (shardBytes != 0 && shardBytes + line.size() > metadataShardMaxBytes)
+                    if (statement.size() > metadataShardMaxBytes)
+                    {
+                        if (diagnostics != nullptr)
+                        {
+                            diagnostics->error("metadata_shard_max_bytes is too small to fit an emitted metadata statement",
+                                               std::to_string(metadataShardMaxBytes));
+                        }
+                        shardWriteOk = false;
+                        break;
+                    }
+                    if (shardBytes != 0 && shardBytes + statement.size() > metadataShardMaxBytes)
                     {
                         shardWriteOk = finishShard();
                         if (!shardWriteOk)
                         {
-                            return;
+                            break;
                         }
                         if (shardIndex >= shardPlans.size() || !startShard())
                         {
                             shardWriteOk = false;
-                            return;
+                            break;
                         }
                     }
-                    shardStream << line;
+                    shardStream << statement;
                     if (!shardStream.good())
                     {
                         if (diagnostics != nullptr)
@@ -3047,10 +3551,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                                                (outputDir / shardPlans[shardIndex].filename).string());
                         }
                         shardWriteOk = false;
-                        return;
+                        break;
                     }
-                    shardBytes += line.size();
-                }, metadata);
+                    shardBytes += statement.size();
+                }
 
                 if (!shardWriteOk || !finishShard())
                 {
@@ -3209,6 +3713,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
         const std::filesystem::path headerPath = outputDir / (baseName + ".hpp");
         const std::filesystem::path sourcePath = outputDir / (baseName + ".cpp");
         const auto headerFilename = headerPath.filename().string();
+        const bool emitMetadata = boolAttrValue(options, "emit_metadata", true);
         const auto behaviorShardMaxBytes = parseBehaviorShardMaxBytes(options, diagnostics());
         const auto metadataShardMaxBytes = parseMetadataShardMaxBytes(options, diagnostics());
         if (!behaviorShardMaxBytes || !metadataShardMaxBytes)
@@ -3229,7 +3734,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
         if (estimateBehaviorStatementBytes(behaviorStatements) > *behaviorShardMaxBytes)
         {
             auto plannedBehaviorShards =
-                planBehaviorShards(baseName, headerFilename, behaviorStatements, *behaviorShardMaxBytes);
+                planBehaviorShards(baseName, headerFilename, state, behaviorStatements, *behaviorShardMaxBytes);
             if (!plannedBehaviorShards)
             {
                 reportError("behavior_shard_max_bytes is too small to fit an emitted behavior statement",
@@ -3248,7 +3753,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             return result;
         }
 
-        writeHeader(*header, *target, *metadata, state, behaviorShardPlans);
+        writeHeader(*header, *target, *metadata, state, behaviorShardPlans, emitMetadata);
         std::vector<std::string> managedSourceFiles;
         if (!writeSource(*source,
                          outputDir,
@@ -3260,6 +3765,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                          *behaviorShardMaxBytes,
                          behaviorShardPlans,
                          *metadataShardMaxBytes,
+                         emitMetadata,
                          managedSourceFiles,
                          result.artifacts,
                          diagnostics()))
