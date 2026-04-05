@@ -2548,6 +2548,25 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             std::string methodName;
         };
 
+        constexpr std::size_t kCtorStorageInitShardMaxStatements = 128;
+
+        std::size_t computeCtorStorageInitShardCount(const CodegenState &state,
+                                                     const CodegenState &postState)
+        {
+            const std::size_t totalStatements = state.ctorStmts.size() + state.persistentTempGroups.size() +
+                                                postState.persistentTempGroups.size();
+            if (totalStatements == 0)
+            {
+                return 0;
+            }
+            if (!state.persistentTemps && !postState.persistentTemps)
+            {
+                return 0;
+            }
+            return std::max<std::size_t>(
+                1, (totalStatements + kCtorStorageInitShardMaxStatements - 1) / kCtorStorageInitShardMaxStatements);
+        }
+
         std::optional<std::vector<MetadataShardPlan>> planMetadataShards(const std::string &baseName,
                                                                          const std::vector<std::string> &statements,
                                                                          std::size_t maxBytes)
@@ -3153,6 +3172,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             for (const auto &plan : postBehaviorShardPlans) {
                 os << "    void " << plan.methodName << "();\n";
             }
+            const auto ctorStorageInitShardCount = computeCtorStorageInitShardCount(state, postState);
+            for (std::size_t shardIndex = 0; shardIndex < ctorStorageInitShardCount; ++shardIndex) {
+                os << "    void init_ctor_storage_shard_" << shardIndex << "();\n";
+            }
             if (!behaviorShardPlans.empty() || !postBehaviorShardPlans.empty()) {
                 os << "\n";
             }
@@ -3286,18 +3309,48 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             writeLocalDpiForwardDecls(os, state);
             os << "#include <algorithm>\n";
             os << "#include <set>\n\n";
-            os << "SSimTop::SSimTop() {\n";
-            for (const auto &stmt : state.ctorStmts)
-            {
-                os << stmt << "\n";
-            }
+            std::vector<std::string> ctorInitStatements;
+            ctorInitStatements.reserve(state.ctorStmts.size() + state.persistentTempGroups.size() +
+                                       postState.persistentTempGroups.size());
+            ctorInitStatements.insert(ctorInitStatements.end(), state.ctorStmts.begin(), state.ctorStmts.end());
             for (const auto &group : state.persistentTempGroups)
             {
-                os << "    " << group.storageName << ".resize(" << group.count << ");\n";
+                ctorInitStatements.push_back("    " + group.storageName + ".resize(" + std::to_string(group.count) + ");");
             }
             for (const auto &group : postState.persistentTempGroups)
             {
-                os << "    " << group.storageName << ".resize(" << group.count << ");\n";
+                ctorInitStatements.push_back("    " + group.storageName + ".resize(" + std::to_string(group.count) + ");");
+            }
+            const auto ctorStorageInitShardCount = computeCtorStorageInitShardCount(state, postState);
+            if (ctorStorageInitShardCount != 0)
+            {
+                for (std::size_t shardIndex = 0; shardIndex < ctorStorageInitShardCount; ++shardIndex)
+                {
+                    const std::size_t begin = shardIndex * kCtorStorageInitShardMaxStatements;
+                    const std::size_t end =
+                        std::min(begin + kCtorStorageInitShardMaxStatements, ctorInitStatements.size());
+                    os << "void SSimTop::init_ctor_storage_shard_" << shardIndex << "() {\n";
+                    for (std::size_t stmtIndex = begin; stmtIndex < end; ++stmtIndex)
+                    {
+                        os << ctorInitStatements[stmtIndex] << "\n";
+                    }
+                    os << "}\n\n";
+                }
+            }
+            os << "SSimTop::SSimTop() {\n";
+            if (ctorStorageInitShardCount == 0)
+            {
+                for (const auto &stmt : ctorInitStatements)
+                {
+                    os << stmt << "\n";
+                }
+            }
+            else
+            {
+                for (std::size_t shardIndex = 0; shardIndex < ctorStorageInitShardCount; ++shardIndex)
+                {
+                    os << "    init_ctor_storage_shard_" << shardIndex << "();\n";
+                }
             }
             os << "    reset();\n";
             os << "}\n\n";

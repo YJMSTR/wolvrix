@@ -2453,6 +2453,36 @@ void testWideBehaviorShardsKeepTypedTemps()
     expect(std::system(compileCmd.c_str()) == 0, "wide behavior shard driver should compile");
 }
 
+void testWideBehaviorShardsSplitCtorStorageInit()
+{
+    Design design = buildWideBehaviorConcatDesign(128);
+    runGsim(design, "wide_behavior_top");
+
+    const auto dir = artifactRoot() / "wide_behavior_ctor_init_shards";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_behavior_ctor_split");
+    options.topOverrides = {"wide_behavior_top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "wide behavior ctor-split emit should succeed");
+    expect(!diags.hasError(), "wide behavior ctor-split emit should not emit diagnostics");
+
+    const std::string header = readFile(dir / "wide_behavior_ctor_split.hpp");
+    const std::string source = readFile(dir / "wide_behavior_ctor_split.cpp");
+    expect(contains(header, "void init_ctor_storage_shard_0();"),
+           "wide behavior ctor-split header should declare constructor storage init shards");
+    expect(contains(source, "void SSimTop::init_ctor_storage_shard_0()"),
+           "wide behavior ctor-split source should define constructor storage init shards");
+    expect(contains(source, "    init_ctor_storage_shard_0();"),
+           "wide behavior ctor-split constructor should call the first storage init shard");
+}
+
 void testMemoryLoweringBehavior()
 {
     Design design = buildMemoryBehaviorDesign();
@@ -2956,6 +2986,7 @@ int main()
         testWideSliceCompile();
         testNarrowBehaviorAshrCompile();
         testWideBehaviorShardsKeepTypedTemps();
+        testWideBehaviorShardsSplitCtorStorageInit();
     }
     catch (const std::exception &ex)
     {

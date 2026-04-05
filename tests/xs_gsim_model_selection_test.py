@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import pathlib
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -50,6 +52,37 @@ def run_make(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
             f"BUILD_DIR={build_dir}",
             f"WOLVRIX_GSIM_CPP={cpp_path}",
             f"WOLVRIX_GSIM_HPP={hpp_path}",
+            f"WOLVRIX_GSIM_INCLUDE_DIR={model_dir}",
+            "EMU_OPTIMIZE=-O0",
+            "WITH_CHISELDB=0",
+            "WITH_CONSTANTIN=0",
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def run_make_target(model_dir: pathlib.Path, build_dir: pathlib.Path, target: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    cpp_path = model_dir / "fixture.cpp"
+    hpp_path = model_dir / "fixture.hpp"
+    manifest_path = model_dir / "fixture.manifest"
+    return subprocess.run(
+        [
+            "make",
+            "-C",
+            str(DIFFTEST_DIR),
+            "-n",
+            str(target),
+            "GSIM=1",
+            "WOLVRIX_GSIM=1",
+            f"DESIGN_DIR={model_dir}",
+            f"BUILD_DIR={build_dir}",
+            f"WOLVRIX_GSIM_CPP={cpp_path}",
+            f"WOLVRIX_GSIM_HPP={hpp_path}",
+            f"WOLVRIX_GSIM_MANIFEST={manifest_path}",
             f"WOLVRIX_GSIM_INCLUDE_DIR={model_dir}",
             "EMU_OPTIMIZE=-O0",
             "WITH_CHISELDB=0",
@@ -313,6 +346,31 @@ def test_top_make_forwards_manifest(model_dir: pathlib.Path) -> None:
     )
 
 
+def test_gsim_wrapper_rebuilds_when_emitted_header_changes(model_dir: pathlib.Path) -> None:
+    build_dir = model_dir.parent / "build_wrapper_dep"
+    hpp_path = model_dir / "fixture.hpp"
+    write_file(hpp_path, "#pragma once\nclass SSimTop {};\n")
+    write_file(model_dir / "fixture.cpp", "int fixture_model() { return 0; }\n")
+    write_file(model_dir / "fixture.manifest", "fixture.cpp\n")
+
+    wrapper_obj = build_dir / "gsim-compile" / "other" / "gsim.o"
+    wrapper_obj.parent.mkdir(parents=True, exist_ok=True)
+    wrapper_obj.write_bytes(b"")
+
+    stale_time = time.time() - 10.0
+    os.utime(wrapper_obj, (stale_time, stale_time))
+    fresh_time = stale_time + 5.0
+    os.utime(hpp_path, (fresh_time, fresh_time))
+
+    result = run_make_target(model_dir, build_dir, wrapper_obj)
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"wrapper dependency dry-run should succeed: {stdout.strip()}")
+    expect(
+        str(DIFFTEST_DIR / "src" / "test" / "csrc" / "gsim" / "gsim.cpp") in stdout,
+        "changing the emitted GSIM header should force a rebuild of the XiangShan gsim wrapper object",
+    )
+
+
 def test_root_make_normalizes_relative_gsim_artifact_paths(model_dir: pathlib.Path) -> None:
     canonical_cpp = model_dir / "fixture.cpp"
     hpp_path = model_dir / "fixture.hpp"
@@ -408,6 +466,18 @@ def test_root_make_allows_xiangshan_metadata_override() -> None:
     )
 
 
+def test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("run_xs_gsim:")
+    end = makefile_text.index("\nrun_xs_gsim_smoke:", start)
+    body = makefile_text[start:end]
+
+    expect(
+        body.count("VM_BUILD_JOBS=$(XS_VM_BUILD_JOBS)") >= 2,
+        "root Makefile should forward XS_VM_BUILD_JOBS through both the logged and executed downstream XiangShan gsim invocations",
+    )
+
+
 def test_gsim_reset_sequence_holds_reset_until_loop_end() -> None:
     emu_cpp = XIANGSHAN_DIR / "difftest" / "src" / "test" / "csrc" / "emu" / "emu.cpp"
     text = emu_cpp.read_text(encoding="utf-8")
@@ -500,12 +570,14 @@ def main() -> int:
         test_uses_manifest_instead_of_globbing(ARTIFACT_ROOT / "case_manifest" / "model")
         test_fails_without_manifest(ARTIFACT_ROOT / "case_missing_manifest" / "model")
         test_top_make_forwards_manifest(ARTIFACT_ROOT / "case_top_manifest" / "model")
+        test_gsim_wrapper_rebuilds_when_emitted_header_changes(ARTIFACT_ROOT / "case_wrapper_dep" / "model")
         test_root_make_normalizes_relative_gsim_artifact_paths(ARTIFACT_ROOT / "case_root_relative" / "model")
         test_root_make_uses_safe_default_behavior_shard_cap()
         test_root_make_allows_behavior_shard_cap_override()
         test_root_make_uses_unlimited_emu_stack_by_default()
         test_root_make_disables_xiangshan_metadata_by_default()
         test_root_make_allows_xiangshan_metadata_override()
+        test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()
         test_gsim_link_disables_relax_and_pie(ARTIFACT_ROOT / "case_link_flags" / "model")
