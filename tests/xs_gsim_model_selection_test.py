@@ -343,11 +343,11 @@ def test_root_make_uses_safe_default_behavior_shard_cap() -> None:
     stdout = result.stdout + result.stderr
     expect(result.returncode == 0, f"root-level shard config print should succeed: {stdout.strip()}")
     expect(
-        "BYTES=16777216" in stdout,
-        f"root Makefile should default XiangShan behavior shard cap to 16 MiB: {stdout.strip()}",
+        "BYTES=4194304" in stdout,
+        f"root Makefile should default XiangShan behavior shard cap to 4 MiB: {stdout.strip()}",
     )
     expect(
-        "FRAGMENT=WOLVRIX_XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES=16777216" in stdout,
+        "FRAGMENT=WOLVRIX_XS_GSIM_BEHAVIOR_SHARD_MAX_BYTES=4194304" in stdout,
         f"root Makefile should forward the default shard cap into the XiangShan gsim script env: {stdout.strip()}",
     )
 
