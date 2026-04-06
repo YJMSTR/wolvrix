@@ -2220,6 +2220,178 @@ void testNamedResetInputWithClockDoesNotForceInitState()
     expect(std::system(exePath.c_str()) == 0, "named reset should follow explicit graph logic instead of forcing init state");
 }
 
+void testNegedgeRegisterWriteHonorsClockLevel()
+{
+    Design design;
+    auto &graph = design.createGraph("negedge_reg_top");
+    design.markAsTop("negedge_reg_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    const auto outQ = makeValue(graph, "q", 8, false);
+    graph.bindOutputPort("q", outQ);
+
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.setAttr(regOp, "initValue", std::string("8'h00"));
+    const auto regOut = makeValue(graph, "state_out", 8, false);
+    graph.addResult(regOp, regOut);
+
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    graph.addResult(readOp, readVal);
+
+    const auto assignQ = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_q"));
+    graph.addOperand(assignQ, readVal);
+    graph.addResult(assignQ, outQ);
+
+    const auto wen = makeConstant(graph, "wen", "wen_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 8, "8'hff");
+    const auto writeOp = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("state_wp"));
+    graph.addOperand(writeOp, wen);
+    graph.addOperand(writeOp, inD);
+    graph.addOperand(writeOp, mask);
+    graph.addOperand(writeOp, clk);
+    graph.setAttr(writeOp, "regSymbol", std::string("state"));
+    graph.setAttr(writeOp, "clockSymbol", std::string("clk"));
+    graph.setAttr(writeOp, "eventEdge", std::vector<std::string>{"negedge"});
+
+    runGsim(design, "negedge_reg_top");
+
+    const auto dir = artifactRoot() / "negedge_reg";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("negedge_reg_sim");
+    options.topOverrides = {"negedge_reg_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "negedge register emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "negedge_reg_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"negedge_reg_sim.hpp\"\n";
+        driver << "#include \"negedge_reg_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_clk(1); sim.set_d(0x12); sim.step();\n";
+        driver << "    if (sim.get_q() != 0) { std::printf(\"FAIL posedge q=%u expected 0\\n\", static_cast<unsigned>(sim.get_q())); return 1; }\n";
+        driver << "    sim.set_clk(0); sim.set_d(0x12); sim.step();\n";
+        driver << "    if (sim.get_q() != 0x12u) { std::printf(\"FAIL negedge q=%u expected 18\\n\", static_cast<unsigned>(sim.get_q())); return 2; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "negedge_reg_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "negedge register driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "negedge register should only update when clk is low");
+}
+
+void testMixedEdgeRegisterWriteUsesEachEventOperand()
+{
+    Design design;
+    auto &graph = design.createGraph("mixed_edge_reg_top");
+    design.markAsTop("mixed_edge_reg_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto rstn = makeValue(graph, "rst_n", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("rst_n", rstn);
+    graph.bindInputPort("d", inD);
+
+    const auto outQ = makeValue(graph, "q", 8, false);
+    graph.bindOutputPort("q", outQ);
+
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.setAttr(regOp, "initValue", std::string("8'h00"));
+    const auto regOut = makeValue(graph, "state_out", 8, false);
+    graph.addResult(regOp, regOut);
+
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    graph.addResult(readOp, readVal);
+
+    const auto zero = makeConstant(graph, "zero", "zero_c", 8, "8'h00");
+    const auto notRstn = makeValue(graph, "not_rst_n", 1, false);
+    const auto notOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("not_rst_n_op"));
+    graph.addOperand(notOp, rstn);
+    graph.addResult(notOp, notRstn);
+
+    const auto writeVal = makeValue(graph, "state_write", 8, false);
+    const auto mux = graph.createOperation(OperationKind::kMux, graph.internSymbol("state_sel"));
+    graph.addOperand(mux, notRstn);
+    graph.addOperand(mux, zero);
+    graph.addOperand(mux, inD);
+    graph.addResult(mux, writeVal);
+
+    const auto assignQ = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_q"));
+    graph.addOperand(assignQ, readVal);
+    graph.addResult(assignQ, outQ);
+
+    const auto wen = makeConstant(graph, "wen", "wen_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 8, "8'hff");
+    const auto writeOp = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("state_wp"));
+    graph.addOperand(writeOp, wen);
+    graph.addOperand(writeOp, writeVal);
+    graph.addOperand(writeOp, mask);
+    graph.addOperand(writeOp, clk);
+    graph.addOperand(writeOp, rstn);
+    graph.setAttr(writeOp, "regSymbol", std::string("state"));
+    graph.setAttr(writeOp, "clockSymbol", std::string("clk"));
+    graph.setAttr(writeOp, "eventEdge", std::vector<std::string>{"posedge", "negedge"});
+
+    runGsim(design, "mixed_edge_reg_top");
+
+    const auto dir = artifactRoot() / "mixed_edge_reg";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("mixed_edge_reg_sim");
+    options.topOverrides = {"mixed_edge_reg_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "mixed-edge register emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "mixed_edge_reg_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"mixed_edge_reg_sim.hpp\"\n";
+        driver << "#include \"mixed_edge_reg_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_rst_n(1); sim.set_clk(1); sim.set_d(0x2a); sim.step();\n";
+        driver << "    if (sim.get_q() != 0x2au) { std::printf(\"FAIL load q=%u expected 42\\n\", static_cast<unsigned>(sim.get_q())); return 1; }\n";
+        driver << "    sim.set_rst_n(0); sim.set_clk(1); sim.set_d(0x55); sim.step();\n";
+        driver << "    if (sim.get_q() != 0x00u) { std::printf(\"FAIL reset q=%u expected 0\\n\", static_cast<unsigned>(sim.get_q())); return 2; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "mixed_edge_reg_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "mixed-edge register driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "mixed-edge register should use each event operand when deciding which edge fires");
+}
+
 void testReplicateSignExtendBehavior()
 {
     Design design = buildReplicateSignExtendDesign();
@@ -3217,6 +3389,8 @@ int main()
         testRegisterDerivedOutputBehavior();
         testRegisterChainKeepsPreStepState();
         testNamedResetInputWithClockDoesNotForceInitState();
+        testNegedgeRegisterWriteHonorsClockLevel();
+        testMixedEdgeRegisterWriteUsesEachEventOperand();
         testReplicateSignExtendBehavior();
         testRegisterInitValueBehavior();
         testBootstrapResetFirstStepBehavior();
