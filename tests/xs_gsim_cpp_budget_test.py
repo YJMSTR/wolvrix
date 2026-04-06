@@ -122,6 +122,24 @@ def main() -> int:
         expect(str(shard_cpp) in manifest_large.stderr, "manifest budget diagnostic should mention the oversized shard")
         expect(manifest_reject_log.exists(), "manifest rejection should write the diagnostic log")
 
+        canonical_only_manifest = ARTIFACT_ROOT / "canonical_base.manifest"
+        canonical_base = ARTIFACT_ROOT / "canonical_base"
+        canonical_cpp = canonical_base.with_suffix(".cpp")
+        canonical_shard = ARTIFACT_ROOT / "canonical_base__step_000.cpp"
+        canonical_cpp.write_text("z" * 1024, encoding="utf-8")
+        canonical_shard.write_text("int tiny_step() { return 0; }\n", encoding="utf-8")
+        canonical_only_manifest.write_text("canonical_base__step_000.cpp\n", encoding="utf-8")
+
+        canonical_large = run_manifest_check(canonical_only_manifest, ARTIFACT_ROOT, 128)
+        expect(
+            canonical_large.returncode == 2,
+            f"manifest budget should also reject an oversized canonical base source, got {canonical_large.returncode}",
+        )
+        expect(
+            str(canonical_cpp) in canonical_large.stderr,
+            f"manifest budget diagnostic should mention the oversized canonical base source: {canonical_large.stderr.strip()}",
+        )
+
         make_large = run_make_manifest_check(manifest, ARTIFACT_ROOT, 128, make_reject_log)
         make_output = make_large.stdout + make_large.stderr
         expect(make_large.returncode != 0, "Makefile preflight should reject an oversized shard from the manifest")

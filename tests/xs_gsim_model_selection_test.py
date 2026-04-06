@@ -473,17 +473,17 @@ def test_root_make_allows_behavior_shard_cap_override() -> None:
     )
 
 
-def test_root_make_uses_unlimited_emu_stack_by_default() -> None:
+def test_root_make_uses_finite_emu_stack_by_default() -> None:
     result = run_root_emu_stack_print()
     stdout = result.stdout + result.stderr
     expect(result.returncode == 0, f"root-level emu stack print should succeed: {stdout.strip()}")
     expect(
-        "STACK=unlimited" in stdout,
-        f"root Makefile should default XiangShan emu stack to unlimited for large gsim shards: {stdout.strip()}",
+        "STACK=65536" in stdout,
+        f"root Makefile should default XiangShan emu stack to a finite value that works under capped hard limits: {stdout.strip()}",
     )
     expect(
-        "RUN_FRAGMENT=ulimit -s unlimited &&" in stdout,
-        f"root Makefile should raise the XiangShan emu stack limit before launching emu: {stdout.strip()}",
+        "RUN_FRAGMENT=ulimit -s 65536 &&" in stdout,
+        f"root Makefile should still raise the XiangShan emu stack limit before launching emu: {stdout.strip()}",
     )
 
 
@@ -750,7 +750,7 @@ def main() -> int:
         test_root_make_normalizes_relative_gsim_artifact_paths(ARTIFACT_ROOT / "case_root_relative" / "model")
         test_root_make_uses_safe_default_behavior_shard_cap()
         test_root_make_allows_behavior_shard_cap_override()
-        test_root_make_uses_unlimited_emu_stack_by_default()
+        test_root_make_uses_finite_emu_stack_by_default()
         test_root_make_disables_xiangshan_metadata_by_default()
         test_root_make_allows_xiangshan_metadata_override()
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
