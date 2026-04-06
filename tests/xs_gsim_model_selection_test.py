@@ -539,6 +539,26 @@ def test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim() -> None:
     )
 
 
+def test_root_make_forwards_xiangshan_feature_flags_to_gsim() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("run_xs_gsim:")
+    end = makefile_text.index("\nrun_xs_gsim_smoke:", start)
+    body = makefile_text[start:end]
+
+    expect(
+        body.count("WITH_CHISELDB=$(XS_WITH_CHISELDB)") >= 2,
+        "run_xs_gsim should forward XS_WITH_CHISELDB through both the logged and executed downstream XiangShan gsim invocations",
+    )
+    expect(
+        body.count("WITH_CONSTANTIN=$(XS_WITH_CONSTANTIN)") >= 2,
+        "run_xs_gsim should forward XS_WITH_CONSTANTIN through both the logged and executed downstream XiangShan gsim invocations",
+    )
+    expect(
+        "WITH_CHISELDB=0" not in body and "WITH_CONSTANTIN=0" not in body,
+        "run_xs_gsim should not hardcode XiangShan feature flags in the downstream gsim invocation",
+    )
+
+
 def test_gsim_reset_sequence_holds_reset_until_loop_end() -> None:
     emu_cpp = XIANGSHAN_DIR / "difftest" / "src" / "test" / "csrc" / "emu" / "emu.cpp"
     text = emu_cpp.read_text(encoding="utf-8")
@@ -640,6 +660,7 @@ def main() -> int:
         test_root_make_allows_xiangshan_metadata_override()
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
         test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
+        test_root_make_forwards_xiangshan_feature_flags_to_gsim()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()
         test_gsim_link_disables_relax_and_pie(ARTIFACT_ROOT / "case_link_flags" / "model")
