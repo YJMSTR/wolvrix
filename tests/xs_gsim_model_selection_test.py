@@ -225,6 +225,31 @@ def run_root_emit_metadata_print(override: str | None = None) -> subprocess.Comp
     )
 
 
+def run_root_python_launch_print(build_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    print_rule = (
+        "print-xs-gsim-python-launch:\n"
+        "\t@printf 'ARGS=%s\\nENV=%s\\n' "
+        "'$(XS_WOLVRIX_PYTHON_ARGS)' "
+        "'$(XS_WOLVRIX_PYTHON_ENV)'"
+    )
+    command = (
+        f"source env.sh && make --eval {shlex.quote(print_rule)} print-xs-gsim-python-launch "
+        f"XS_WOLVRIX_PYTHON_BUILD_DIR={shlex.quote(str(build_dir))}"
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            command,
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def run_gsim_link_flags_print(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
     build_dir = model_dir.parent / "build_link_flags"
     cpp_path = model_dir / "fixture.cpp"
@@ -466,6 +491,42 @@ def test_root_make_allows_xiangshan_metadata_override() -> None:
     )
 
 
+def test_root_make_only_forces_build_tree_python_when_bindings_exist() -> None:
+    missing_result = run_root_python_launch_print(ARTIFACT_ROOT / "missing_build_python")
+    missing_stdout = missing_result.stdout + missing_result.stderr
+    expect(missing_result.returncode == 0, f"root-level python launch print should succeed: {missing_stdout.strip()}")
+    expect(
+        "ARGS=" in missing_stdout and "ARGS=-S" not in missing_stdout,
+        f"missing build-tree bindings should not force -S in run_xs_gsim: {missing_stdout.strip()}",
+    )
+    expect(
+        "ENV=WOLVRIX_PYTHON_BUILD_DIR=" in missing_stdout,
+        f"run_xs_gsim should still pass the build dir hint for load_wolvrix(): {missing_stdout.strip()}",
+    )
+    expect(
+        "PYTHONPATH=" not in missing_stdout and "PYTHONNOUSERSITE=1" not in missing_stdout,
+        f"missing build-tree bindings should not shadow an installed wolvrix package: {missing_stdout.strip()}",
+    )
+
+    build_dir = ARTIFACT_ROOT / "present_build_python"
+    pkg_dir = build_dir / "wolvrix"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_file(pkg_dir / "__init__.py", "_native = object()\n")
+    (pkg_dir / "_wolvrix.so").write_bytes(b"")
+
+    present_result = run_root_python_launch_print(build_dir)
+    present_stdout = present_result.stdout + present_result.stderr
+    expect(present_result.returncode == 0, f"root-level python launch print should succeed: {present_stdout.strip()}")
+    expect(
+        "ARGS=-S" in present_stdout,
+        f"present build-tree bindings should keep the isolated -S launch path: {present_stdout.strip()}",
+    )
+    expect(
+        f"PYTHONPATH={build_dir}" in present_stdout and "PYTHONNOUSERSITE=1" in present_stdout,
+        f"present build-tree bindings should still pin imports to the build tree: {present_stdout.strip()}",
+    )
+
+
 def test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim() -> None:
     makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     start = makefile_text.index("run_xs_gsim:")
@@ -577,6 +638,7 @@ def main() -> int:
         test_root_make_uses_unlimited_emu_stack_by_default()
         test_root_make_disables_xiangshan_metadata_by_default()
         test_root_make_allows_xiangshan_metadata_override()
+        test_root_make_only_forces_build_tree_python_when_bindings_exist()
         test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()

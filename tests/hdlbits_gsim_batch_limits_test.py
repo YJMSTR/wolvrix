@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -76,6 +77,45 @@ def main() -> int:
             oom_result.memory_limited,
             f"expected memory-limited marker, got returncode={oom_result.returncode}, stderr={oom_result.stderr!r}",
         )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            build_root = pathlib.Path(tmpdir) / "build_python"
+            build_root.mkdir(parents=True, exist_ok=True)
+            build_launch = module.resolve_wolvrix_python_launch(str(build_root))
+            expect(
+                build_launch.python_args == [],
+                f"missing build-tree bindings should not force -S isolation: {build_launch.python_args!r}",
+            )
+            expect(
+                build_launch.env["WOLVRIX_PYTHON_BUILD_DIR"] == str(build_root),
+                f"launch config should still forward build dir hint: {build_launch.env!r}",
+            )
+            expect(
+                "PYTHONPATH" not in build_launch.env,
+                f"missing build-tree bindings should not force PYTHONPATH: {build_launch.env!r}",
+            )
+            expect(
+                "PYTHONNOUSERSITE" not in build_launch.env,
+                f"missing build-tree bindings should not force PYTHONNOUSERSITE: {build_launch.env!r}",
+            )
+
+            pkg_dir = build_root / "wolvrix"
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            (pkg_dir / "__init__.py").write_text("_native = object()\n", encoding="utf-8")
+            (pkg_dir / "_wolvrix.so").write_bytes(b"")
+            isolated_launch = module.resolve_wolvrix_python_launch(str(build_root))
+            expect(
+                isolated_launch.python_args == ["-S"],
+                f"present build-tree bindings should force -S isolation: {isolated_launch.python_args!r}",
+            )
+            expect(
+                isolated_launch.env.get("PYTHONPATH") == str(build_root),
+                f"present build-tree bindings should export PYTHONPATH to the build tree: {isolated_launch.env!r}",
+            )
+            expect(
+                isolated_launch.env.get("PYTHONNOUSERSITE") == "1",
+                f"present build-tree bindings should disable user site imports: {isolated_launch.env!r}",
+            )
     except Exception as ex:
         return fail(str(ex))
     return 0
