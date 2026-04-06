@@ -121,7 +121,7 @@ namespace wolvrix::lib::emit
             std::map<std::string, std::size_t> persistentTempGroupIndices;
             // Track unsupported operations
             std::vector<std::string> unsupportedOps;
-            bool hasResetInput = false;
+            bool hasMixedClockEdges = false;
         };
 
         // Get C++ type for a value based on its width
@@ -1198,9 +1198,6 @@ namespace wolvrix::lib::emit
                     std::string addr = getOperandExpr(1);
                     std::string data = getOperandExpr(2);
                     std::string mask = getOperandExpr(3);
-                    if (state.hasResetInput) {
-                        condition = "(!input_reset_ && (" + condition + "))";
-                    }
 
                     auto memSymAttr = op.attr("memSymbol");
                     std::string sym;
@@ -1232,7 +1229,7 @@ namespace wolvrix::lib::emit
                     if (!sym.empty()) {
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
                         if (!op.results().empty()) {
-                            state.valueExprs[op.results()[0]] = latchName;
+                            setResultExpr(0, latchName);
                         }
                     }
                     break;
@@ -1267,7 +1264,7 @@ namespace wolvrix::lib::emit
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
                         if (!op.results().empty()) {
-                            state.valueExprs[op.results()[0]] = regName;
+                            setResultExpr(0, regName);
                         }
                     }
                     break;
@@ -1276,8 +1273,17 @@ namespace wolvrix::lib::emit
                     std::string condition = getOperandExpr(0);
                     std::string nextValue = getOperandExpr(1);
                     std::string mask = getOperandExpr(2);
-                    if (state.hasResetInput) {
-                        condition = "(!input_reset_ && (" + condition + "))";
+                    if (state.hasMixedClockEdges && op.operands().size() > 3) {
+                        const auto edges =
+                            getAttrAs<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
+                        const std::string clockExpr = getOperandExpr(3);
+                        for (const auto &edge : edges) {
+                            if (edge == "posedge") {
+                                condition = "((" + condition + ") && (" + clockExpr + "))";
+                            } else if (edge == "negedge") {
+                                condition = "((" + condition + ") && (!(" + clockExpr + ")))";
+                            }
+                        }
                     }
 
                     auto regSymAttr = op.attr("regSymbol");
@@ -1512,10 +1518,6 @@ namespace wolvrix::lib::emit
                 std::string portExpr = "input_" + sanitizeIdentifier(port.name) + "_";
                 state.valueExprs[port.value] = portExpr;
                 state.inputValueNames[port.value] = sanitizeIdentifier(port.name);
-                if (sanitizeIdentifier(port.name) == "reset")
-                {
-                    state.hasResetInput = true;
-                }
             }
 
             for (const auto& port : graph.outputPorts()) {
@@ -1536,6 +1538,8 @@ namespace wolvrix::lib::emit
             std::map<std::string, int32_t> storageWidths;
             std::map<std::string, std::string> storageInitExprs;
             std::vector<std::string> storageOrder;
+            bool sawPosedge = false;
+            bool sawNegedge = false;
 
             auto noteStorage = [&](const std::string& storageName, int32_t width) {
                 const int32_t clampedWidth = std::max<int32_t>(1, width);
@@ -1620,6 +1624,14 @@ namespace wolvrix::lib::emit
                         }
                         noteStorage(regName, width);
                     }
+                    if (op.kind() == wolvrix::lib::grh::OperationKind::kRegisterWritePort) {
+                        const auto edges =
+                            getAttrAs<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
+                        for (const auto &edge : edges) {
+                            if (edge == "posedge") sawPosedge = true;
+                            if (edge == "negedge") sawNegedge = true;
+                        }
+                    }
                 }
                 if (op.kind() == wolvrix::lib::grh::OperationKind::kLatchReadPort ||
                     op.kind() == wolvrix::lib::grh::OperationKind::kLatchWritePort) {
@@ -1640,6 +1652,8 @@ namespace wolvrix::lib::emit
                     }
                 }
             }
+
+            state.hasMixedClockEdges = sawPosedge && sawNegedge;
 
             for (const auto& storageName : storageOrder)
             {
@@ -3386,15 +3400,6 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             os << "        bootstrap_reset_pending_ = false;\n";
             os << "        difftest_exit_ = 0;\n";
             os << "    }\n";
-            if (state.hasResetInput)
-            {
-                os << "    if (input_reset_) {\n";
-                for (const auto &stmt : state.resetStmts)
-                {
-                    os << stmt << "\n";
-                }
-                os << "    }\n";
-            }
             if (behaviorShardPlans.empty())
             {
                 for (const auto &stmt : stepStatements)

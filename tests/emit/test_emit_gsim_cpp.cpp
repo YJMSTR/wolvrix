@@ -2051,6 +2051,175 @@ void testRegisterDerivedOutputBehavior()
     expect(std::system(exePath.c_str()) == 0, "register-derived output driver should pass");
 }
 
+void testRegisterChainKeepsPreStepState()
+{
+    Design design;
+    auto &graph = design.createGraph("reg_chain_top");
+    design.markAsTop("reg_chain_top");
+
+    const auto inD = makeValue(graph, "d", 1, false);
+    const auto inClk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("d", inD);
+    graph.bindInputPort("clk", inClk);
+
+    const auto outQ = makeValue(graph, "q", 1, false);
+    graph.bindOutputPort("q", outQ);
+
+    const auto reg1 = graph.createOperation(OperationKind::kRegister, graph.internSymbol("inst1_q"));
+    const auto reg1Out = makeValue(graph, "inst1_q_out", 1, false);
+    graph.addResult(reg1, reg1Out);
+    const auto reg2 = graph.createOperation(OperationKind::kRegister, graph.internSymbol("inst2_q"));
+    const auto reg2Out = makeValue(graph, "inst2_q_out", 1, false);
+    graph.addResult(reg2, reg2Out);
+    const auto reg3 = graph.createOperation(OperationKind::kRegister, graph.internSymbol("inst3_q"));
+    const auto reg3Out = makeValue(graph, "inst3_q_out", 1, false);
+    graph.addResult(reg3, reg3Out);
+
+    const auto rp1 = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("inst1_rp"));
+    graph.setAttr(rp1, "regSymbol", std::string("inst1_q"));
+    const auto read1 = makeValue(graph, "inst1_read", 1, false);
+    graph.addResult(rp1, read1);
+    const auto rp2 = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("inst2_rp"));
+    graph.setAttr(rp2, "regSymbol", std::string("inst2_q"));
+    const auto read2 = makeValue(graph, "inst2_read", 1, false);
+    graph.addResult(rp2, read2);
+    const auto rp3 = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("inst3_rp"));
+    graph.setAttr(rp3, "regSymbol", std::string("inst3_q"));
+    const auto read3 = makeValue(graph, "inst3_read", 1, false);
+    graph.addResult(rp3, read3);
+
+    const auto assignQ = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_q"));
+    graph.addOperand(assignQ, read3);
+    graph.addResult(assignQ, outQ);
+
+    const auto wen = makeConstant(graph, "wen", "wen_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 1, "1'b1");
+    makeRegisterWrite(graph, "inst1_wp", wen, inD, mask, inClk, "inst1_q");
+    makeRegisterWrite(graph, "inst2_wp", wen, read1, mask, inClk, "inst2_q");
+    makeRegisterWrite(graph, "inst3_wp", wen, read2, mask, inClk, "inst3_q");
+
+    runGsim(design, "reg_chain_top");
+
+    const auto dir = artifactRoot() / "reg_chain_snapshot";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reg_chain_sim");
+    options.topOverrides = {"reg_chain_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "register-chain emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "reg_chain_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"reg_chain_sim.hpp\"\n";
+        driver << "#include \"reg_chain_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_d(1); sim.step();\n";
+        driver << "    if (sim.get_q() != 0) { std::printf(\"FAIL step1 q=%u expected 0\\n\", static_cast<unsigned>(sim.get_q())); return 1; }\n";
+        driver << "    sim.set_d(0); sim.step();\n";
+        driver << "    if (sim.get_q() != 0) { std::printf(\"FAIL step2 q=%u expected 0\\n\", static_cast<unsigned>(sim.get_q())); return 2; }\n";
+        driver << "    sim.set_d(1); sim.step();\n";
+        driver << "    if (sim.get_q() != 1) { std::printf(\"FAIL step3 q=%u expected 1\\n\", static_cast<unsigned>(sim.get_q())); return 3; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "reg_chain_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "register-chain driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "register-chain driver should preserve pre-step state across writes");
+}
+
+void testNamedResetInputWithClockDoesNotForceInitState()
+{
+    Design design;
+    auto &graph = design.createGraph("named_reset_clock_top");
+    design.markAsTop("named_reset_clock_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto resetIn = makeValue(graph, "reset", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("reset", resetIn);
+    graph.bindInputPort("d", inD);
+
+    const auto outQ = makeValue(graph, "q", 8, false);
+    graph.bindOutputPort("q", outQ);
+
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.setAttr(regOp, "initValue", std::string("8'h00"));
+    const auto regOut = makeValue(graph, "state_out", 8, false);
+    graph.addResult(regOp, regOut);
+
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    graph.addResult(readOp, readVal);
+
+    const auto resetConst = makeConstant(graph, "reset_const", "reset_const_c", 8, "8'h34");
+    const auto writeVal = makeValue(graph, "state_write", 8, false);
+    const auto mux = graph.createOperation(OperationKind::kMux, graph.internSymbol("state_sel"));
+    graph.addOperand(mux, resetIn);
+    graph.addOperand(mux, resetConst);
+    graph.addOperand(mux, inD);
+    graph.addResult(mux, writeVal);
+
+    const auto assignQ = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_q"));
+    graph.addOperand(assignQ, readVal);
+    graph.addResult(assignQ, outQ);
+
+    const auto wen = makeConstant(graph, "wen", "wen_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 8, "8'hff");
+    makeRegisterWrite(graph, "state_wp", wen, writeVal, mask, clk, "state");
+
+    runGsim(design, "named_reset_clock_top");
+
+    const auto dir = artifactRoot() / "named_reset_clock";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("named_reset_clock_sim");
+    options.topOverrides = {"named_reset_clock_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "named-reset-with-clock emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "named_reset_clock_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"named_reset_clock_sim.hpp\"\n";
+        driver << "#include \"named_reset_clock_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.set_d(0); sim.step();\n";
+        driver << "    if (sim.get_q() != 0x34u) { std::printf(\"FAIL reset q=%u expected 52\\n\", static_cast<unsigned>(sim.get_q())); return 1; }\n";
+        driver << "    sim.set_reset(0); sim.set_d(18); sim.step();\n";
+        driver << "    if (sim.get_q() != 18u) { std::printf(\"FAIL data q=%u expected 18\\n\", static_cast<unsigned>(sim.get_q())); return 2; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "named_reset_clock_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "named-reset-with-clock driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "named reset should follow explicit graph logic instead of forcing init state");
+}
+
 void testReplicateSignExtendBehavior()
 {
     Design design = buildReplicateSignExtendDesign();
@@ -3046,6 +3215,8 @@ int main()
         testMetadataStatementsStaySmallUnderLargeShardBudget();
         testRegisterLatencyBehavior();
         testRegisterDerivedOutputBehavior();
+        testRegisterChainKeepsPreStepState();
+        testNamedResetInputWithClockDoesNotForceInitState();
         testReplicateSignExtendBehavior();
         testRegisterInitValueBehavior();
         testBootstrapResetFirstStepBehavior();
