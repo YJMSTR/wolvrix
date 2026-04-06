@@ -1972,6 +1972,85 @@ void testRegisterLatencyBehavior()
     expect(std::system(exePath.c_str()) == 0, "register latency driver should pass");
 }
 
+void testRegisterDerivedOutputBehavior()
+{
+    Design design;
+    auto &graph = design.createGraph("reg_derived_top");
+    design.markAsTop("reg_derived_top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inClk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("clk", inClk);
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto regOut = makeValue(graph, "reg_state_out", 8, false);
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.addResult(regOp, regOut);
+
+    const auto readVal = makeValue(graph, "state_read", 8, false);
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    graph.addResult(readOp, readVal);
+
+    const auto oneConst = makeConstant(graph, "one_const", "one_const_c", 8, "8'd1");
+    const auto sumVal = makeValue(graph, "y_plus_one", 8, false);
+    const auto addOp = graph.createOperation(OperationKind::kAdd, graph.internSymbol("add_y"));
+    graph.addOperand(addOp, readVal);
+    graph.addOperand(addOp, oneConst);
+    graph.addResult(addOp, sumVal);
+
+    const auto assignY = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assignY, sumVal);
+    graph.addResult(assignY, outY);
+
+    const auto wen = makeConstant(graph, "wen", "wen_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 8, "8'hff");
+    makeRegisterWrite(graph, "state_wp", wen, inA, mask, inClk, "state");
+
+    runGsim(design, "reg_derived_top");
+
+    const auto dir = artifactRoot() / "reg_derived_output";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reg_derived_sim");
+    options.topOverrides = {"reg_derived_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "register-derived output emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "reg_derived_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"reg_derived_sim.hpp\"\n";
+        driver << "#include \"reg_derived_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    if (sim.get_y() != 1) { std::printf(\"FAIL reset y=%u expected 1\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    sim.set_a(41); sim.step();\n";
+        driver << "    if (sim.get_y() != 42) { std::printf(\"FAIL step1 y=%u expected 42\\n\", static_cast<unsigned>(sim.get_y())); return 2; }\n";
+        driver << "    sim.set_a(7); sim.step();\n";
+        driver << "    if (sim.get_y() != 8) { std::printf(\"FAIL step2 y=%u expected 8\\n\", static_cast<unsigned>(sim.get_y())); return 3; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "reg_derived_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "register-derived output driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "register-derived output driver should pass");
+}
+
 void testReplicateSignExtendBehavior()
 {
     Design design = buildReplicateSignExtendDesign();
@@ -2966,6 +3045,7 @@ int main()
         testMetadataShardsRespectByteBudgetForLargeMetadata();
         testMetadataStatementsStaySmallUnderLargeShardBudget();
         testRegisterLatencyBehavior();
+        testRegisterDerivedOutputBehavior();
         testReplicateSignExtendBehavior();
         testRegisterInitValueBehavior();
         testBootstrapResetFirstStepBehavior();

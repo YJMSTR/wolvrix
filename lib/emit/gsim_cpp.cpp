@@ -661,6 +661,20 @@ namespace wolvrix::lib::emit
             return !hasReturn && outArgName.empty() && !eventEdge.empty();
         }
 
+        bool isStatefulReadOp(const wolvrix::lib::grh::Operation &op)
+        {
+            using namespace wolvrix::lib::grh;
+
+            switch (op.kind())
+            {
+                case OperationKind::kRegisterReadPort:
+                case OperationKind::kLatchReadPort:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         // Forward declare sanitizeIdentifier for use in lowerOperation
         // (already defined above)
 
@@ -3401,10 +3415,14 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             }
             if (postBehaviorShardPlans.empty())
             {
-                if (!postStepStatements.empty())
+                if (!postStepStatements.empty() || !postState.outputStmts.empty())
                 {
                     os << "    {\n";
                     for (const auto &stmt : postStepStatements)
+                    {
+                        os << stmt << "\n";
+                    }
+                    for (const auto &stmt : postState.outputStmts)
                     {
                         os << stmt << "\n";
                     }
@@ -3416,6 +3434,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 for (const auto &plan : postBehaviorShardPlans)
                 {
                     os << "    " << plan.methodName << "();\n";
+                }
+                for (const auto &stmt : postState.outputStmts)
+                {
+                    os << stmt << "\n";
                 }
             }
             os << "    difftest_exit_ = 0;\n";
@@ -3797,6 +3819,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
         std::unordered_set<int64_t> postSequentialSideEffectOpIndices;
         std::unordered_set<int64_t> postSequentialSliceOpIndices;
         std::vector<int64_t> postSequentialWorklist;
+        std::unordered_map<int32_t, int64_t> producerOpIndices;
         for (int64_t opIdx : metadata->topoOrder)
         {
             if (opIdx < 0 || static_cast<std::size_t>(opIdx) >= operationIdsByIndex.size())
@@ -3809,6 +3832,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 continue;
             }
             const auto op = target->graph->getOperation(opId);
+            for (const auto valueId : op.results())
+            {
+                producerOpIndices[valueId.index] = opIdx;
+            }
             if (!isPostSequentialSideEffectDpiCall(op))
             {
                 continue;
@@ -3839,6 +3866,60 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                     postSequentialWorklist.push_back(predecessor);
                 }
             }
+        }
+
+        for (const auto &port : target->graph->outputPorts())
+        {
+            const auto producerIt = producerOpIndices.find(port.value.index);
+            if (producerIt == producerOpIndices.end())
+            {
+                continue;
+            }
+
+            std::unordered_set<int64_t> outputSlice;
+            std::vector<int64_t> outputWorklist{producerIt->second};
+            bool dependsOnStatefulRead = false;
+            while (!outputWorklist.empty())
+            {
+                const auto current = outputWorklist.back();
+                outputWorklist.pop_back();
+                if (!outputSlice.insert(current).second)
+                {
+                    continue;
+                }
+                if (current < 0 || static_cast<std::size_t>(current) >= operationIdsByIndex.size())
+                {
+                    continue;
+                }
+                const auto opId = operationIdsByIndex[static_cast<std::size_t>(current)];
+                if (!opId.valid())
+                {
+                    continue;
+                }
+                const auto op = target->graph->getOperation(opId);
+                if (isStatefulReadOp(op))
+                {
+                    dependsOnStatefulRead = true;
+                }
+                const auto predIt = metadata->predecessors.find(current);
+                if (predIt == metadata->predecessors.end())
+                {
+                    continue;
+                }
+                for (const auto predecessor : predIt->second)
+                {
+                    if (predecessor >= 0)
+                    {
+                        outputWorklist.push_back(predecessor);
+                    }
+                }
+            }
+
+            if (!dependsOnStatefulRead)
+            {
+                continue;
+            }
+            postSequentialSliceOpIndices.insert(outputSlice.begin(), outputSlice.end());
         }
 
         auto buildCodegenState = [&](bool persistentTemps,
@@ -3917,7 +3998,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
         CodegenState postState = buildCodegenState(false,
                                                    &postSequentialSliceOpIndices,
                                                    nullptr,
-                                                   false,
+                                                   true,
                                                    "post_step_tmp_group_");
 
         // Validate custom port order names
@@ -3982,7 +4063,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             postState = buildCodegenState(true,
                                           &postSequentialSliceOpIndices,
                                           nullptr,
-                                          false,
+                                          true,
                                           "post_step_tmp_group_");
             std::vector<std::string> rebuiltUnsupportedOps = state.unsupportedOps;
             rebuiltUnsupportedOps.insert(rebuiltUnsupportedOps.end(), postState.unsupportedOps.begin(), postState.unsupportedOps.end());
