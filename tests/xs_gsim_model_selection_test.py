@@ -583,6 +583,26 @@ def test_root_make_forwards_xiangshan_feature_flags_to_gsim() -> None:
     )
 
 
+def test_root_make_forwards_simulator_build_options_to_gsim() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("run_xs_gsim:")
+    end = makefile_text.index("\nrun_xs_gsim_smoke:", start)
+    body = makefile_text[start:end]
+
+    expect(
+        body.count("EMU_THREADS=$(XS_EMU_THREADS)") >= 2,
+        "run_xs_gsim should forward XS_EMU_THREADS through both the logged and executed downstream XiangShan gsim invocations",
+    )
+    expect(
+        body.count('SIM_VFLAGS="$(XS_SIM_VFLAGS)"') + body.count('SIM_VFLAGS=\\"$(XS_SIM_VFLAGS)\\"') >= 2,
+        "run_xs_gsim should forward XS_SIM_VFLAGS through both the logged and executed downstream XiangShan gsim invocations",
+    )
+    expect(
+        body.count("$(if $(filter 1,$(XS_WAVEFORM)),EMU_TRACE=fst,)") >= 2,
+        "run_xs_gsim should forward the conditional EMU_TRACE=fst fragment through both downstream XiangShan gsim invocations",
+    )
+
+
 def test_root_make_derives_actual_gsim_artifact_dir_from_base_override(model_dir: pathlib.Path) -> None:
     result = run_root_gsim_artifact_dir_print(model_dir)
     stdout = result.stdout + result.stderr
@@ -723,6 +743,7 @@ def main() -> int:
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
         test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
         test_root_make_forwards_xiangshan_feature_flags_to_gsim()
+        test_root_make_forwards_simulator_build_options_to_gsim()
         test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
         test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
         test_gsim_reset_sequence_holds_reset_until_loop_end()

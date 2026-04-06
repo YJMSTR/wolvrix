@@ -767,6 +767,106 @@ namespace
         return list;
     }
 
+    const char *slangSeverityName(slang::DiagnosticSeverity severity)
+    {
+        switch (severity)
+        {
+        case slang::DiagnosticSeverity::Ignored:
+            return "debug";
+        case slang::DiagnosticSeverity::Note:
+            return "info";
+        case slang::DiagnosticSeverity::Warning:
+            return "warning";
+        case slang::DiagnosticSeverity::Error:
+        case slang::DiagnosticSeverity::Fatal:
+            return "error";
+        default:
+            return "info";
+        }
+    }
+
+    PyObject *slangDiagnosticsToPyList(std::span<const slang::Diagnostic> messages,
+                                       const slang::DiagnosticEngine &diagEngine,
+                                       const slang::SourceManager *sourceManager)
+    {
+        PyObject *list = PyList_New(static_cast<Py_ssize_t>(messages.size()));
+        if (!list)
+        {
+            return nullptr;
+        }
+        for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(messages.size()); ++i)
+        {
+            const auto &message = messages[static_cast<std::size_t>(i)];
+            PyObject *dict = PyDict_New();
+            if (!dict)
+            {
+                Py_DECREF(list);
+                return nullptr;
+            }
+
+            const auto severity = diagEngine.getSeverity(message.code, message.location);
+            const std::string text = std::string(diagEngine.getMessage(message.code));
+            auto *kind = PyUnicode_FromString(slangSeverityName(severity));
+            auto *pass = PyUnicode_FromString("slang");
+            auto *msg = PyUnicode_FromString(text.c_str());
+            auto *ctx = PyUnicode_FromString("");
+            auto *origin = PyUnicode_FromString("");
+            if (!kind || !pass || !msg || !ctx || !origin)
+            {
+                Py_XDECREF(kind);
+                Py_XDECREF(pass);
+                Py_XDECREF(msg);
+                Py_XDECREF(ctx);
+                Py_XDECREF(origin);
+                Py_DECREF(dict);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            PyDict_SetItemString(dict, "kind", kind);
+            PyDict_SetItemString(dict, "pass", pass);
+            PyDict_SetItemString(dict, "message", msg);
+            PyDict_SetItemString(dict, "context", ctx);
+            PyDict_SetItemString(dict, "origin", origin);
+            Py_DECREF(kind);
+            Py_DECREF(pass);
+            Py_DECREF(msg);
+            Py_DECREF(ctx);
+            Py_DECREF(origin);
+
+            if (message.location.valid() && sourceManager)
+            {
+                DiagnosticLocationInfo info;
+                if (getDiagnosticLocationInfo(sourceManager, message.location, info))
+                {
+                    PyObject *file = PyUnicode_FromString(info.filename.c_str());
+                    PyObject *line = PyLong_FromUnsignedLongLong(info.line);
+                    PyObject *column = PyLong_FromUnsignedLongLong(info.column);
+                    if (file && line && column)
+                    {
+                        PyDict_SetItemString(dict, "file", file);
+                        PyDict_SetItemString(dict, "line", line);
+                        PyDict_SetItemString(dict, "column", column);
+                    }
+                    Py_XDECREF(file);
+                    Py_XDECREF(line);
+                    Py_XDECREF(column);
+                }
+            }
+
+            PyObject *text_obj = PyUnicode_FromString(text.c_str());
+            if (!text_obj)
+            {
+                Py_DECREF(dict);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            PyDict_SetItemString(dict, "text", text_obj);
+            Py_DECREF(text_obj);
+            PyList_SET_ITEM(list, i, dict);
+        }
+        return list;
+    }
+
     void emitDiagnostics(const std::vector<wolvrix::lib::diag::Diagnostic> &messages,
                          wolvrix::lib::LogLevel threshold,
                          const slang::SourceManager *sourceManager)
@@ -869,29 +969,18 @@ namespace
         driver.options.singleUnit = true;
         driver.options.compilationFlags.at(slang::ast::CompilationFlags::AllowTopLevelIfacePorts) = true;
 
-        auto reportSlangDiagnostics = [&]() {
-            if (driver.diagEngine.getNumErrors() == 0 && driver.diagEngine.getNumWarnings() == 0)
-            {
-                return;
-            }
-            (void)driver.reportDiagnostics(/* quiet */ true);
-        };
-
         if (!driver.parseCommandLine(static_cast<int>(argv.size()), argv.data()))
         {
-            reportSlangDiagnostics();
             PyErr_SetString(PyExc_RuntimeError, "failed to parse slang options");
             return nullptr;
         }
         if (!driver.processOptions())
         {
-            reportSlangDiagnostics();
             PyErr_SetString(PyExc_RuntimeError, "failed to apply slang options");
             return nullptr;
         }
         if (!driver.parseAllSources())
         {
-            reportSlangDiagnostics();
             PyErr_SetString(PyExc_RuntimeError, "failed to parse sources");
             return nullptr;
         }
@@ -913,15 +1002,26 @@ namespace
                 hasSlangErrors = true;
             }
         }
-        if (hasSlangIssues)
-        {
-            driver.reportCompilation(*compilation, /* quiet */ true);
-            reportSlangDiagnostics();
-        }
         if (hasSlangErrors)
         {
-            PyErr_SetString(PyExc_RuntimeError, "slang reported errors; see diagnostics");
-            return nullptr;
+            const auto sourceManager = compilation->getSourceManager();
+            PyObject *diag_list = slangDiagnosticsToPyList(allDiagnostics, driver.diagEngine,
+                                                           sourceManager);
+            if (!diag_list)
+            {
+                return nullptr;
+            }
+            PyObject *result = PyTuple_New(3);
+            if (!result)
+            {
+                Py_DECREF(diag_list);
+                return nullptr;
+            }
+            Py_INCREF(Py_None);
+            PyTuple_SET_ITEM(result, 0, Py_None);
+            PyTuple_SET_ITEM(result, 1, PyBool_FromLong(0));
+            PyTuple_SET_ITEM(result, 2, diag_list);
+            return result;
         }
 
         bool ok = false;

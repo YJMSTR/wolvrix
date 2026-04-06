@@ -4,6 +4,7 @@ import importlib.util
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 
 
@@ -358,6 +359,48 @@ def test_emit_attributes_forward_behavior_shard_cap() -> None:
                f"behavior shard should respect forwarded byte cap: {step_path}")
 
 
+def test_read_sv_frontend_failure_respects_quiet_mode() -> None:
+    root = ARTIFACT_ROOT / "frontend_failure_quiet"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    broken_sv = source_dir / "broken.sv"
+    broken_sv.write_text("module top(input logic a output logic y); endmodule\n", encoding="utf-8")
+
+    probe = f"""
+import importlib.util
+import pathlib
+import sys
+
+candidate = pathlib.Path({str((BUILD_PYTHON_DIR / 'wolvrix' / '__init__.py'))!r})
+spec = importlib.util.spec_from_file_location("wolvrix", candidate, submodule_search_locations=[str(candidate.parent)])
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"failed to load wolvrix module spec from {{candidate}}")
+module = importlib.util.module_from_spec(spec)
+sys.modules["wolvrix"] = module
+spec.loader.exec_module(module)
+design, diagnostics = module.read_sv(
+    {str(broken_sv)!r},
+    print_diagnostics_level="off",
+    raise_diagnostics_level="off",
+)
+print("design_is_none", design is None)
+print("diag_count", len(diagnostics))
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    expect(result.returncode == 0, f"quiet frontend probe should succeed: {result.stderr or result.stdout}")
+    expect("design_is_none True" in result.stdout, f"broken source should not produce a design: {result.stdout}")
+    expect("diag_count" in result.stdout, f"probe should report diagnostic count: {result.stdout}")
+    expect(result.stderr.strip() == "", f"quiet frontend failure should not print raw Slang diagnostics: {result.stderr!r}")
+
+
 def main() -> int:
     try:
         test_same_design_pipeline_flow()
@@ -370,6 +413,7 @@ def main() -> int:
         test_port_order_nonexistent_name()
         test_port_order_duplicate_name()
         test_emit_attributes_forward_behavior_shard_cap()
+        test_read_sv_frontend_failure_respects_quiet_mode()
     except Exception as ex:
         return fail(str(ex))
     return 0
