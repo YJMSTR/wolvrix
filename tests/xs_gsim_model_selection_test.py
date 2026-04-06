@@ -250,6 +250,30 @@ def run_root_python_launch_print(build_dir: pathlib.Path) -> subprocess.Complete
     )
 
 
+def run_root_gsim_artifact_dir_print(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    base_rel = (model_dir / "fixture").relative_to(REPO_ROOT)
+    print_rule = (
+        "print-xs-gsim-artifact-dir:\n"
+        "\t@printf 'DIR=%s\\n' '$(XS_WOLF_GSIM_DIR_ABS)'"
+    )
+    command = (
+        f"source env.sh && make --eval {shlex.quote(print_rule)} print-xs-gsim-artifact-dir "
+        f"XS_WOLF_GSIM_BASE={shlex.quote(str(base_rel))}"
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            command,
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def run_gsim_link_flags_print(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
     build_dir = model_dir.parent / "build_link_flags"
     cpp_path = model_dir / "fixture.cpp"
@@ -559,6 +583,44 @@ def test_root_make_forwards_xiangshan_feature_flags_to_gsim() -> None:
     )
 
 
+def test_root_make_derives_actual_gsim_artifact_dir_from_base_override(model_dir: pathlib.Path) -> None:
+    result = run_root_gsim_artifact_dir_print(model_dir)
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"root-level gsim artifact dir print should succeed: {stdout.strip()}")
+    expect(
+        f"DIR={model_dir}" in stdout,
+        f"root Makefile should derive the GSIM artifact directory from XS_WOLF_GSIM_BASE: {stdout.strip()}",
+    )
+
+
+def test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+
+    budget_start = makefile_text.index("check_xs_gsim_budget:")
+    budget_end = makefile_text.index("\n\nrun_xs_gsim:", budget_start)
+    budget_body = makefile_text[budget_start:budget_end]
+    expect(
+        '--base-dir "$(abspath $(XS_WOLF_GSIM_DIR))"' in budget_body,
+        "check_xs_gsim_budget should resolve manifest shards from the actual GSIM artifact directory",
+    )
+    expect(
+        '$(XS_WOLF_EMIT_DIR)' not in budget_body,
+        "check_xs_gsim_budget should not resolve manifest shards relative to the SV emit directory",
+    )
+
+    run_start = makefile_text.index("run_xs_gsim:")
+    run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
+    run_body = makefile_text[run_start:run_end]
+    expect(
+        run_body.count("WOLVRIX_GSIM_INCLUDE_DIR=$(XS_WOLF_GSIM_DIR_ABS)") >= 1,
+        "run_xs_gsim should pass the actual GSIM artifact directory to XiangShan downstream builds",
+    )
+    expect(
+        "WOLVRIX_GSIM_INCLUDE_DIR=$(XS_WOLF_EMIT_DIR_ABS)" not in run_body,
+        "run_xs_gsim should not hardcode XS_WOLF_EMIT_DIR as the downstream GSIM artifact directory",
+    )
+
+
 def test_gsim_reset_sequence_holds_reset_until_loop_end() -> None:
     emu_cpp = XIANGSHAN_DIR / "difftest" / "src" / "test" / "csrc" / "emu" / "emu.cpp"
     text = emu_cpp.read_text(encoding="utf-8")
@@ -661,6 +723,8 @@ def main() -> int:
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
         test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
         test_root_make_forwards_xiangshan_feature_flags_to_gsim()
+        test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
+        test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()
         test_gsim_link_disables_relax_and_pie(ARTIFACT_ROOT / "case_link_flags" / "model")
