@@ -116,6 +116,47 @@ def main() -> int:
                 isolated_launch.env.get("PYTHONNOUSERSITE") == "1",
                 f"present build-tree bindings should disable user site imports: {isolated_launch.env!r}",
             )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dut_path = pathlib.Path(tmpdir) / "dut_001.v"
+            dut_path.write_text("module top_module; endmodule\n", encoding="utf-8")
+            output_dir = pathlib.Path(tmpdir) / "out"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            repo_root = pathlib.Path(tmpdir)
+
+            original_runner = module.run_subprocess_limited
+            captured: dict[str, object] = {}
+
+            def fake_runner(argv, timeout_sec, memory_limit_mb, env=None):  # type: ignore[override]
+                captured["argv"] = list(argv)
+                captured["timeout_sec"] = timeout_sec
+                captured["memory_limit_mb"] = memory_limit_mb
+                captured["env"] = dict(env or {})
+                return module.LimitedProcessResult(returncode=0, stdout="", stderr="")
+
+            module.run_subprocess_limited = fake_runner  # type: ignore[assignment]
+            try:
+                result = module.run_single_dut_subprocess(
+                    dut_path,
+                    output_dir,
+                    str(repo_root / "wolvrix" / "build" / "python"),
+                    repo_root,
+                    "runtime",
+                    timeout_sec=17,
+                    memory_limit_mb=321,
+                )
+            finally:
+                module.run_subprocess_limited = original_runner  # type: ignore[assignment]
+
+            expect(result.result == "success", f"runtime helper probe should succeed: {result}")
+            expect(
+                captured.get("memory_limit_mb") == 321,
+                f"runtime mode should apply the configured memory cap to the outer helper process: {captured!r}",
+            )
+            expect(
+                "--memory-limit-mb" in captured.get("argv", []),
+                f"runtime mode should still forward the memory-limit flag to the helper argv: {captured!r}",
+            )
     except Exception as ex:
         return fail(str(ex))
     return 0
