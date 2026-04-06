@@ -695,6 +695,48 @@ namespace wolvrix::lib::emit
                 return "0";
             };
 
+            auto applyEventEdgeGuard = [&](const std::string &baseCondition,
+                                           std::size_t eventOperandOffset) -> std::string {
+                const auto edges =
+                    getAttrAs<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
+                const bool needsEdgeGuard =
+                    std::find(edges.begin(), edges.end(), "negedge") != edges.end();
+                if (!needsEdgeGuard || op.operands().size() < eventOperandOffset + edges.size())
+                {
+                    return baseCondition;
+                }
+
+                std::vector<std::string> edgeTerms;
+                edgeTerms.reserve(edges.size());
+                for (std::size_t edgeIndex = 0; edgeIndex < edges.size(); ++edgeIndex)
+                {
+                    const std::string signalExpr = getOperandExpr(eventOperandOffset + edgeIndex);
+                    if (edges[edgeIndex] == "posedge")
+                    {
+                        edgeTerms.push_back("(" + signalExpr + ")");
+                    }
+                    else if (edges[edgeIndex] == "negedge")
+                    {
+                        edgeTerms.push_back("(!(" + signalExpr + "))");
+                    }
+                    else
+                    {
+                        edgeTerms.push_back("(" + signalExpr + ")");
+                    }
+                }
+                if (edgeTerms.empty())
+                {
+                    return baseCondition;
+                }
+
+                std::string edgeCondition = edgeTerms.front();
+                for (std::size_t i = 1; i < edgeTerms.size(); ++i)
+                {
+                    edgeCondition = "(" + edgeCondition + " || " + edgeTerms[i] + ")";
+                }
+                return "((" + baseCondition + ") && " + edgeCondition + ")";
+            };
+
             // Helper to set result expression
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < op.results().size()) {
@@ -1197,6 +1239,7 @@ namespace wolvrix::lib::emit
                     std::string addr = getOperandExpr(1);
                     std::string data = getOperandExpr(2);
                     std::string mask = getOperandExpr(3);
+                    condition = applyEventEdgeGuard(condition, 4);
 
                     auto memSymAttr = op.attr("memSymbol");
                     std::string sym;
@@ -1272,31 +1315,7 @@ namespace wolvrix::lib::emit
                     std::string condition = getOperandExpr(0);
                     std::string nextValue = getOperandExpr(1);
                     std::string mask = getOperandExpr(2);
-                    const auto edges =
-                        getAttrAs<std::vector<std::string>>(op, "eventEdge").value_or(std::vector<std::string>{});
-                    const bool needsEdgeGuard =
-                        std::find(edges.begin(), edges.end(), "negedge") != edges.end();
-                    if (needsEdgeGuard && op.operands().size() >= 3 + edges.size()) {
-                        std::vector<std::string> edgeTerms;
-                        edgeTerms.reserve(edges.size());
-                        for (std::size_t edgeIndex = 0; edgeIndex < edges.size(); ++edgeIndex) {
-                            const std::string signalExpr = getOperandExpr(3 + edgeIndex);
-                            if (edges[edgeIndex] == "posedge") {
-                                edgeTerms.push_back("(" + signalExpr + ")");
-                            } else if (edges[edgeIndex] == "negedge") {
-                                edgeTerms.push_back("(!(" + signalExpr + "))");
-                            } else {
-                                edgeTerms.push_back("(" + signalExpr + ")");
-                            }
-                        }
-                        if (!edgeTerms.empty()) {
-                            std::string edgeCondition = edgeTerms.front();
-                            for (std::size_t i = 1; i < edgeTerms.size(); ++i) {
-                                edgeCondition = "(" + edgeCondition + " || " + edgeTerms[i] + ")";
-                            }
-                            condition = "((" + condition + ") && " + edgeCondition + ")";
-                        }
-                    }
+                    condition = applyEventEdgeGuard(condition, 3);
 
                     auto regSymAttr = op.attr("regSymbol");
                     std::string sym;
@@ -1458,7 +1477,7 @@ namespace wolvrix::lib::emit
                     }
                     call << ");";
 
-                    const std::string condition = getOperandExpr(0);
+                    const std::string condition = applyEventEdgeGuard(getOperandExpr(0), 1 + inArgName.size());
                     state.combinationalStmts.push_back("        if (" + condition + ") { " + call.str() + " }");
 
                     if (hasReturn)

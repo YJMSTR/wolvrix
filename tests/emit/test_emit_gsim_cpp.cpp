@@ -2392,6 +2392,185 @@ void testMixedEdgeRegisterWriteUsesEachEventOperand()
     expect(std::system(exePath.c_str()) == 0, "mixed-edge register should use each event operand when deciding which edge fires");
 }
 
+void testNegedgeMemoryWriteHonorsClockLevel()
+{
+    Design design;
+    auto &graph = design.createGraph("negedge_mem_top");
+    design.markAsTop("negedge_mem_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto wen = makeValue(graph, "wen", 1, false);
+    const auto raddr = makeValue(graph, "raddr", 1, false);
+    const auto waddr = makeValue(graph, "waddr", 1, false);
+    const auto wdata = makeValue(graph, "wdata", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("wen", wen);
+    graph.bindInputPort("raddr", raddr);
+    graph.bindInputPort("waddr", waddr);
+    graph.bindInputPort("wdata", wdata);
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+
+    const auto mem = graph.createOperation(OperationKind::kMemory, graph.internSymbol("mem0"));
+    graph.setAttr(mem, "width", static_cast<int64_t>(8));
+    graph.setAttr(mem, "row", static_cast<int64_t>(2));
+    graph.setAttr(mem, "isSigned", false);
+    graph.setAttr(mem, "initKind", std::vector<std::string>{"literal"});
+    graph.setAttr(mem, "initFile", std::vector<std::string>{""});
+    graph.setAttr(mem, "initValue", std::vector<std::string>{"8'h00"});
+    graph.setAttr(mem, "initStart", std::vector<int64_t>{-1});
+    graph.setAttr(mem, "initLen", std::vector<int64_t>{0});
+
+    const auto readOp = graph.createOperation(OperationKind::kMemoryReadPort, graph.internSymbol("mem0_read"));
+    graph.setAttr(readOp, "memSymbol", std::string("mem0"));
+    graph.addOperand(readOp, raddr);
+    const auto readData = makeValue(graph, "read_data", 8, false);
+    graph.addResult(readOp, readData);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, readData);
+    graph.addResult(assign, out);
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto memWrite = graph.createOperation(OperationKind::kMemoryWritePort, graph.internSymbol("mem0_write"));
+    graph.setAttr(memWrite, "memSymbol", std::string("mem0"));
+    graph.addOperand(memWrite, wen);
+    graph.addOperand(memWrite, waddr);
+    graph.addOperand(memWrite, wdata);
+    graph.addOperand(memWrite, mask);
+    graph.addOperand(memWrite, clk);
+    graph.setAttr(memWrite, "eventEdge", std::vector<std::string>{"negedge"});
+
+    runGsim(design, "negedge_mem_top");
+
+    const auto dir = artifactRoot() / "negedge_mem";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("negedge_mem_sim");
+    options.topOverrides = {"negedge_mem_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "negedge memory emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "negedge_mem_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"negedge_mem_sim.hpp\"\n";
+        driver << "#include \"negedge_mem_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_raddr(0); sim.set_waddr(0); sim.set_wen(1); sim.set_wdata(0x2a);\n";
+        driver << "    sim.set_clk(1); sim.step();\n";
+        driver << "    if (sim.get_y() != 0) { std::printf(\"FAIL poslevel y=%u expected 0\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    sim.set_clk(0); sim.step();\n";
+        driver << "    sim.set_wen(0); sim.step();\n";
+        driver << "    if (sim.get_y() != 0x2au) { std::printf(\"FAIL negedge y=%u expected 42\\n\", static_cast<unsigned>(sim.get_y())); return 2; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "negedge_mem_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "negedge memory driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "negedge memory write should only fire when the negedge level is active");
+}
+
+void testMixedEdgeDpiCallUsesEachEventOperand()
+{
+    Design design;
+    auto &graph = design.createGraph("mixed_edge_dpi_top");
+    design.markAsTop("mixed_edge_dpi_top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto rstn = makeValue(graph, "rst_n", 1, false);
+    const auto in = makeValue(graph, "in", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("rst_n", rstn);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", out);
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, in);
+    graph.addResult(assign, out);
+
+    const auto cond = makeConstant(graph, "dpi_cond", "dpi_cond_const", 1, "1'b1");
+    const auto import = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(import, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(import, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(import, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(import, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(import, "argsType", std::vector<std::string>{"logic"});
+    graph.setAttr(import, "hasReturn", false);
+    graph.setAttr(import, "returnWidth", static_cast<int64_t>(0));
+    graph.setAttr(import, "returnSigned", false);
+    graph.setAttr(import, "returnType", std::string("void"));
+
+    const auto call = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("dpi_call"));
+    graph.setAttr(call, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(call, "eventEdge", std::vector<std::string>{"posedge", "negedge"});
+    graph.setAttr(call, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(call, "outArgName", std::vector<std::string>{});
+    graph.setAttr(call, "inoutArgName", std::vector<std::string>{});
+    graph.setAttr(call, "hasReturn", false);
+    graph.addOperand(call, cond);
+    graph.addOperand(call, in);
+    graph.addOperand(call, clk);
+    graph.addOperand(call, rstn);
+
+    runGsim(design, "mixed_edge_dpi_top");
+
+    const auto dir = artifactRoot() / "mixed_edge_dpi";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("mixed_edge_dpi_sim");
+    options.topOverrides = {"mixed_edge_dpi_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "mixed-edge dpi emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "mixed_edge_dpi_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"mixed_edge_dpi_sim.hpp\"\n";
+        driver << "#include <cstdint>\n";
+        driver << "#include <cstdio>\n";
+        driver << "static std::uint32_t g_calls = 0;\n";
+        driver << "static std::uint32_t g_last = 0;\n";
+        driver << "extern \"C\" void dpi_capture(std::uint8_t value) { ++g_calls; g_last = value; }\n";
+        driver << "#include \"mixed_edge_dpi_sim.cpp\"\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_in(7); sim.set_clk(1); sim.set_rst_n(1); sim.step();\n";
+        driver << "    if (g_calls != 1 || g_last != 7) { std::printf(\"FAIL posedge calls=%u last=%u\\n\", g_calls, g_last); return 1; }\n";
+        driver << "    sim.set_clk(0); sim.set_rst_n(1); sim.step();\n";
+        driver << "    if (g_calls != 1) { std::printf(\"FAIL extra call on idle low level: %u\\n\", g_calls); return 2; }\n";
+        driver << "    sim.set_clk(1); sim.set_rst_n(0); sim.step();\n";
+        driver << "    if (g_calls != 2) { std::printf(\"FAIL negedge-rst call count=%u\\n\", g_calls); return 3; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "mixed_edge_dpi_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "mixed-edge dpi driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "edge-qualified dpi calls should only run on matching event levels");
+}
+
 void testReplicateSignExtendBehavior()
 {
     Design design = buildReplicateSignExtendDesign();
@@ -3391,6 +3570,8 @@ int main()
         testNamedResetInputWithClockDoesNotForceInitState();
         testNegedgeRegisterWriteHonorsClockLevel();
         testMixedEdgeRegisterWriteUsesEachEventOperand();
+        testNegedgeMemoryWriteHonorsClockLevel();
+        testMixedEdgeDpiCallUsesEachEventOperand();
         testReplicateSignExtendBehavior();
         testRegisterInitValueBehavior();
         testBootstrapResetFirstStepBehavior();
