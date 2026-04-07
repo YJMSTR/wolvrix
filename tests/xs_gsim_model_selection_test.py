@@ -654,6 +654,36 @@ def test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream() -> 
     )
 
 
+def test_root_make_resolves_xs_gsim_emu_from_actual_build_dir() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    run_start = makefile_text.index("run_xs_gsim:")
+    run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
+    run_body = makefile_text[run_start:run_end]
+    expect(
+        'XS_GSIM_BUILD_DIR="$(XS_ROOT)/$(BUILD_DIR)"' in run_body,
+        "run_xs_gsim should resolve the emulator from the actual XiangShan BUILD_DIR instead of hardcoding $(XS_ROOT)/build",
+    )
+    expect(
+        'XS_GSIM_BUILD_DIR="$(XS_ROOT)/build"' not in run_body,
+        "run_xs_gsim should not hardcode $(XS_ROOT)/build when locating the downstream gsim emulator",
+    )
+
+
+def test_root_make_honors_custom_waveform_path_for_xs_gsim() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    run_start = makefile_text.index("run_xs_gsim:")
+    run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
+    run_body = makefile_text[run_start:run_end]
+    expect(
+        run_body.count('$(if $(filter 1,$(XS_WAVEFORM))$(XS_WAVEFORM_PATH),--wave-path $(XS_WAVEFORM_PATH_ABS),$(if $(filter 1,$(XS_WAVEFORM)),--wave-path $$WAVEFORM,))') >= 2,
+        "run_xs_gsim should honor XS_WAVEFORM_PATH in both the logged and executed emulator invocations",
+    )
+    expect(
+        '--wave-path $(XS_WAVEFORM_PATH_ABS)' in run_body,
+        "run_xs_gsim should prefer XS_WAVEFORM_PATH when a custom waveform location is provided",
+    )
+
+
 def test_gsim_reset_sequence_holds_reset_until_loop_end() -> None:
     emu_cpp = XIANGSHAN_DIR / "difftest" / "src" / "test" / "csrc" / "emu" / "emu.cpp"
     text = emu_cpp.read_text(encoding="utf-8")
@@ -760,6 +790,8 @@ def main() -> int:
         test_xs_repcut_targets_depend_on_xs_wolf_emit()
         test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
         test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
+        test_root_make_resolves_xs_gsim_emu_from_actual_build_dir()
+        test_root_make_honors_custom_waveform_path_for_xs_gsim()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()
         test_gsim_link_disables_relax_and_pie(ARTIFACT_ROOT / "case_link_flags" / "model")
