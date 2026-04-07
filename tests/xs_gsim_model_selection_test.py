@@ -567,12 +567,16 @@ def test_root_make_only_forces_build_tree_python_when_bindings_exist() -> None:
     present_stdout = present_result.stdout + present_result.stderr
     expect(present_result.returncode == 0, f"root-level python launch print should succeed: {present_stdout.strip()}")
     expect(
-        "ARGS=-S" in present_stdout,
-        f"present build-tree bindings should keep the isolated -S launch path: {present_stdout.strip()}",
+        "ARGS=-S" not in present_stdout,
+        f"unstamped build-tree bindings should not keep the isolated -S launch path: {present_stdout.strip()}",
     )
     expect(
-        f"PYTHONPATH={build_dir}" in present_stdout and "PYTHONNOUSERSITE=1" in present_stdout,
-        f"present build-tree bindings should still pin imports to the build tree: {present_stdout.strip()}",
+        f"PYTHONPATH={build_dir}" not in present_stdout and "PYTHONNOUSERSITE=1" not in present_stdout,
+        f"unstamped build-tree bindings should not pin imports to the build tree: {present_stdout.strip()}",
+    )
+    expect(
+        "WOLVRIX_PYTHON_BUILD_DIR=" not in present_stdout,
+        f"unstamped build-tree bindings should not hint XiangShan helpers toward the build tree: {present_stdout.strip()}",
     )
 
     mismatched_dir = ARTIFACT_ROOT / "mismatched_build_python"
@@ -592,6 +596,33 @@ def test_root_make_only_forces_build_tree_python_when_bindings_exist() -> None:
     expect(
         f"PYTHONPATH={mismatched_dir}" not in mismatched_stdout and "PYTHONNOUSERSITE=1" not in mismatched_stdout,
         f"mismatched build-tree bindings should not shadow the editable install for XiangShan flows: {mismatched_stdout.strip()}",
+    )
+    expect(
+        "WOLVRIX_PYTHON_BUILD_DIR=" not in mismatched_stdout,
+        f"mismatched build-tree bindings should not hint XiangShan helpers toward the build tree: {mismatched_stdout.strip()}",
+    )
+
+    stamped_dir = ARTIFACT_ROOT / "stamped_build_python"
+    pkg_dir = stamped_dir / "wolvrix"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_file(pkg_dir / "__init__.py", "_native = object()\n")
+    (pkg_dir / "_wolvrix.so").write_bytes(b"")
+    write_file(stamped_dir / ".python-executable", f"{sys.executable}\n")
+
+    stamped_result = run_root_python_launch_print(stamped_dir)
+    stamped_stdout = stamped_result.stdout + stamped_result.stderr
+    expect(stamped_result.returncode == 0, f"root-level python launch print should succeed: {stamped_stdout.strip()}")
+    expect(
+        "ARGS=-S" in stamped_stdout,
+        f"matching stamped build-tree bindings should keep the isolated -S launch path: {stamped_stdout.strip()}",
+    )
+    expect(
+        f"PYTHONPATH={stamped_dir}" in stamped_stdout and "PYTHONNOUSERSITE=1" in stamped_stdout,
+        f"matching stamped build-tree bindings should still pin imports to the build tree: {stamped_stdout.strip()}",
+    )
+    expect(
+        f"ENV=WOLVRIX_PYTHON_BUILD_DIR={stamped_dir}" in stamped_stdout,
+        f"matching stamped build-tree bindings should still hint XiangShan helpers toward the build tree: {stamped_stdout.strip()}",
     )
 
 
@@ -623,8 +654,26 @@ def test_root_make_only_exports_global_pythonpath_for_complete_build_tree() -> N
         f"complete build-tree bindings should mark the global build python as available: {present_stdout.strip()}",
     )
     expect(
-        f"PYTHONPATH={present_dir}" in present_stdout,
-        f"complete build-tree bindings should prepend the build python dir globally: {present_stdout.strip()}",
+        f"PYTHONPATH={present_dir}" not in present_stdout,
+        f"unstamped build-tree bindings should not prepend the build python dir globally: {present_stdout.strip()}",
+    )
+
+    stamped_dir = ARTIFACT_ROOT / "global_py_stamped"
+    pkg_dir = stamped_dir / "wolvrix"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_file(pkg_dir / "__init__.py", "_native = object()\n")
+    (pkg_dir / "_wolvrix.so").write_bytes(b"")
+    write_file(stamped_dir / ".python-executable", f"{sys.executable}\n")
+    stamped_result = run_root_global_python_env_print(stamped_dir)
+    stamped_stdout = stamped_result.stdout + stamped_result.stderr
+    expect(stamped_result.returncode == 0, f"root-level global python env print should succeed: {stamped_stdout.strip()}")
+    expect(
+        f"HAS_BUILD={stamped_dir}/wolvrix/_wolvrix.so" in stamped_stdout,
+        f"matching stamped build-tree bindings should still mark the global build python as available: {stamped_stdout.strip()}",
+    )
+    expect(
+        f"PYTHONPATH={stamped_dir}" in stamped_stdout,
+        f"matching stamped build-tree bindings should prepend the build python dir globally: {stamped_stdout.strip()}",
     )
 
 
@@ -653,6 +702,10 @@ def test_py_install_tracks_active_python_interpreter() -> None:
         'else \\\n\t\techo "[PY] Installing editable wolvrix package"; \\\n\t\t$(PYTHON) -m pip install -e $(WOLVRIX_DIR);'
         not in body,
         "py_install should not limit editable installation to the mismatched-build branch",
+    )
+    expect(
+        '-DPython_EXECUTABLE="$(CURRENT_PYTHON)"' in makefile_text,
+        "Makefile should reconfigure CMake with the active Python interpreter before refreshing the build-tree stamp",
     )
 
 
