@@ -250,6 +250,31 @@ def run_root_python_launch_print(build_dir: pathlib.Path) -> subprocess.Complete
     )
 
 
+def run_root_global_python_env_print(build_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    print_rule = (
+        "print-root-python-env:\n"
+        "\t@printf 'PYTHONPATH=%s\\nHAS_BUILD=%s\\n' "
+        "'$(PYTHONPATH)' "
+        "'$(WOLVRIX_HAS_BUILD_PYTHON)'"
+    )
+    command = (
+        f"source env.sh && make --eval {shlex.quote(print_rule)} print-root-python-env "
+        f"WOLVRIX_PYTHON_DIR={shlex.quote(str(build_dir))}"
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            command,
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def run_root_gsim_artifact_dir_print(model_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
     base_rel = (model_dir / "fixture").relative_to(REPO_ROOT)
     print_rule = (
@@ -551,6 +576,58 @@ def test_root_make_only_forces_build_tree_python_when_bindings_exist() -> None:
     )
 
 
+def test_root_make_only_exports_global_pythonpath_for_complete_build_tree() -> None:
+    missing_dir = ARTIFACT_ROOT / "global_py_missing"
+    missing_dir.mkdir(parents=True, exist_ok=True)
+    missing_result = run_root_global_python_env_print(missing_dir)
+    missing_stdout = missing_result.stdout + missing_result.stderr
+    expect(missing_result.returncode == 0, f"root-level global python env print should succeed: {missing_stdout.strip()}")
+    expect(
+        f"HAS_BUILD=" in missing_stdout and f"HAS_BUILD={missing_dir}" not in missing_stdout,
+        f"missing build-tree bindings should not mark the global build python as complete: {missing_stdout.strip()}",
+    )
+    expect(
+        f"PYTHONPATH={missing_dir}" not in missing_stdout,
+        f"missing build-tree bindings should not prepend the half-built python dir globally: {missing_stdout.strip()}",
+    )
+
+    present_dir = ARTIFACT_ROOT / "global_py_present"
+    pkg_dir = present_dir / "wolvrix"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_file(pkg_dir / "__init__.py", "_native = object()\n")
+    (pkg_dir / "_wolvrix.so").write_bytes(b"")
+    present_result = run_root_global_python_env_print(present_dir)
+    present_stdout = present_result.stdout + present_result.stderr
+    expect(present_result.returncode == 0, f"root-level global python env print should succeed: {present_stdout.strip()}")
+    expect(
+        f"HAS_BUILD={present_dir}/wolvrix/_wolvrix.so" in present_stdout,
+        f"complete build-tree bindings should mark the global build python as available: {present_stdout.strip()}",
+    )
+    expect(
+        f"PYTHONPATH={present_dir}" in present_stdout,
+        f"complete build-tree bindings should prepend the build python dir globally: {present_stdout.strip()}",
+    )
+
+
+def test_py_install_tracks_active_python_interpreter() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index(".PHONY: py_install")
+    end = makefile_text.index("\n\n$(HDLBITS_EMITTED_DUT)", start)
+    body = makefile_text[start:end]
+    expect(
+        "WOLVRIX_PYTHON_STAMP" in body,
+        "py_install should record the active Python interpreter in a stamp file",
+    )
+    expect(
+        "import sys; print(sys.executable)" in body and "CURRENT_PYTHON" in body,
+        "py_install should compare the current Python interpreter against the recorded stamp",
+    )
+    expect(
+        "$(PYTHON) -m pip install -e $(WOLVRIX_DIR)" in body,
+        "py_install should still reinstall the editable package when the interpreter changes",
+    )
+
+
 def test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim() -> None:
     makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     start = makefile_text.index("run_xs_gsim:")
@@ -784,6 +861,8 @@ def main() -> int:
         test_root_make_disables_xiangshan_metadata_by_default()
         test_root_make_allows_xiangshan_metadata_override()
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
+        test_root_make_only_exports_global_pythonpath_for_complete_build_tree()
+        test_py_install_tracks_active_python_interpreter()
         test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
         test_root_make_forwards_xiangshan_feature_flags_to_gsim()
         test_root_make_forwards_simulator_build_options_to_gsim()
