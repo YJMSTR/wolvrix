@@ -575,6 +575,25 @@ def test_root_make_only_forces_build_tree_python_when_bindings_exist() -> None:
         f"present build-tree bindings should still pin imports to the build tree: {present_stdout.strip()}",
     )
 
+    mismatched_dir = ARTIFACT_ROOT / "mismatched_build_python"
+    pkg_dir = mismatched_dir / "wolvrix"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_file(pkg_dir / "__init__.py", "_native = object()\n")
+    (pkg_dir / "_wolvrix.so").write_bytes(b"")
+    write_file(mismatched_dir / ".python-executable", "/tmp/other-python\n")
+
+    mismatched_result = run_root_python_launch_print(mismatched_dir)
+    mismatched_stdout = mismatched_result.stdout + mismatched_result.stderr
+    expect(mismatched_result.returncode == 0, f"root-level python launch print should succeed: {mismatched_stdout.strip()}")
+    expect(
+        "ARGS=-S" not in mismatched_stdout,
+        f"mismatched build-tree bindings should not force the isolated -S launch path: {mismatched_stdout.strip()}",
+    )
+    expect(
+        f"PYTHONPATH={mismatched_dir}" not in mismatched_stdout and "PYTHONNOUSERSITE=1" not in mismatched_stdout,
+        f"mismatched build-tree bindings should not shadow the editable install for XiangShan flows: {mismatched_stdout.strip()}",
+    )
+
 
 def test_root_make_only_exports_global_pythonpath_for_complete_build_tree() -> None:
     missing_dir = ARTIFACT_ROOT / "global_py_missing"
@@ -629,6 +648,11 @@ def test_py_install_tracks_active_python_interpreter() -> None:
     expect(
         "WOLVRIX_PYTHON_STAMP" in makefile_text and "CURRENT_PYTHON" in makefile_text,
         "the Makefile should track and compare the active Python interpreter globally, not just inside py_install reuse logic",
+    )
+    expect(
+        'else \\\n\t\techo "[PY] Installing editable wolvrix package"; \\\n\t\t$(PYTHON) -m pip install -e $(WOLVRIX_DIR);'
+        not in body,
+        "py_install should not limit editable installation to the mismatched-build branch",
     )
 
 
