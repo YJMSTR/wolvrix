@@ -626,6 +626,33 @@ def test_py_install_tracks_active_python_interpreter() -> None:
         "$(PYTHON) -m pip install -e $(WOLVRIX_DIR)" in body,
         "py_install should still reinstall the editable package when the interpreter changes",
     )
+    expect(
+        "WOLVRIX_PYTHON_STAMP" in makefile_text and "CURRENT_PYTHON" in makefile_text,
+        "the Makefile should track and compare the active Python interpreter globally, not just inside py_install reuse logic",
+    )
+
+
+def test_root_make_global_pythonpath_depends_on_matching_python_stamp() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    expect(
+        "WOLVRIX_ACTIVE_PYTHON_MATCHES" in makefile_text,
+        "global PYTHONPATH export should depend on whether the build-tree binding matches the active Python interpreter",
+    )
+    expect(
+        "WOLVRIX_PYTHON_STAMP" in makefile_text and "CURRENT_PYTHON" in makefile_text,
+        "global PYTHONPATH guard should compare the build-tree stamp against the active interpreter",
+    )
+
+
+def test_root_make_forwards_build_dir_to_xs_gsim_downstream() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    run_start = makefile_text.index("run_xs_gsim:")
+    run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
+    run_body = makefile_text[run_start:run_end]
+    expect(
+        run_body.count("BUILD_DIR=$(BUILD_DIR)") >= 2,
+        "run_xs_gsim should forward BUILD_DIR through both the logged and executed downstream XiangShan gsim invocations",
+    )
 
 
 def test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim() -> None:
@@ -863,6 +890,7 @@ def main() -> int:
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
         test_root_make_only_exports_global_pythonpath_for_complete_build_tree()
         test_py_install_tracks_active_python_interpreter()
+        test_root_make_global_pythonpath_depends_on_matching_python_stamp()
         test_root_make_forwards_vm_build_jobs_to_xiangshan_gsim()
         test_root_make_forwards_xiangshan_feature_flags_to_gsim()
         test_root_make_forwards_simulator_build_options_to_gsim()
@@ -870,6 +898,7 @@ def main() -> int:
         test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
         test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
         test_root_make_resolves_xs_gsim_emu_from_actual_build_dir()
+        test_root_make_forwards_build_dir_to_xs_gsim_downstream()
         test_root_make_honors_custom_waveform_path_for_xs_gsim()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()
