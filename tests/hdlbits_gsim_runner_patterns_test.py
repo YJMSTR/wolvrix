@@ -213,6 +213,12 @@ def main() -> int:
         run_dut("116", expect_tb_parity=True)
         run_dut("118", expect_tb_parity=True)
 
+        wrapper_095 = (run_dut("095", expect_tb_parity=True) / "Vdut_095.h").read_text(encoding="utf-8")
+        expect(
+            "sim_.settle();" in wrapper_095 and "sim_.commit_step();" in wrapper_095,
+            "TB parity wrappers should route their eval flow through the fine-grained settle/commit_step API instead of calling step() directly",
+        )
+
         runner_030 = (run_dut("030", expect_no_tb_parity=True) / "dut_030_runner.cpp").read_text(encoding="utf-8")
         expect(
             "comb and ff XOR outputs correct across edges" in runner_030,
