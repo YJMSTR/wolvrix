@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import sys
 import tempfile
@@ -186,6 +187,66 @@ def main() -> int:
             expect(
                 "--memory-limit-mb" in captured.get("argv", []),
                 f"runtime mode should still forward the memory-limit flag to the helper argv: {captured!r}",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = pathlib.Path(tmpdir)
+            dut_dir = tmp / "dut"
+            dut_dir.mkdir(parents=True, exist_ok=True)
+            dut_path = dut_dir / "dut_001.v"
+            dut_path.write_text("module top_module; endmodule\n", encoding="utf-8")
+            custom_build_root = tmp / "custom_build"
+            custom_python_dir = custom_build_root / "python"
+            custom_python_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = tmp / "out"
+
+            original_get_dut_files = module.get_dut_files
+            original_run_single = module.run_single_dut_subprocess
+            old_argv = sys.argv[:]
+            old_env = os.environ.copy()
+            captured_main: dict[str, object] = {}
+
+            module.get_dut_files = lambda _dut_dir: [dut_path]  # type: ignore[assignment]
+
+            def fake_run_single_main(dut_path_arg, output_dir_arg, python_path_arg, repo_root_arg,
+                                     execution_mode_arg, timeout_sec=60, memory_limit_mb=None):  # type: ignore[override]
+                captured_main["python_path"] = python_path_arg
+                captured_main["repo_root"] = repo_root_arg
+                captured_main["execution_mode"] = execution_mode_arg
+                captured_main["timeout_sec"] = timeout_sec
+                captured_main["memory_limit_mb"] = memory_limit_mb
+                return module.DUTResult(
+                    dut_id=module.extract_dut_id(dut_path_arg),
+                    result="success",
+                    elapsed_ms=0.0,
+                )
+
+            module.run_single_dut_subprocess = fake_run_single_main  # type: ignore[assignment]
+            try:
+                os.environ.clear()
+                os.environ.update(old_env)
+                os.environ["WOLVRIX_BUILD_DIR"] = str(custom_build_root)
+                sys.argv = [
+                    "wolvrix_hdlbits_gsim_batch.py",
+                    "--dut-dir",
+                    str(dut_dir),
+                    "--output-dir",
+                    str(output_dir),
+                    "--max-duts",
+                    "1",
+                ]
+                status = module.main()
+            finally:
+                module.get_dut_files = original_get_dut_files  # type: ignore[assignment]
+                module.run_single_dut_subprocess = original_run_single  # type: ignore[assignment]
+                sys.argv[:] = old_argv
+                os.environ.clear()
+                os.environ.update(old_env)
+
+            expect(status == 0, f"batch main should succeed with mocked subprocess runner: {status}")
+            expect(
+                captured_main.get("python_path") == str(custom_python_dir),
+                f"batch main should honor custom WOLVRIX_BUILD_DIR/python paths: {captured_main!r}",
             )
     except Exception as ex:
         return fail(str(ex))
