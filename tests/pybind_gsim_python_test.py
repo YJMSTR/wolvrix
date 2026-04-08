@@ -516,6 +516,35 @@ endmodule
     expect(not diagnostics, f"diagnostics='none' should suppress warning diagnostics: {diagnostics}")
 
 
+def test_read_sv_diagnostics_none_still_raises_on_error() -> None:
+    root = ARTIFACT_ROOT / "frontend_error_filtered"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    broken_sv = source_dir / "broken.sv"
+    broken_sv.write_text(
+        """module top;
+    logic x;
+    assign y = missing_symbol;
+endmodule
+""",
+        encoding="utf-8",
+    )
+
+    try:
+        wolvrix.read_sv(
+            str(broken_sv),
+            diagnostics="none",
+            print_diagnostics_level="off",
+            raise_diagnostics_level="error",
+        )
+    except RuntimeError as ex:
+        diagnostics = list(getattr(ex, "diagnostics", []))
+        expect(not diagnostics, f"quiet error raise should still keep filtered diagnostics empty: {diagnostics}")
+        return
+    raise RuntimeError("read_sv should still raise on real errors when diagnostics='none'")
+
+
 def test_run_pass_diagnostics_none_suppresses_info() -> None:
     root = ARTIFACT_ROOT / "run_pass_info_filtered"
     source_dir = root / "src"
@@ -530,6 +559,26 @@ def test_run_pass_diagnostics_none_suppresses_info() -> None:
     )
     expect(not changed, "stats pass should not modify the design")
     expect(not diagnostics, f"diagnostics='none' should suppress pass info diagnostics: {diagnostics}")
+
+
+def test_run_pipeline_diagnostics_none_still_raises_on_error() -> None:
+    root = ARTIFACT_ROOT / "run_pipeline_error_filtered"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    design = create_design(source_dir)
+    try:
+        design.run_pipeline(
+            [["gsim", ["-path", "missing_top"]]],
+            diagnostics="none",
+            print_diagnostics_level="off",
+            raise_diagnostics_level="error",
+        )
+    except RuntimeError as ex:
+        diagnostics = list(getattr(ex, "diagnostics", []))
+        expect(not diagnostics, f"quiet pipeline error raise should still keep filtered diagnostics empty: {diagnostics}")
+        return
+    raise RuntimeError("run_pipeline should still raise on pass failure when diagnostics='none'")
 
 
 def test_run_pipeline_diagnostics_none_suppresses_info() -> None:
@@ -565,7 +614,9 @@ def main() -> int:
         test_read_sv_formats_slang_placeholder_arguments()
         test_read_sv_preserves_frontend_warnings_on_success()
         test_read_sv_diagnostics_none_suppresses_warnings()
+        test_read_sv_diagnostics_none_still_raises_on_error()
         test_run_pass_diagnostics_none_suppresses_info()
+        test_run_pipeline_diagnostics_none_still_raises_on_error()
         test_run_pipeline_diagnostics_none_suppresses_info()
     except Exception as ex:
         return fail(str(ex))

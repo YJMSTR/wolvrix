@@ -39,7 +39,7 @@ class Design:
             log_level,
         )
         _print_diagnostics(diag, print_diagnostics_level)
-        if _should_raise(diag, raise_diagnostics_level) or (not ok and _should_raise(diag, "error")):
+        if _should_raise(diag, raise_diagnostics_level) or _should_raise_failed_operation(not ok, raise_diagnostics_level):
             _raise_with_diagnostics(diag)
         return bool(changed), list(diag)
 
@@ -61,7 +61,7 @@ class Design:
             log_level,
         )
         _print_diagnostics(diag, print_diagnostics_level)
-        if _should_raise(diag, raise_diagnostics_level) or (not ok and _should_raise(diag, "error")):
+        if _should_raise(diag, raise_diagnostics_level) or _should_raise_failed_operation(not ok, raise_diagnostics_level):
             _raise_with_diagnostics(diag)
         return bool(changed), list(diag)
 
@@ -127,7 +127,7 @@ def read_sv(
 ) -> tuple[Design | None, list[dict]]:
     capsule, ok, diag = _native.read_sv(path, slang_args or [], log_level, diagnostics)
     _print_diagnostics(diag, print_diagnostics_level)
-    if _should_raise(diag, raise_diagnostics_level):
+    if _should_raise(diag, raise_diagnostics_level) or _should_raise_failed_operation(not ok, raise_diagnostics_level):
         _raise_with_diagnostics(diag)
     design = Design(capsule) if capsule is not None else None
     return design, list(diag)
@@ -239,6 +239,12 @@ def _should_raise(diags: list[dict], threshold: str) -> bool:
         if kind_rank is not None and kind_rank >= rank:
             return True
     return False
+
+
+def _should_raise_failed_operation(failed: bool, threshold: str) -> bool:
+    if not failed:
+        return False
+    return _level_rank(threshold) is not None
 
 
 def _raise_with_diagnostics(diags: list[dict]) -> None:
