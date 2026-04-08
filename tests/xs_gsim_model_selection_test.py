@@ -777,6 +777,33 @@ def test_xs_repcut_targets_depend_on_xs_wolf_emit() -> None:
         )
 
 
+def test_repcut_package_targets_forward_custom_wolvrix_build_dir() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    for target in ("run_xs_repcut_partitioned_smoke", "build_xs_repcut_verilator"):
+        start = makefile_text.index(f"{target}:")
+        end = makefile_text.find("\n\n", start)
+        body = makefile_text[start:end]
+        expect(
+            "WOLVRIX_BUILD_DIR=$(WOLVRIX_BUILD_DIR)" in body,
+            f"{target} should log the custom WOLVRIX_BUILD_DIR when invoking the repcut packaging script",
+        )
+        expect(
+            'WOLVRIX_BUILD_DIR="$(WOLVRIX_BUILD_DIR)"' in body,
+            f"{target} should export the custom WOLVRIX_BUILD_DIR into the repcut packaging script process",
+        )
+
+
+def test_build_xs_repcut_verilator_honors_python_stamp_guard() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("build_xs_repcut_verilator:")
+    end = makefile_text.find("\n\n", start)
+    body = makefile_text[start:end]
+    expect(
+        "WOLVRIX_MATCHING_BUILD_PYTHON" in body,
+        "build_xs_repcut_verilator should honor the same matching-build-python guard as the rest of the Makefile",
+    )
+
+
 def test_root_make_forwards_simulator_build_options_to_gsim() -> None:
     makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     start = makefile_text.index("run_xs_gsim:")
@@ -972,6 +999,8 @@ def main() -> int:
         test_root_make_forwards_xiangshan_feature_flags_to_gsim()
         test_root_make_forwards_simulator_build_options_to_gsim()
         test_xs_repcut_targets_depend_on_xs_wolf_emit()
+        test_repcut_package_targets_forward_custom_wolvrix_build_dir()
+        test_build_xs_repcut_verilator_honors_python_stamp_guard()
         test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
         test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
         test_root_make_resolves_xs_gsim_emu_from_actual_build_dir()
