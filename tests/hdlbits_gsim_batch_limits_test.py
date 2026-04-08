@@ -181,12 +181,58 @@ def main() -> int:
 
             expect(result.result == "success", f"runtime helper probe should succeed: {result}")
             expect(
-                captured.get("memory_limit_mb") == 321,
-                f"runtime mode should apply the configured memory cap to the outer helper process: {captured!r}",
+                captured.get("memory_limit_mb") is None,
+                f"runtime mode should not apply the configured memory cap to the outer helper process itself: {captured!r}",
             )
             expect(
                 "--memory-limit-mb" in captured.get("argv", []),
                 f"runtime mode should still forward the memory-limit flag to the helper argv: {captured!r}",
+            )
+            argv = captured.get("argv", [])
+            expect(
+                "--memory-limit-mb" in argv and argv[argv.index("--memory-limit-mb") + 1] == "321",
+                f"runtime mode should forward the configured memory cap to the inner helper argv: {captured!r}",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dut_path = pathlib.Path(tmpdir) / "dut_001.v"
+            dut_path.write_text("module top_module; endmodule\n", encoding="utf-8")
+            output_dir = pathlib.Path(tmpdir) / "out"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            repo_root = pathlib.Path(tmpdir)
+
+            original_runner = module.run_subprocess_limited
+            captured_compile: dict[str, object] = {}
+
+            def fake_compile_runner(argv, timeout_sec, memory_limit_mb, env=None):  # type: ignore[override]
+                captured_compile["argv"] = list(argv)
+                captured_compile["timeout_sec"] = timeout_sec
+                captured_compile["memory_limit_mb"] = memory_limit_mb
+                captured_compile["env"] = dict(env or {})
+                return module.LimitedProcessResult(
+                    returncode=0,
+                    stdout='{"result": "success", "elapsed_ms": 0.0}\n',
+                    stderr="",
+                )
+
+            module.run_subprocess_limited = fake_compile_runner  # type: ignore[assignment]
+            try:
+                result = module.run_single_dut_subprocess(
+                    dut_path,
+                    output_dir,
+                    str(repo_root / "wolvrix" / "build" / "python"),
+                    repo_root,
+                    "compile",
+                    timeout_sec=19,
+                    memory_limit_mb=654,
+                )
+            finally:
+                module.run_subprocess_limited = original_runner  # type: ignore[assignment]
+
+            expect(result.result == "success", f"compile helper probe should succeed: {result}")
+            expect(
+                captured_compile.get("memory_limit_mb") is None,
+                f"compile mode should not apply the configured memory cap to the outer helper process itself: {captured_compile!r}",
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
