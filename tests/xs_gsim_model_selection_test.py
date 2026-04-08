@@ -852,6 +852,34 @@ def test_build_xs_repcut_verilator_honors_python_stamp_guard() -> None:
     )
 
 
+def test_xs_python_launch_selection_is_not_frozen_at_parse_time() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    for variable in (
+        "XS_WOLVRIX_PYTHON_HINT_DIR",
+        "XS_WOLVRIX_PYTHON_ENV",
+        "XS_WOLVRIX_PYTHON_ARGS",
+    ):
+        expect(
+            f"{variable} =" in makefile_text,
+            f"{variable} should use recursive expansion so py_install rebuilds can refresh XiangShan helper python selection",
+        )
+        expect(
+            f"{variable} :=" not in makefile_text,
+            f"{variable} should not be frozen with := before py_install restamps the build tree",
+        )
+
+
+def test_build_xs_repcut_verilator_refreshes_python_stamp() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("build_xs_repcut_verilator:")
+    end = makefile_text.find("\n\n", start)
+    body = makefile_text[start:end]
+    expect(
+        "WOLVRIX_PYTHON_STAMP" in body and "CURRENT_PYTHON" in body,
+        "build_xs_repcut_verilator should refresh the build-tree python stamp after rebuilding Wolvrix",
+    )
+
+
 def test_root_make_forwards_simulator_build_options_to_gsim() -> None:
     makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     start = makefile_text.index("run_xs_gsim:")
@@ -1050,6 +1078,8 @@ def main() -> int:
         test_xs_repcut_targets_depend_on_xs_wolf_emit()
         test_repcut_package_targets_forward_custom_wolvrix_build_dir()
         test_build_xs_repcut_verilator_honors_python_stamp_guard()
+        test_xs_python_launch_selection_is_not_frozen_at_parse_time()
+        test_build_xs_repcut_verilator_refreshes_python_stamp()
         test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
         test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
         test_root_make_resolves_xs_gsim_emu_from_actual_build_dir()
