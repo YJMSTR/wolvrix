@@ -974,8 +974,8 @@ def test_root_make_honors_custom_waveform_path_for_xs_gsim() -> None:
     run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
     run_body = makefile_text[run_start:run_end]
     expect(
-        run_body.count('$(if $(filter 1,$(XS_WAVEFORM))$(XS_WAVEFORM_PATH),--wave-path $(XS_WAVEFORM_PATH_ABS),$(if $(filter 1,$(XS_WAVEFORM)),--wave-path $$WAVEFORM,))') >= 2,
-        "run_xs_gsim should honor XS_WAVEFORM_PATH in both the logged and executed emulator invocations",
+        run_body.count('$(if $(filter 1,$(XS_WAVEFORM)),$(if $(XS_WAVEFORM_PATH),--wave-path $(XS_WAVEFORM_PATH_ABS),--wave-path $$WAVEFORM),)') >= 2,
+        "run_xs_gsim should honor XS_WAVEFORM_PATH in both the logged and executed emulator invocations and should not emit --wave-path when waveform dumping is disabled",
     )
     expect(
         '--wave-path $(XS_WAVEFORM_PATH_ABS)' in run_body,

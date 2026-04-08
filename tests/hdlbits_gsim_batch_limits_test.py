@@ -231,8 +231,8 @@ def main() -> int:
 
             expect(result.result == "success", f"compile helper probe should succeed: {result}")
             expect(
-                captured_compile.get("memory_limit_mb") is None,
-                f"compile mode should not apply the configured memory cap to the outer helper process itself: {captured_compile!r}",
+                captured_compile.get("memory_limit_mb") == 654,
+                f"compile mode should apply the configured memory cap to the per-DUT compile helper process: {captured_compile!r}",
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
