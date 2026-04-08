@@ -250,6 +250,32 @@ def run_root_python_launch_print(build_dir: pathlib.Path) -> subprocess.Complete
     )
 
 
+def run_root_python_launch_print_with_wolvrix_build_dir(build_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
+    print_rule = (
+        "print-xs-gsim-python-launch:\n"
+        "\t@printf 'ARGS=%s\\nENV=%s\\nDIR=%s\\n' "
+        "'$(XS_WOLVRIX_PYTHON_ARGS)' "
+        "'$(XS_WOLVRIX_PYTHON_ENV)' "
+        "'$(XS_WOLVRIX_PYTHON_BUILD_DIR)'"
+    )
+    command = (
+        f"source env.sh && make --eval {shlex.quote(print_rule)} print-xs-gsim-python-launch "
+        f"WOLVRIX_BUILD_DIR={shlex.quote(str(build_dir))}"
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-lc",
+            command,
+        ],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
 def run_root_global_python_env_print(build_dir: pathlib.Path) -> subprocess.CompletedProcess[str]:
     print_rule = (
         "print-root-python-env:\n"
@@ -626,6 +652,28 @@ def test_root_make_only_forces_build_tree_python_when_bindings_exist() -> None:
     )
 
 
+def test_xs_python_build_dir_follows_custom_wolvrix_build_dir() -> None:
+    custom_build_dir = ARTIFACT_ROOT / "custom_wolvrix_build"
+    python_build_dir = custom_build_dir / "python"
+    pkg_dir = python_build_dir / "wolvrix"
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_file(pkg_dir / "__init__.py", "_native = object()\n")
+    (pkg_dir / "_wolvrix.so").write_bytes(b"")
+    write_file(python_build_dir / ".python-executable", f"{sys.executable}\n")
+
+    result = run_root_python_launch_print_with_wolvrix_build_dir(custom_build_dir)
+    stdout = result.stdout + result.stderr
+    expect(result.returncode == 0, f"custom WOLVRIX_BUILD_DIR python launch print should succeed: {stdout.strip()}")
+    expect(
+        f"DIR={python_build_dir}" in stdout,
+        f"XS helper python build dir should derive from custom WOLVRIX_BUILD_DIR by default: {stdout.strip()}",
+    )
+    expect(
+        f"ENV=WOLVRIX_PYTHON_BUILD_DIR={python_build_dir}" in stdout,
+        f"XS helper python env should point at the custom WOLVRIX_BUILD_DIR/python tree: {stdout.strip()}",
+    )
+
+
 def test_root_make_only_exports_global_pythonpath_for_complete_build_tree() -> None:
     missing_dir = ARTIFACT_ROOT / "global_py_missing"
     missing_dir.mkdir(parents=True, exist_ok=True)
@@ -992,6 +1040,7 @@ def main() -> int:
         test_root_make_disables_xiangshan_metadata_by_default()
         test_root_make_allows_xiangshan_metadata_override()
         test_root_make_only_forces_build_tree_python_when_bindings_exist()
+        test_xs_python_build_dir_follows_custom_wolvrix_build_dir()
         test_root_make_only_exports_global_pythonpath_for_complete_build_tree()
         test_py_install_tracks_active_python_interpreter()
         test_root_make_global_pythonpath_depends_on_matching_python_stamp()
