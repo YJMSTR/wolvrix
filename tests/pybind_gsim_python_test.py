@@ -485,6 +485,69 @@ endmodule
     expect(warning_diags, f"warning-only parse should preserve frontend warnings: {diagnostics}")
 
 
+def test_read_sv_diagnostics_none_suppresses_warnings() -> None:
+    root = ARTIFACT_ROOT / "frontend_warning_filtered"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    warn_sv = source_dir / "warn.sv"
+    warn_sv.write_text(
+        """module top(
+    input logic a,
+    output logic y
+);
+    always_comb begin
+        unique case (a)
+            1'b0: y = 1'b0;
+        endcase
+    end
+endmodule
+""",
+        encoding="utf-8",
+    )
+
+    design, diagnostics = wolvrix.read_sv(
+        str(warn_sv),
+        diagnostics="none",
+        print_diagnostics_level="off",
+        raise_diagnostics_level="info",
+    )
+    expect(design is not None, "filtered warning-only frontend parse should still return a design")
+    expect(not diagnostics, f"diagnostics='none' should suppress warning diagnostics: {diagnostics}")
+
+
+def test_run_pass_diagnostics_none_suppresses_info() -> None:
+    root = ARTIFACT_ROOT / "run_pass_info_filtered"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    design = create_design(source_dir)
+    changed, diagnostics = design.run_pass(
+        "stats",
+        diagnostics="none",
+        print_diagnostics_level="off",
+        raise_diagnostics_level="info",
+    )
+    expect(not changed, "stats pass should not modify the design")
+    expect(not diagnostics, f"diagnostics='none' should suppress pass info diagnostics: {diagnostics}")
+
+
+def test_run_pipeline_diagnostics_none_suppresses_info() -> None:
+    root = ARTIFACT_ROOT / "run_pipeline_info_filtered"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    design = create_design(source_dir)
+    changed, diagnostics = design.run_pipeline(
+        [["stats", []]],
+        diagnostics="none",
+        print_diagnostics_level="off",
+        raise_diagnostics_level="info",
+    )
+    expect(not changed, "stats pipeline should not modify the design")
+    expect(not diagnostics, f"diagnostics='none' should suppress pipeline info diagnostics: {diagnostics}")
+
+
 def main() -> int:
     try:
         test_same_design_pipeline_flow()
@@ -501,6 +564,9 @@ def main() -> int:
         test_read_sv_setup_failure_returns_slang_diagnostics()
         test_read_sv_formats_slang_placeholder_arguments()
         test_read_sv_preserves_frontend_warnings_on_success()
+        test_read_sv_diagnostics_none_suppresses_warnings()
+        test_run_pass_diagnostics_none_suppresses_info()
+        test_run_pipeline_diagnostics_none_suppresses_info()
     except Exception as ex:
         return fail(str(ex))
     return 0

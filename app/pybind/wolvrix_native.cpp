@@ -527,6 +527,23 @@ namespace
         }
     }
 
+    wolvrix::lib::LogLevel diagnosticKindTextToLogLevel(std::string_view kind)
+    {
+        if (kind == "debug")
+        {
+            return wolvrix::lib::LogLevel::Debug;
+        }
+        if (kind == "info")
+        {
+            return wolvrix::lib::LogLevel::Info;
+        }
+        if (kind == "warn" || kind == "warning")
+        {
+            return wolvrix::lib::LogLevel::Warn;
+        }
+        return wolvrix::lib::LogLevel::Error;
+    }
+
     struct DiagnosticLocationInfo
     {
         slang::SourceLocation location;
@@ -1079,6 +1096,60 @@ namespace
         return list;
     }
 
+    PyObject *filterPyDiagnosticsList(PyObject *diag_list, wolvrix::lib::LogLevel threshold)
+    {
+        PyObject *filtered = PyList_New(0);
+        if (!filtered)
+        {
+            return nullptr;
+        }
+        if (threshold == wolvrix::lib::LogLevel::Off)
+        {
+            return filtered;
+        }
+        if (!PyList_Check(diag_list))
+        {
+            return filtered;
+        }
+        const Py_ssize_t count = PyList_GET_SIZE(diag_list);
+        for (Py_ssize_t i = 0; i < count; ++i)
+        {
+            PyObject *item = PyList_GET_ITEM(diag_list, i);
+            if (!item)
+            {
+                continue;
+            }
+            bool keep = true;
+            if (PyDict_Check(item))
+            {
+                PyObject *kind_obj = PyDict_GetItemString(item, "kind");
+                if (kind_obj && PyUnicode_Check(kind_obj))
+                {
+                    const char *kind_text = PyUnicode_AsUTF8(kind_obj);
+                    if (!kind_text)
+                    {
+                        Py_DECREF(filtered);
+                        return nullptr;
+                    }
+                    keep = logLevelRank(diagnosticKindTextToLogLevel(kind_text)) >= logLevelRank(threshold);
+                }
+            }
+            if (keep && PyList_Append(filtered, item) < 0)
+            {
+                Py_DECREF(filtered);
+                return nullptr;
+            }
+        }
+        return filtered;
+    }
+
+    PyObject *filterPyDiagnosticsListOrTake(PyObject *diag_list, wolvrix::lib::LogLevel threshold)
+    {
+        PyObject *filtered = filterPyDiagnosticsList(diag_list, threshold);
+        Py_DECREF(diag_list);
+        return filtered;
+    }
+
     PyObject *makeReadSvResult(PyObject *design_obj, bool success, PyObject *diag_list)
     {
         PyObject *result = PyTuple_New(3);
@@ -1113,7 +1184,8 @@ namespace
     PyObject *makeSlangReadSvFailure(std::span<const slang::Diagnostic> messages,
                                      const slang::DiagnosticEngine &diagEngine,
                                      const slang::SourceManager *sourceManager,
-                                     const std::string &stderrText)
+                                     const std::string &stderrText,
+                                     wolvrix::lib::LogLevel diag_level)
     {
         PyObject *slang_diag_list = slangDiagnosticsToPyList(messages, diagEngine, sourceManager);
         if (!slang_diag_list)
@@ -1131,7 +1203,12 @@ namespace
         {
             return nullptr;
         }
-        return makeReadSvResult(nullptr, false, diag_list);
+        PyObject *filtered_diag_list = filterPyDiagnosticsListOrTake(diag_list, diag_level);
+        if (!filtered_diag_list)
+        {
+            return nullptr;
+        }
+        return makeReadSvResult(nullptr, false, filtered_diag_list);
     }
 
     void emitDiagnostics(const std::vector<wolvrix::lib::diag::Diagnostic> &messages,
@@ -1208,6 +1285,20 @@ namespace
             return nullptr;
         }
 
+        bool ok = false;
+        const wolvrix::lib::LogLevel log_level = parseLogLevel(log_level_text, ok);
+        if (!ok)
+        {
+            PyErr_SetString(PyExc_ValueError, "unknown log_level");
+            return nullptr;
+        }
+        wolvrix::lib::LogLevel diag_level = wolvrix::lib::LogLevel::Warn;
+        if (!parseDiagnosticsLevel(diag_text, diag_level))
+        {
+            PyErr_SetString(PyExc_ValueError, "unknown diagnostics level");
+            return nullptr;
+        }
+
         std::vector<std::string> argv_storage;
         argv_storage.reserve(2 + slang_args.size());
         argv_storage.emplace_back("read_sv");
@@ -1247,7 +1338,8 @@ namespace
             return makeSlangReadSvFailure(frontendClient->diagnostics(),
                                           driver.diagEngine,
                                           &driver.diagEngine.getSourceManager(),
-                                          stderrText);
+                                          stderrText,
+                                          diag_level);
         }
         if (!driver.processOptions())
         {
@@ -1255,7 +1347,8 @@ namespace
             return makeSlangReadSvFailure(frontendClient->diagnostics(),
                                           driver.diagEngine,
                                           &driver.diagEngine.getSourceManager(),
-                                          stderrText);
+                                          stderrText,
+                                          diag_level);
         }
         if (!driver.parseAllSources())
         {
@@ -1263,7 +1356,8 @@ namespace
             return makeSlangReadSvFailure(frontendClient->diagnostics(),
                                           driver.diagEngine,
                                           &driver.diagEngine.getSourceManager(),
-                                          stderrText);
+                                          stderrText,
+                                          diag_level);
         }
         const std::string setupStderrText = setupStderrCapture.finish();
 
@@ -1289,23 +1383,9 @@ namespace
             return makeSlangReadSvFailure(allDiagnostics,
                                           driver.diagEngine,
                                           compilation->getSourceManager(),
-                                          setupStderrText);
+                                          setupStderrText,
+                                          diag_level);
         }
-
-        bool ok = false;
-        const wolvrix::lib::LogLevel log_level = parseLogLevel(log_level_text, ok);
-        if (!ok)
-        {
-            PyErr_SetString(PyExc_ValueError, "unknown log_level");
-            return nullptr;
-        }
-        wolvrix::lib::LogLevel diag_level = wolvrix::lib::LogLevel::Warn;
-        if (!parseDiagnosticsLevel(diag_text, diag_level))
-        {
-            PyErr_SetString(PyExc_ValueError, "unknown diagnostics level");
-            return nullptr;
-        }
-        (void)diag_level;
 
         PyObject *frontend_diag_list = stderrTextToPyList(setupStderrText);
         if (!frontend_diag_list)
@@ -1379,7 +1459,12 @@ namespace
             {
                 return nullptr;
             }
-            return makeReadSvResult(nullptr, false, diag_list);
+            PyObject *filtered_diag_list = filterPyDiagnosticsListOrTake(diag_list, diag_level);
+            if (!filtered_diag_list)
+            {
+                return nullptr;
+            }
+            return makeReadSvResult(nullptr, false, filtered_diag_list);
         }
         converter.diagnostics().flushThreadLocal();
         const bool success = !converter.diagnostics().hasError();
@@ -1395,17 +1480,22 @@ namespace
         {
             return nullptr;
         }
+        PyObject *filtered_diag_list = filterPyDiagnosticsListOrTake(diag_list, diag_level);
+        if (!filtered_diag_list)
+        {
+            return nullptr;
+        }
         if (success)
         {
             PyObject *capsule = makeDesignCapsule(std::move(design), std::move(compilation));
             if (!capsule)
             {
-                Py_DECREF(diag_list);
+                Py_DECREF(filtered_diag_list);
                 return nullptr;
             }
-            return makeReadSvResult(capsule, true, diag_list);
+            return makeReadSvResult(capsule, true, filtered_diag_list);
         }
-        return makeReadSvResult(nullptr, false, diag_list);
+        return makeReadSvResult(nullptr, false, filtered_diag_list);
     }
 
     PyObject *py_read_json(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
@@ -1852,7 +1942,6 @@ namespace
             PyErr_SetString(PyExc_ValueError, "unknown diagnostics level");
             return nullptr;
         }
-        (void)diag_level;
         bool ok = false;
         const wolvrix::lib::LogLevel log_level = parseLogLevel(log_text, ok);
         if (!ok)
@@ -1931,15 +2020,20 @@ namespace
         {
             return nullptr;
         }
+        PyObject *filtered_diag_list = filterPyDiagnosticsListOrTake(diag_list, diag_level);
+        if (!filtered_diag_list)
+        {
+            return nullptr;
+        }
         PyObject *tuple = PyTuple_New(3);
         if (!tuple)
         {
-            Py_DECREF(diag_list);
+            Py_DECREF(filtered_diag_list);
             return nullptr;
         }
         PyTuple_SET_ITEM(tuple, 0, PyBool_FromLong(result.changed ? 1 : 0));
         PyTuple_SET_ITEM(tuple, 1, PyBool_FromLong(result.success ? 1 : 0));
-        PyTuple_SET_ITEM(tuple, 2, diag_list);
+        PyTuple_SET_ITEM(tuple, 2, filtered_diag_list);
         return tuple;
     }
 
@@ -1963,7 +2057,6 @@ namespace
             PyErr_SetString(PyExc_ValueError, "unknown diagnostics level");
             return nullptr;
         }
-        (void)diag_level;
         bool ok = false;
         const wolvrix::lib::LogLevel log_level = parseLogLevel(log_text, ok);
         if (!ok)
@@ -2044,15 +2137,20 @@ namespace
         {
             return nullptr;
         }
+        PyObject *filtered_diag_list = filterPyDiagnosticsListOrTake(diag_list, diag_level);
+        if (!filtered_diag_list)
+        {
+            return nullptr;
+        }
         PyObject *tuple = PyTuple_New(3);
         if (!tuple)
         {
-            Py_DECREF(diag_list);
+            Py_DECREF(filtered_diag_list);
             return nullptr;
         }
         PyTuple_SET_ITEM(tuple, 0, PyBool_FromLong(result.changed ? 1 : 0));
         PyTuple_SET_ITEM(tuple, 1, PyBool_FromLong(result.success ? 1 : 0));
-        PyTuple_SET_ITEM(tuple, 2, diag_list);
+        PyTuple_SET_ITEM(tuple, 2, filtered_diag_list);
         return tuple;
     }
 
