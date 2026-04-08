@@ -30,7 +30,11 @@ def reset_dir(path: pathlib.Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def run_dut(dut_id: str) -> None:
+def run_dut(
+    dut_id: str,
+    expect_tb_parity: bool = False,
+    expect_no_tb_parity: bool = False,
+) -> None:
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
     env["WOLVRIX_PYTHON_BUILD_DIR"] = str(BUILD_PYTHON_DIR)
@@ -57,6 +61,14 @@ def run_dut(dut_id: str) -> None:
         f"dut_{dut_id} runtime failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
     )
     expect((dut_dir / f"dut_{dut_id}_runner").exists(), f"dut_{dut_id} missing runtime binary")
+    if expect_tb_parity:
+        expect((dut_dir / "verilated.h").exists(), f"dut_{dut_id} missing verilated.h parity shim")
+        expect((dut_dir / "verilated_cov.h").exists(), f"dut_{dut_id} missing verilated_cov.h parity shim")
+        expect((dut_dir / f"Vdut_{dut_id}.h").exists(), f"dut_{dut_id} missing Verilator-compatible wrapper")
+    if expect_no_tb_parity:
+        expect(not (dut_dir / "verilated.h").exists(), f"dut_{dut_id} unexpectedly used TB parity shim")
+        expect(not (dut_dir / "verilated_cov.h").exists(), f"dut_{dut_id} unexpectedly used TB parity cov shim")
+        expect(not (dut_dir / f"Vdut_{dut_id}.h").exists(), f"dut_{dut_id} unexpectedly used Verilator-compatible wrapper")
 
 
 def main() -> int:
@@ -186,6 +198,19 @@ def main() -> int:
             "098",
         ):
             run_dut(dut_id)
+        run_dut("001", expect_tb_parity=True)
+        run_dut("084", expect_tb_parity=True)
+        run_dut("085", expect_tb_parity=True)
+        run_dut("088", expect_tb_parity=True)
+        run_dut("098", expect_tb_parity=True)
+        run_dut("111", expect_tb_parity=True)
+        run_dut("114", expect_tb_parity=True)
+        run_dut("030", expect_no_tb_parity=True)
+        run_dut("060", expect_tb_parity=True)
+        run_dut("095", expect_tb_parity=True)
+        run_dut("106", expect_tb_parity=True)
+        run_dut("116", expect_tb_parity=True)
+        run_dut("118", expect_tb_parity=True)
     except Exception as ex:
         return fail(str(ex))
     return 0
