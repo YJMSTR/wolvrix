@@ -401,6 +401,90 @@ print("diag_count", len(diagnostics))
     expect(result.stderr.strip() == "", f"quiet frontend failure should not print raw Slang diagnostics: {result.stderr!r}")
 
 
+def test_read_sv_setup_failure_returns_slang_diagnostics() -> None:
+    root = ARTIFACT_ROOT / "frontend_setup_failure"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    missing_f = source_dir / "missing.f"
+    design, diagnostics = wolvrix.read_sv(
+        None,
+        slang_args=["-f", str(missing_f)],
+        print_diagnostics_level="off",
+        raise_diagnostics_level="off",
+    )
+    expect(design is None, "missing -f file should not produce a design")
+    expect(diagnostics, "missing -f file should surface frontend diagnostics")
+    combined_text = "\n".join(str(diag.get("text", "")) for diag in diagnostics)
+    expect(str(missing_f) in combined_text,
+           f"frontend diagnostics should mention the missing file path: {combined_text}")
+
+
+def test_read_sv_formats_slang_placeholder_arguments() -> None:
+    root = ARTIFACT_ROOT / "frontend_formatted_error"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    broken_sv = source_dir / "broken_port.sv"
+    broken_sv.write_text(
+        """module leaf(
+    input logic a
+);
+endmodule
+
+module top;
+    logic x;
+    leaf u_leaf(.missing(x));
+endmodule
+""",
+        encoding="utf-8",
+    )
+
+    design, diagnostics = wolvrix.read_sv(
+        str(broken_sv),
+        print_diagnostics_level="off",
+        raise_diagnostics_level="off",
+    )
+    expect(design is None, "frontend semantic error should not produce a design")
+    expect(diagnostics, "frontend semantic error should surface diagnostics")
+    combined_text = "\n".join(str(diag.get("text", "")) for diag in diagnostics)
+    expect("{}" not in combined_text,
+           f"formatted Slang diagnostics should not leak placeholder braces: {combined_text}")
+    expect("missing" in combined_text and "leaf" in combined_text,
+           f"formatted Slang diagnostics should include concrete names: {combined_text}")
+
+
+def test_read_sv_preserves_frontend_warnings_on_success() -> None:
+    root = ARTIFACT_ROOT / "frontend_warning_success"
+    source_dir = root / "src"
+    reset_dir(source_dir)
+
+    warn_sv = source_dir / "warn.sv"
+    warn_sv.write_text(
+        """module top(
+    input logic a,
+    output logic y
+);
+    always_comb begin
+        unique case (a)
+            1'b0: y = 1'b0;
+        endcase
+    end
+endmodule
+""",
+        encoding="utf-8",
+    )
+
+    design, diagnostics = wolvrix.read_sv(
+        str(warn_sv),
+        print_diagnostics_level="off",
+        raise_diagnostics_level="off",
+    )
+    expect(design is not None, "warning-only frontend diagnostics should still return a design")
+    warning_diags = [diag for diag in diagnostics if str(diag.get("kind", "")).lower() == "warning"]
+    expect(warning_diags, f"warning-only parse should preserve frontend warnings: {diagnostics}")
+
+
 def main() -> int:
     try:
         test_same_design_pipeline_flow()
@@ -414,6 +498,9 @@ def main() -> int:
         test_port_order_duplicate_name()
         test_emit_attributes_forward_behavior_shard_cap()
         test_read_sv_frontend_failure_respects_quiet_mode()
+        test_read_sv_setup_failure_returns_slang_diagnostics()
+        test_read_sv_formats_slang_placeholder_arguments()
+        test_read_sv_preserves_frontend_warnings_on_success()
     except Exception as ex:
         return fail(str(ex))
     return 0

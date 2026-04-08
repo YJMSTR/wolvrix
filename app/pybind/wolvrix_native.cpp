@@ -11,10 +11,12 @@
 
 #include "slang/analysis/AnalysisManager.h"
 #include "slang/ast/Compilation.h"
+#include "slang/diagnostics/DiagnosticClient.h"
 #include "slang/driver/Driver.h"
 #include "slang/text/SourceManager.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cctype>
@@ -154,6 +156,115 @@ namespace
     {
         std::string name;
         std::vector<std::string> args;
+    };
+
+    class BufferedDiagnosticClient final : public slang::DiagnosticClient
+    {
+    public:
+        void report(const slang::ReportedDiagnostic &diagnostic) override
+        {
+            diagnostics_.push_back(diagnostic.originalDiagnostic);
+        }
+
+        std::span<const slang::Diagnostic> diagnostics() const
+        {
+            return diagnostics_;
+        }
+
+    private:
+        std::vector<slang::Diagnostic> diagnostics_;
+    };
+
+    class StderrCapture
+    {
+    public:
+        bool start()
+        {
+            captureFile_ = std::tmpfile();
+            if (!captureFile_)
+            {
+                return false;
+            }
+            savedFd_ = ::dup(STDERR_FILENO);
+            if (savedFd_ < 0)
+            {
+                std::fclose(captureFile_);
+                captureFile_ = nullptr;
+                return false;
+            }
+            std::cerr.flush();
+            std::fflush(stderr);
+            if (::dup2(::fileno(captureFile_), STDERR_FILENO) < 0)
+            {
+                ::close(savedFd_);
+                savedFd_ = -1;
+                std::fclose(captureFile_);
+                captureFile_ = nullptr;
+                return false;
+            }
+            active_ = true;
+            return true;
+        }
+
+        std::string finish()
+        {
+            if (!captureFile_)
+            {
+                return {};
+            }
+
+            if (active_)
+            {
+                std::cerr.flush();
+                std::fflush(stderr);
+                ::dup2(savedFd_, STDERR_FILENO);
+                ::close(savedFd_);
+                savedFd_ = -1;
+                active_ = false;
+            }
+
+            std::fflush(captureFile_);
+            std::rewind(captureFile_);
+
+            std::string output;
+            std::array<char, 4096> buffer{};
+            while (true)
+            {
+                const std::size_t count = std::fread(buffer.data(), 1, buffer.size(), captureFile_);
+                if (count == 0)
+                {
+                    break;
+                }
+                output.append(buffer.data(), count);
+            }
+
+            std::fclose(captureFile_);
+            captureFile_ = nullptr;
+            return output;
+        }
+
+        ~StderrCapture()
+        {
+            if (active_)
+            {
+                std::cerr.flush();
+                std::fflush(stderr);
+                ::dup2(savedFd_, STDERR_FILENO);
+            }
+            if (savedFd_ >= 0)
+            {
+                ::close(savedFd_);
+            }
+            if (captureFile_)
+            {
+                std::fclose(captureFile_);
+            }
+        }
+
+    private:
+        FILE *captureFile_ = nullptr;
+        int savedFd_ = -1;
+        bool active_ = false;
     };
 
     bool parsePassPipeline(PyObject *obj, std::vector<PassSpec> &out, std::string &error)
@@ -805,7 +916,7 @@ namespace
             }
 
             const auto severity = diagEngine.getSeverity(message.code, message.location);
-            const std::string text = std::string(diagEngine.getMessage(message.code));
+            const std::string text = diagEngine.formatMessage(message);
             auto *kind = PyUnicode_FromString(slangSeverityName(severity));
             auto *pass = PyUnicode_FromString("slang");
             auto *msg = PyUnicode_FromString(text.c_str());
@@ -865,6 +976,162 @@ namespace
             PyList_SET_ITEM(list, i, dict);
         }
         return list;
+    }
+
+    PyObject *concatPyLists(PyObject *first, PyObject *second)
+    {
+        PyObject *merged = PyList_New(0);
+        if (!merged)
+        {
+            return nullptr;
+        }
+        if (PyList_Extend(merged, first) < 0 || PyList_Extend(merged, second) < 0)
+        {
+            Py_DECREF(merged);
+            return nullptr;
+        }
+        return merged;
+    }
+
+    PyObject *stderrTextToPyList(const std::string &stderrText)
+    {
+        std::vector<std::string> lines;
+        std::size_t start = 0;
+        while (start < stderrText.size())
+        {
+            std::size_t end = stderrText.find('\n', start);
+            if (end == std::string::npos)
+            {
+                end = stderrText.size();
+            }
+            std::string line = stderrText.substr(start, end - start);
+            if (!line.empty())
+            {
+                lines.push_back(std::move(line));
+            }
+            start = end + 1;
+        }
+
+        PyObject *list = PyList_New(static_cast<Py_ssize_t>(lines.size()));
+        if (!list)
+        {
+            return nullptr;
+        }
+        for (Py_ssize_t i = 0; i < static_cast<Py_ssize_t>(lines.size()); ++i)
+        {
+            const std::string &line = lines[static_cast<std::size_t>(i)];
+            std::string kind = "error";
+            std::string message = line;
+            if (line.rfind("error: ", 0) == 0)
+            {
+                message = line.substr(7);
+            }
+            else if (line.rfind("warning: ", 0) == 0)
+            {
+                kind = "warning";
+                message = line.substr(9);
+            }
+            else if (line.rfind("note: ", 0) == 0 || line.rfind("  note: ", 0) == 0)
+            {
+                kind = "info";
+                const std::size_t prefix = line.rfind("note: ", 0) == 0 ? 6 : 8;
+                message = line.substr(prefix);
+            }
+
+            PyObject *dict = PyDict_New();
+            if (!dict)
+            {
+                Py_DECREF(list);
+                return nullptr;
+            }
+            auto *kindObj = PyUnicode_FromString(kind.c_str());
+            auto *passObj = PyUnicode_FromString("slang");
+            auto *msgObj = PyUnicode_FromString(message.c_str());
+            auto *ctxObj = PyUnicode_FromString("");
+            auto *originObj = PyUnicode_FromString("");
+            auto *textObj = PyUnicode_FromString(message.c_str());
+            if (!kindObj || !passObj || !msgObj || !ctxObj || !originObj || !textObj)
+            {
+                Py_XDECREF(kindObj);
+                Py_XDECREF(passObj);
+                Py_XDECREF(msgObj);
+                Py_XDECREF(ctxObj);
+                Py_XDECREF(originObj);
+                Py_XDECREF(textObj);
+                Py_DECREF(dict);
+                Py_DECREF(list);
+                return nullptr;
+            }
+            PyDict_SetItemString(dict, "kind", kindObj);
+            PyDict_SetItemString(dict, "pass", passObj);
+            PyDict_SetItemString(dict, "message", msgObj);
+            PyDict_SetItemString(dict, "context", ctxObj);
+            PyDict_SetItemString(dict, "origin", originObj);
+            PyDict_SetItemString(dict, "text", textObj);
+            Py_DECREF(kindObj);
+            Py_DECREF(passObj);
+            Py_DECREF(msgObj);
+            Py_DECREF(ctxObj);
+            Py_DECREF(originObj);
+            Py_DECREF(textObj);
+            PyList_SET_ITEM(list, i, dict);
+        }
+        return list;
+    }
+
+    PyObject *makeReadSvResult(PyObject *design_obj, bool success, PyObject *diag_list)
+    {
+        PyObject *result = PyTuple_New(3);
+        if (!result)
+        {
+            Py_XDECREF(design_obj);
+            Py_DECREF(diag_list);
+            return nullptr;
+        }
+        if (design_obj)
+        {
+            PyTuple_SET_ITEM(result, 0, design_obj);
+        }
+        else
+        {
+            Py_INCREF(Py_None);
+            PyTuple_SET_ITEM(result, 0, Py_None);
+        }
+        PyTuple_SET_ITEM(result, 1, PyBool_FromLong(success ? 1 : 0));
+        PyTuple_SET_ITEM(result, 2, diag_list);
+        return result;
+    }
+
+    PyObject *mergePyListsOrTake(PyObject *first, PyObject *second)
+    {
+        PyObject *merged = concatPyLists(first, second);
+        Py_DECREF(first);
+        Py_DECREF(second);
+        return merged;
+    }
+
+    PyObject *makeSlangReadSvFailure(std::span<const slang::Diagnostic> messages,
+                                     const slang::DiagnosticEngine &diagEngine,
+                                     const slang::SourceManager *sourceManager,
+                                     const std::string &stderrText)
+    {
+        PyObject *slang_diag_list = slangDiagnosticsToPyList(messages, diagEngine, sourceManager);
+        if (!slang_diag_list)
+        {
+            return nullptr;
+        }
+        PyObject *stderr_diag_list = stderrTextToPyList(stderrText);
+        if (!stderr_diag_list)
+        {
+            Py_DECREF(slang_diag_list);
+            return nullptr;
+        }
+        PyObject *diag_list = mergePyListsOrTake(stderr_diag_list, slang_diag_list);
+        if (!diag_list)
+        {
+            return nullptr;
+        }
+        return makeReadSvResult(nullptr, false, diag_list);
     }
 
     void emitDiagnostics(const std::vector<wolvrix::lib::diag::Diagnostic> &messages,
@@ -968,22 +1235,37 @@ namespace
         driver.addStandardArgs();
         driver.options.singleUnit = true;
         driver.options.compilationFlags.at(slang::ast::CompilationFlags::AllowTopLevelIfacePorts) = true;
+        auto frontendClient = std::make_shared<BufferedDiagnosticClient>();
+        driver.diagEngine.clearClients();
+        driver.diagEngine.addClient(frontendClient);
+        StderrCapture setupStderrCapture;
+        setupStderrCapture.start();
 
         if (!driver.parseCommandLine(static_cast<int>(argv.size()), argv.data()))
         {
-            PyErr_SetString(PyExc_RuntimeError, "failed to parse slang options");
-            return nullptr;
+            const std::string stderrText = setupStderrCapture.finish();
+            return makeSlangReadSvFailure(frontendClient->diagnostics(),
+                                          driver.diagEngine,
+                                          &driver.diagEngine.getSourceManager(),
+                                          stderrText);
         }
         if (!driver.processOptions())
         {
-            PyErr_SetString(PyExc_RuntimeError, "failed to apply slang options");
-            return nullptr;
+            const std::string stderrText = setupStderrCapture.finish();
+            return makeSlangReadSvFailure(frontendClient->diagnostics(),
+                                          driver.diagEngine,
+                                          &driver.diagEngine.getSourceManager(),
+                                          stderrText);
         }
         if (!driver.parseAllSources())
         {
-            PyErr_SetString(PyExc_RuntimeError, "failed to parse sources");
-            return nullptr;
+            const std::string stderrText = setupStderrCapture.finish();
+            return makeSlangReadSvFailure(frontendClient->diagnostics(),
+                                          driver.diagEngine,
+                                          &driver.diagEngine.getSourceManager(),
+                                          stderrText);
         }
+        const std::string setupStderrText = setupStderrCapture.finish();
 
         auto compilation = std::shared_ptr<slang::ast::Compilation>(driver.createCompilation());
         driver.runAnalysis(*compilation);
@@ -992,7 +1274,7 @@ namespace
         bool hasSlangErrors = false;
         for (const auto &diag : allDiagnostics)
         {
-            const auto severity = slang::getDefaultSeverity(diag.code);
+            const auto severity = driver.diagEngine.getSeverity(diag.code, diag.location);
             if (severity >= slang::DiagnosticSeverity::Warning)
             {
                 hasSlangIssues = true;
@@ -1004,24 +1286,10 @@ namespace
         }
         if (hasSlangErrors)
         {
-            const auto sourceManager = compilation->getSourceManager();
-            PyObject *diag_list = slangDiagnosticsToPyList(allDiagnostics, driver.diagEngine,
-                                                           sourceManager);
-            if (!diag_list)
-            {
-                return nullptr;
-            }
-            PyObject *result = PyTuple_New(3);
-            if (!result)
-            {
-                Py_DECREF(diag_list);
-                return nullptr;
-            }
-            Py_INCREF(Py_None);
-            PyTuple_SET_ITEM(result, 0, Py_None);
-            PyTuple_SET_ITEM(result, 1, PyBool_FromLong(0));
-            PyTuple_SET_ITEM(result, 2, diag_list);
-            return result;
+            return makeSlangReadSvFailure(allDiagnostics,
+                                          driver.diagEngine,
+                                          compilation->getSourceManager(),
+                                          setupStderrText);
         }
 
         bool ok = false;
@@ -1038,6 +1306,38 @@ namespace
             return nullptr;
         }
         (void)diag_level;
+
+        PyObject *frontend_diag_list = stderrTextToPyList(setupStderrText);
+        if (!frontend_diag_list)
+        {
+            return nullptr;
+        }
+        if (hasSlangIssues)
+        {
+            PyObject *slang_diag_list = slangDiagnosticsToPyList(allDiagnostics,
+                                                                 driver.diagEngine,
+                                                                 compilation->getSourceManager());
+            if (!slang_diag_list)
+            {
+                Py_DECREF(frontend_diag_list);
+                return nullptr;
+            }
+            PyObject *merged_frontend = mergePyListsOrTake(frontend_diag_list, slang_diag_list);
+            if (!merged_frontend)
+            {
+                return nullptr;
+            }
+            frontend_diag_list = merged_frontend;
+        }
+        else if (PyList_GET_SIZE(frontend_diag_list) == 0)
+        {
+            Py_DECREF(frontend_diag_list);
+            frontend_diag_list = PyList_New(0);
+            if (!frontend_diag_list)
+            {
+                return nullptr;
+            }
+        }
 
         wolvrix::lib::ingest::ConvertOptions convertOptions;
         convertOptions.abortOnError = true;
@@ -1067,36 +1367,32 @@ namespace
         catch (const wolvrix::lib::ingest::ConvertAbort &)
         {
             converter.diagnostics().flushThreadLocal();
-            PyObject *diag_list = diagnosticsToPyList(converter.diagnostics().messages(),
-                                                      compilation->getSourceManager());
+            PyObject *converter_diag_list = diagnosticsToPyList(converter.diagnostics().messages(),
+                                                                compilation->getSourceManager());
+            if (!converter_diag_list)
+            {
+                Py_DECREF(frontend_diag_list);
+                return nullptr;
+            }
+            PyObject *diag_list = mergePyListsOrTake(frontend_diag_list, converter_diag_list);
             if (!diag_list)
             {
                 return nullptr;
             }
-            PyObject *result = PyTuple_New(3);
-            if (!result)
-            {
-                Py_DECREF(diag_list);
-                return nullptr;
-            }
-            Py_INCREF(Py_None);
-            PyTuple_SET_ITEM(result, 0, Py_None);
-            PyTuple_SET_ITEM(result, 1, PyBool_FromLong(0));
-            PyTuple_SET_ITEM(result, 2, diag_list);
-            return result;
+            return makeReadSvResult(nullptr, false, diag_list);
         }
         converter.diagnostics().flushThreadLocal();
         const bool success = !converter.diagnostics().hasError();
-        PyObject *diag_list = diagnosticsToPyList(converter.diagnostics().messages(),
-                                                  compilation->getSourceManager());
-        if (!diag_list)
+        PyObject *converter_diag_list = diagnosticsToPyList(converter.diagnostics().messages(),
+                                                            compilation->getSourceManager());
+        if (!converter_diag_list)
         {
+            Py_DECREF(frontend_diag_list);
             return nullptr;
         }
-        PyObject *result = PyTuple_New(3);
-        if (!result)
+        PyObject *diag_list = mergePyListsOrTake(frontend_diag_list, converter_diag_list);
+        if (!diag_list)
         {
-            Py_DECREF(diag_list);
             return nullptr;
         }
         if (success)
@@ -1105,19 +1401,11 @@ namespace
             if (!capsule)
             {
                 Py_DECREF(diag_list);
-                Py_DECREF(result);
                 return nullptr;
             }
-            PyTuple_SET_ITEM(result, 0, capsule);
+            return makeReadSvResult(capsule, true, diag_list);
         }
-        else
-        {
-            Py_INCREF(Py_None);
-            PyTuple_SET_ITEM(result, 0, Py_None);
-        }
-        PyTuple_SET_ITEM(result, 1, PyBool_FromLong(success ? 1 : 0));
-        PyTuple_SET_ITEM(result, 2, diag_list);
-        return result;
+        return makeReadSvResult(nullptr, false, diag_list);
     }
 
     PyObject *py_read_json(PyObject * /*self*/, PyObject *args, PyObject *kwargs)
