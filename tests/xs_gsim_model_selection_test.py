@@ -841,8 +841,8 @@ def test_root_make_resolves_xs_gsim_emu_from_actual_build_dir() -> None:
     run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
     run_body = makefile_text[run_start:run_end]
     expect(
-        'XS_GSIM_BUILD_DIR="$(XS_ROOT)/$(BUILD_DIR)"' in run_body,
-        "run_xs_gsim should resolve the emulator from the actual XiangShan BUILD_DIR instead of hardcoding $(XS_ROOT)/build",
+        'XS_GSIM_BUILD_DIR="$(if $(filter /%,$(BUILD_DIR)),$(BUILD_DIR),$(XS_ROOT)/$(BUILD_DIR))"' in run_body,
+        "run_xs_gsim should preserve absolute BUILD_DIR values while still resolving relative ones under XiangShan",
     )
     expect(
         'XS_GSIM_BUILD_DIR="$(XS_ROOT)/build"' not in run_body,

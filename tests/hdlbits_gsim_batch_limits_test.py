@@ -105,16 +105,46 @@ def main() -> int:
             (pkg_dir / "_wolvrix.so").write_bytes(b"")
             isolated_launch = module.resolve_wolvrix_python_launch(str(build_root))
             expect(
-                isolated_launch.python_args == ["-S"],
-                f"present build-tree bindings should force -S isolation: {isolated_launch.python_args!r}",
+                isolated_launch.python_args == [],
+                f"unstamped build-tree bindings should not force -S isolation: {isolated_launch.python_args!r}",
             )
             expect(
-                isolated_launch.env.get("PYTHONPATH") == str(build_root),
-                f"present build-tree bindings should export PYTHONPATH to the build tree: {isolated_launch.env!r}",
+                "PYTHONPATH" not in isolated_launch.env,
+                f"unstamped build-tree bindings should not export PYTHONPATH to the build tree: {isolated_launch.env!r}",
             )
             expect(
-                isolated_launch.env.get("PYTHONNOUSERSITE") == "1",
-                f"present build-tree bindings should disable user site imports: {isolated_launch.env!r}",
+                "PYTHONNOUSERSITE" not in isolated_launch.env,
+                f"unstamped build-tree bindings should not disable user site imports: {isolated_launch.env!r}",
+            )
+
+            (build_root / ".python-executable").write_text(f"{sys.executable}\n", encoding="utf-8")
+            stamped_launch = module.resolve_wolvrix_python_launch(str(build_root))
+            expect(
+                stamped_launch.python_args == ["-S"],
+                f"matching stamped build-tree bindings should force -S isolation: {stamped_launch.python_args!r}",
+            )
+            expect(
+                stamped_launch.env.get("PYTHONPATH") == str(build_root),
+                f"matching stamped build-tree bindings should export PYTHONPATH to the build tree: {stamped_launch.env!r}",
+            )
+            expect(
+                stamped_launch.env.get("PYTHONNOUSERSITE") == "1",
+                f"matching stamped build-tree bindings should disable user site imports: {stamped_launch.env!r}",
+            )
+
+            (build_root / ".python-executable").write_text("/tmp/other-python\n", encoding="utf-8")
+            mismatched_launch = module.resolve_wolvrix_python_launch(str(build_root))
+            expect(
+                mismatched_launch.python_args == [],
+                f"mismatched build-tree bindings should not force -S isolation: {mismatched_launch.python_args!r}",
+            )
+            expect(
+                "PYTHONPATH" not in mismatched_launch.env,
+                f"mismatched build-tree bindings should not export PYTHONPATH to the build tree: {mismatched_launch.env!r}",
+            )
+            expect(
+                "PYTHONNOUSERSITE" not in mismatched_launch.env,
+                f"mismatched build-tree bindings should not disable user site imports: {mismatched_launch.env!r}",
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
