@@ -234,6 +234,11 @@ def main() -> int:
                 captured_compile.get("memory_limit_mb") == 654,
                 f"compile mode should apply the configured memory cap to the per-DUT compile helper process: {captured_compile!r}",
             )
+            argv = captured_compile.get("argv", [])
+            expect(
+                len(argv) >= 3 and "timeout=19" in str(argv[2]),
+                f"compile mode should pass the configured per-DUT timeout through to the inner syntax-check subprocess: {captured_compile!r}",
+            )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = pathlib.Path(tmpdir)
