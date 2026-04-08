@@ -968,6 +968,32 @@ def test_root_make_honors_custom_waveform_path_for_xs_gsim() -> None:
     )
 
 
+def test_root_make_cleans_gsim_compile_before_downstream_rebuild() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    run_start = makefile_text.index("run_xs_gsim:")
+    run_end = makefile_text.index("\nrun_xs_gsim_smoke:", run_start)
+    run_body = makefile_text[run_start:run_end]
+    expect(
+        'rm -rf "$${XS_GSIM_BUILD_DIR}/gsim-compile"' in run_body,
+        "run_xs_gsim should clear the downstream gsim-compile directory before rebuilding to avoid stale incremental wrapper/object reuse",
+    )
+
+
+def test_root_make_honors_custom_waveform_path_for_xs_repcut() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("run_xs_repcut:")
+    end = makefile_text.index("\nrun_xs_repcut_partitioned_smoke:", start)
+    body = makefile_text[start:end]
+    expect(
+        body.count('$(if $(filter 1,$(XS_WAVEFORM)),$(if $(XS_WAVEFORM_PATH),--wave-path $(XS_WAVEFORM_PATH_ABS),--wave-path $$REPCUT_WAVEFORM),)') >= 2,
+        "run_xs_repcut should honor XS_WAVEFORM_PATH in both the logged and executed emulator invocations and should not emit --wave-path when waveform dumping is disabled",
+    )
+    expect(
+        '--wave-path $(XS_WAVEFORM_PATH_ABS)' in body,
+        "run_xs_repcut should prefer XS_WAVEFORM_PATH when a custom waveform location is provided",
+    )
+
+
 def test_gsim_reset_sequence_holds_reset_until_loop_end() -> None:
     emu_cpp = XIANGSHAN_DIR / "difftest" / "src" / "test" / "csrc" / "emu" / "emu.cpp"
     text = emu_cpp.read_text(encoding="utf-8")
@@ -1085,6 +1111,8 @@ def main() -> int:
         test_root_make_resolves_xs_gsim_emu_from_actual_build_dir()
         test_root_make_forwards_build_dir_to_xs_gsim_downstream()
         test_root_make_honors_custom_waveform_path_for_xs_gsim()
+        test_root_make_cleans_gsim_compile_before_downstream_rebuild()
+        test_root_make_honors_custom_waveform_path_for_xs_repcut()
         test_gsim_reset_sequence_holds_reset_until_loop_end()
         test_gsim_wrapper_forwards_clock_and_emu_toggles_it()
         test_gsim_link_disables_relax_and_pie(ARTIFACT_ROOT / "case_link_flags" / "model")
