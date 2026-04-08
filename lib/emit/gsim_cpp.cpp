@@ -3180,6 +3180,8 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 os << "    void set_reset(unsigned reset) { bootstrap_reset_pending_ = (reset != 0); }\n\n";
             }
             os << "    void reset();\n\n";
+            os << "    void settle();\n";
+            os << "    void commit_step();\n";
             os << "    void step();\n\n";
 
             // Input port setters
@@ -3413,7 +3415,9 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 os << "    output_" << sanitizeIdentifier(name) << "_ = 0;\n";
             }
             os << "}\n\n";
-            os << "void SSimTop::step() {\n";
+            os << "void SSimTop::settle() {\n";
+            os << "}\n\n";
+            os << "void SSimTop::commit_step() {\n";
             os << "    ++difftest_step_;\n";
             os << "    if (bootstrap_reset_pending_) {\n";
             os << "        bootstrap_reset_pending_ = false;\n";
@@ -3465,6 +3469,10 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 }
             }
             os << "    difftest_exit_ = 0;\n";
+            os << "}\n\n";
+            os << "void SSimTop::step() {\n";
+            os << "    settle();\n";
+            os << "    commit_step();\n";
             os << "}\n\n";
             if (emitMetadata)
             {

@@ -1137,7 +1137,14 @@ void testHappyPathAfterRunningGsim()
     const std::string source = readFile(sourcePath);
     expect(contains(header, "class SSimTop"), "header should expose the downstream simulator-facing SSimTop class");
     expect(contains(header, "void set_reset(unsigned reset)"), "header should expose set_reset for downstream GSIM runtime");
+    expect(contains(header, "void settle()"), "header should expose settle for fine-grained downstream GSIM runtime");
+    expect(contains(header, "void commit_step()"), "header should expose commit_step for fine-grained downstream GSIM runtime");
     expect(contains(header, "void step()"), "header should expose step for downstream GSIM runtime");
+    expect(contains(source, "void SSimTop::settle()"), "source should define settle for fine-grained downstream GSIM runtime");
+    expect(contains(source, "void SSimTop::commit_step()"), "source should define commit_step for fine-grained downstream GSIM runtime");
+    expect(contains(source, "void SSimTop::step()"), "source should define step for downstream GSIM runtime");
+    expect(contains(source, "    settle();"), "step() should call settle() in the compatibility path");
+    expect(contains(source, "    commit_step();"), "step() should call commit_step() in the compatibility path");
     expect(contains(header, "get_difftest__DOT__uart__DOT__out__DOT__valid()"), "header should expose downstream UART out valid accessor");
     expect(contains(header, "get_difftest__DOT__uart__DOT__out__DOT__ch()"), "header should expose downstream UART out char accessor");
     expect(contains(header, "get_difftest__DOT__uart__DOT__in__DOT__valid()"), "header should expose downstream UART in valid accessor");
