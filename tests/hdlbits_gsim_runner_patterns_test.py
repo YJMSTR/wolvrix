@@ -34,7 +34,7 @@ def run_dut(
     dut_id: str,
     expect_tb_parity: bool = False,
     expect_no_tb_parity: bool = False,
-) -> None:
+) -> pathlib.Path:
     env = os.environ.copy()
     env["PYTHONNOUSERSITE"] = "1"
     env["WOLVRIX_PYTHON_BUILD_DIR"] = str(BUILD_PYTHON_DIR)
@@ -69,6 +69,7 @@ def run_dut(
         expect(not (dut_dir / "verilated.h").exists(), f"dut_{dut_id} unexpectedly used TB parity shim")
         expect(not (dut_dir / "verilated_cov.h").exists(), f"dut_{dut_id} unexpectedly used TB parity cov shim")
         expect(not (dut_dir / f"Vdut_{dut_id}.h").exists(), f"dut_{dut_id} unexpectedly used Verilator-compatible wrapper")
+    return dut_dir
 
 
 def main() -> int:
@@ -211,6 +212,30 @@ def main() -> int:
         run_dut("106", expect_tb_parity=True)
         run_dut("116", expect_tb_parity=True)
         run_dut("118", expect_tb_parity=True)
+
+        runner_030 = (run_dut("030", expect_no_tb_parity=True) / "dut_030_runner.cpp").read_text(encoding="utf-8")
+        expect(
+            "comb and ff XOR outputs correct across edges" in runner_030,
+            "dut_030 runner should mirror the original TB's combined combinational + ff XOR workload instead of the weaker generic fallback",
+        )
+
+        runner_093 = (run_dut("093", expect_no_tb_parity=True) / "dut_093_runner.cpp").read_text(encoding="utf-8")
+        expect(
+            "3-bit state machine output" in runner_093 and "q0" in runner_093 and "q1" in runner_093 and "q2" in runner_093,
+            "dut_093 runner should mirror the original TB's full 3-bit state-machine sequence instead of the reduced generic fallback",
+        )
+
+        runner_115 = (run_dut("115", expect_no_tb_parity=True) / "dut_115_runner.cpp").read_text(encoding="utf-8")
+        expect(
+            "serial load + muxed readout" in runner_115 and "check_Z" in runner_115,
+            "dut_115 runner should mirror the original TB's serial-load plus 8-way mux readout checks instead of the reduced generic fallback",
+        )
+
+        runner_162 = (run_dut("162", expect_no_tb_parity=True) / "dut_162_runner.cpp").read_text(encoding="utf-8")
+        expect(
+            "for (uint8_t idx = 0; idx < 128U; ++idx)" in runner_162 and "passed all prediction and training scenarios" in runner_162,
+            "dut_162 runner should preserve the original TB's full PHT sweep and prediction/training workload instead of the reduced fallback sequence",
+        )
     except Exception as ex:
         return fail(str(ex))
     return 0
