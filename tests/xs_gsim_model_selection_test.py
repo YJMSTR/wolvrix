@@ -847,8 +847,8 @@ def test_build_xs_repcut_verilator_honors_python_stamp_guard() -> None:
     end = makefile_text.find("\n\n", start)
     body = makefile_text[start:end]
     expect(
-        "WOLVRIX_MATCHING_BUILD_PYTHON" in body,
-        "build_xs_repcut_verilator should honor the same matching-build-python guard as the rest of the Makefile",
+        "WOLVRIX_PYTHON_STAMP" in body and 'cat "$(WOLVRIX_PYTHON_STAMP)"' in body,
+        "build_xs_repcut_verilator should honor the build-tree python compatibility guard before deciding whether editable install is necessary",
     )
 
 
@@ -877,6 +877,21 @@ def test_build_xs_repcut_verilator_refreshes_python_stamp() -> None:
     expect(
         "WOLVRIX_PYTHON_STAMP" in body and "CURRENT_PYTHON" in body,
         "build_xs_repcut_verilator should refresh the build-tree python stamp after rebuilding Wolvrix",
+    )
+
+
+def test_build_xs_repcut_verilator_rechecks_stamp_after_rebuild() -> None:
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    start = makefile_text.index("build_xs_repcut_verilator:")
+    end = makefile_text.find("\n\n", start)
+    body = makefile_text[start:end]
+    expect(
+        '[ -n "$(WOLVRIX_MATCHING_BUILD_PYTHON)" ]' not in body,
+        "build_xs_repcut_verilator should not rely on the pre-expanded WOLVRIX_MATCHING_BUILD_PYTHON variable after rebuilding Wolvrix",
+    )
+    expect(
+        'cat "$(WOLVRIX_PYTHON_STAMP)"' in body and '$(PYTHON) -m pip install -e $(WOLVRIX_DIR)' in body,
+        "build_xs_repcut_verilator should re-check the refreshed python stamp before deciding whether editable install is still necessary",
     )
 
 
@@ -1106,6 +1121,7 @@ def main() -> int:
         test_build_xs_repcut_verilator_honors_python_stamp_guard()
         test_xs_python_launch_selection_is_not_frozen_at_parse_time()
         test_build_xs_repcut_verilator_refreshes_python_stamp()
+        test_build_xs_repcut_verilator_rechecks_stamp_after_rebuild()
         test_root_make_derives_actual_gsim_artifact_dir_from_base_override(ARTIFACT_ROOT / "case_gsim_artifact_dir" / "model")
         test_root_make_uses_actual_gsim_artifact_dir_for_budget_and_downstream()
         test_root_make_resolves_xs_gsim_emu_from_actual_build_dir()
