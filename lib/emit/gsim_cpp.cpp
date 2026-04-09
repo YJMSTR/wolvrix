@@ -4061,12 +4061,12 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             return true;
         };
 
-        CodegenState state = buildCodegenState(false,
+        CodegenState state = buildCodegenState(true,
                                                nullptr,
                                                &postSequentialSideEffectOpIndices,
                                                true,
                                                "step_tmp_group_");
-        CodegenState postState = buildCodegenState(false,
+        CodegenState postState = buildCodegenState(true,
                                                    &postSequentialSliceOpIndices,
                                                    nullptr,
                                                    true,

@@ -2977,9 +2977,9 @@ void testLargeCombinationalChainUsesMaterializedTemporaries()
            "large combinational chains should keep materialized temporaries out of the public header");
     expect(!contains(header, "output_y_ = sim_tmp_v"),
            "header should not inline step behavior for large combinational chains");
-    expect(contains(source, "const std::uint8_t sim_tmp_v"),
+    expect(contains(source, "const std::uint8_t sim_tmp_v") || contains(source, "step_tmp_group_"),
            "large combinational chains should materialize intermediate temporaries in the emitted source");
-    expect(contains(source, "output_y_ = sim_tmp_v"),
+    expect(contains(source, "output_y_ = sim_tmp_v") || contains(source, "output_y_ = step_tmp_group_"),
            "output assignments should consume a materialized temporary rather than an inlined expression tree");
 
     const std::filesystem::path driverPath = dir / "chain_driver.cpp";
