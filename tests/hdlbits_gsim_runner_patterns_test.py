@@ -230,11 +230,7 @@ def main() -> int:
             "dut_162 runner should preserve the original TB's full PHT sweep and prediction/training workload instead of the reduced fallback sequence",
         )
 
-        runner_141 = (run_dut("141", expect_no_tb_parity=True) / "dut_141_runner.cpp").read_text(encoding="utf-8")
-        expect(
-            "simple 2-state FSM with z behavior" in runner_141 and 'const std::array<std::uint8_t, 6> sequence' in runner_141,
-            "dut_141 runner should preserve the original TB's reset-and-sequence FSM workload instead of a weaker fallback",
-        )
+        run_dut("141", expect_tb_parity=True)
     except Exception as ex:
         return fail(str(ex))
     return 0

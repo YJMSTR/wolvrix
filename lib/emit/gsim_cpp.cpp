@@ -1271,7 +1271,7 @@ namespace wolvrix::lib::emit
                     if (!sym.empty()) {
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
                         if (!op.results().empty()) {
-                            setResultExpr(0, latchName);
+                            state.valueExprs[op.results()[0]] = latchName;
                         }
                     }
                     break;
@@ -3507,6 +3507,7 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                     os << stmt << "\n";
                 }
             }
+            os << "    settle();\n";
             os << "    difftest_exit_ = 0;\n";
             os << "}\n\n";
             os << "void SSimTop::step() {\n";
