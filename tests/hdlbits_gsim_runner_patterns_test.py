@@ -225,11 +225,7 @@ def main() -> int:
             "dut_030 runner should mirror the original TB's combined combinational + ff XOR workload instead of the weaker generic fallback",
         )
 
-        runner_093 = (run_dut("093", expect_no_tb_parity=True) / "dut_093_runner.cpp").read_text(encoding="utf-8")
-        expect(
-            "3-bit state machine output" in runner_093 and "q0" in runner_093 and "q1" in runner_093 and "q2" in runner_093,
-            "dut_093 runner should mirror the original TB's full 3-bit state-machine sequence instead of the reduced generic fallback",
-        )
+        run_dut("093", expect_tb_parity=True)
 
         runner_115 = (run_dut("115", expect_no_tb_parity=True) / "dut_115_runner.cpp").read_text(encoding="utf-8")
         expect(
