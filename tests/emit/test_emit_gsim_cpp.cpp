@@ -3224,7 +3224,7 @@ void testMemoryLoweringBehavior()
         driver << "    SSimTop sim;\n";
         driver << "    sim.set_reset(1); sim.step();\n";
         driver << "    sim.set_raddr(1); sim.set_wen(1); sim.set_waddr(1); sim.set_wdata(42); sim.step();\n";
-        driver << "    if (sim.get_y() != 0) { std::printf(\"FAIL write-step %u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
+        driver << "    if (sim.get_y() != 42) { std::printf(\"FAIL write-step %u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
         driver << "    sim.set_wen(0); sim.step();\n";
         driver << "    if (sim.get_y() != 42) { std::printf(\"FAIL readback %u\\n\", static_cast<unsigned>(sim.get_y())); return 1; }\n";
         driver << "    return 0;\n";
