@@ -89,6 +89,42 @@ def main() -> int:
             expect(row["compile_ms"] >= 0.0, f"{name} missing compile_ms")
             expect(row["runtime_ms"] >= 0.0, f"{name} missing runtime_ms")
             expect(row["total_ms"] >= row["emit_ms"], f"{name} total_ms smaller than emit_ms")
+
+        special_out = ARTIFACT_ROOT / "verilator_special_cases"
+        special = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                str(SCRIPT_PATH),
+                "--output-dir",
+                str(special_out),
+                "--backend",
+                "verilator",
+                "--dut-ids",
+                "043,098,119",
+                "--timeout",
+                "120",
+                "--memory-limit-mb",
+                "32768",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        expect(
+            special.returncode == 0,
+            "special-case verilator benchmark failed\nstdout:\n"
+            + (special.stdout or "")
+            + "\nstderr:\n"
+            + (special.stderr or ""),
+        )
+        special_report = json.loads((special_out / "batch_report.json").read_text(encoding="utf-8"))
+        special_rows = {entry["dut_id"]: entry for entry in special_report["dut_results"]}
+        for dut_id in ("043", "098", "119"):
+            row = special_rows.get(dut_id)
+            expect(row is not None, f"missing verilator dut_{dut_id} result")
+            expect(row["result"] == "success", f"verilator dut_{dut_id} did not succeed: {row['result']}")
     except Exception as ex:
         return fail(str(ex))
     return 0
