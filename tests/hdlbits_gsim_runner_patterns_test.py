@@ -206,7 +206,6 @@ def main() -> int:
         run_dut("098", expect_tb_parity=True)
         run_dut("111", expect_tb_parity=True)
         run_dut("114", expect_tb_parity=True)
-        run_dut("030", expect_no_tb_parity=True)
         run_dut("060", expect_tb_parity=True)
         run_dut("095", expect_tb_parity=True)
         run_dut("106", expect_tb_parity=True)
@@ -219,19 +218,11 @@ def main() -> int:
             "TB parity wrappers should route their eval flow through the fine-grained settle/commit_step API instead of calling step() directly",
         )
 
-        runner_030 = (run_dut("030", expect_no_tb_parity=True) / "dut_030_runner.cpp").read_text(encoding="utf-8")
-        expect(
-            "comb and ff XOR outputs correct across edges" in runner_030,
-            "dut_030 runner should mirror the original TB's combined combinational + ff XOR workload instead of the weaker generic fallback",
-        )
+        run_dut("030", expect_tb_parity=True)
 
         run_dut("093", expect_tb_parity=True)
 
-        runner_115 = (run_dut("115", expect_no_tb_parity=True) / "dut_115_runner.cpp").read_text(encoding="utf-8")
-        expect(
-            "serial load + muxed readout" in runner_115 and "check_Z" in runner_115,
-            "dut_115 runner should mirror the original TB's serial-load plus 8-way mux readout checks instead of the reduced generic fallback",
-        )
+        run_dut("115", expect_tb_parity=True)
 
         runner_162 = (run_dut("162", expect_no_tb_parity=True) / "dut_162_runner.cpp").read_text(encoding="utf-8")
         expect(
