@@ -101,7 +101,7 @@ def main() -> int:
                 "--backend",
                 "verilator",
                 "--dut-ids",
-                "043,098,119",
+                "043,098,119,125,126,143,151,158",
                 "--timeout",
                 "120",
                 "--memory-limit-mb",
@@ -121,7 +121,7 @@ def main() -> int:
         )
         special_report = json.loads((special_out / "batch_report.json").read_text(encoding="utf-8"))
         special_rows = {entry["dut_id"]: entry for entry in special_report["dut_results"]}
-        for dut_id in ("043", "098", "119"):
+        for dut_id in ("043", "098", "119", "125", "126", "143", "151", "158"):
             row = special_rows.get(dut_id)
             expect(row is not None, f"missing verilator dut_{dut_id} result")
             expect(row["result"] == "success", f"verilator dut_{dut_id} did not succeed: {row['result']}")
