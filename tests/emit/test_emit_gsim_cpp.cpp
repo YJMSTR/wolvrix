@@ -328,6 +328,55 @@ Design buildNamedResetRegisterCycleDesign()
     return design;
 }
 
+Design buildFineGrainedPhaseDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("phase_top");
+    design.markAsTop("phase_top");
+
+    const auto inA = makeValue(graph, "a", 1, false);
+    const auto inB = makeValue(graph, "b", 1, false);
+    const auto inClk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+    graph.bindInputPort("clk", inClk);
+
+    const auto outComb = makeValue(graph, "comb_y", 1, false);
+    const auto outReg = makeValue(graph, "reg_y", 1, false);
+    graph.bindOutputPort("comb_y", outComb);
+    graph.bindOutputPort("reg_y", outReg);
+
+    const auto xorVal = makeValue(graph, "xor_val", 1, false);
+    const auto xorOp = graph.createOperation(OperationKind::kXor, graph.internSymbol("xor_logic"));
+    graph.addOperand(xorOp, inA);
+    graph.addOperand(xorOp, inB);
+    graph.addResult(xorOp, xorVal);
+
+    const auto assignComb = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_comb"));
+    graph.addOperand(assignComb, xorVal);
+    graph.addResult(assignComb, outComb);
+
+    const auto regOp = graph.createOperation(OperationKind::kRegister, graph.internSymbol("state"));
+    graph.setAttr(regOp, "initValue", std::string("1'b0"));
+    const auto regOut = makeValue(graph, "state_out", 1, false);
+    graph.addResult(regOp, regOut);
+
+    const auto readOp = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol("state_rp"));
+    graph.setAttr(readOp, "regSymbol", std::string("state"));
+    const auto readVal = makeValue(graph, "state_read", 1, false);
+    graph.addResult(readOp, readVal);
+
+    const auto assignReg = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_reg"));
+    graph.addOperand(assignReg, readVal);
+    graph.addResult(assignReg, outReg);
+
+    const auto one = makeConstant(graph, "wen", "wen_c", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_c", 1, "1'b1");
+    makeRegisterWrite(graph, "state_wp", one, xorVal, mask, inClk, "state");
+
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -2146,6 +2195,50 @@ void testRegisterChainKeepsPreStepState()
     expect(std::system(exePath.c_str()) == 0, "register-chain driver should preserve pre-step state across writes");
 }
 
+void testFineGrainedPhaseBehavior()
+{
+    Design design = buildFineGrainedPhaseDesign();
+    runGsim(design, "phase_top");
+
+    const auto dir = artifactRoot() / "fine_grained_phase";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("phase_sim");
+    options.topOverrides = {"phase_top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "fine-grained phase emit should succeed");
+
+    const std::filesystem::path driverPath = dir / "phase_driver.cpp";
+    {
+        std::ofstream driver(driverPath);
+        driver << "#include \"phase_sim.hpp\"\n";
+        driver << "#include \"phase_sim.cpp\"\n";
+        driver << "#include <cstdio>\n";
+        driver << "int main() {\n";
+        driver << "    SSimTop sim;\n";
+        driver << "    sim.set_reset(1); sim.step();\n";
+        driver << "    if (sim.get_comb_y() != 0 || sim.get_reg_y() != 0) { std::printf(\"FAIL reset comb=%u reg=%u expected 0/0\\n\", static_cast<unsigned>(sim.get_comb_y()), static_cast<unsigned>(sim.get_reg_y())); return 1; }\n";
+        driver << "    sim.set_reset(0); sim.set_clk(0); sim.set_a(1); sim.set_b(0); sim.settle();\n";
+        driver << "    if (sim.get_comb_y() != 1 || sim.get_reg_y() != 0) { std::printf(\"FAIL settle comb=%u reg=%u expected 1/0\\n\", static_cast<unsigned>(sim.get_comb_y()), static_cast<unsigned>(sim.get_reg_y())); return 2; }\n";
+        driver << "    sim.commit_step();\n";
+        driver << "    if (sim.get_comb_y() != 1 || sim.get_reg_y() != 1) { std::printf(\"FAIL commit comb=%u reg=%u expected 1/1\\n\", static_cast<unsigned>(sim.get_comb_y()), static_cast<unsigned>(sim.get_reg_y())); return 3; }\n";
+        driver << "    return 0;\n";
+        driver << "}\n";
+    }
+
+    const std::string exePath = (dir / "phase_driver").string();
+    const std::string compileCmd =
+        "g++ -std=c++17 -Wall -Wextra -Werror -I " + dir.string() +
+        " -o " + exePath + " " + driverPath.string() + " 2>&1";
+    expect(std::system(compileCmd.c_str()) == 0, "fine-grained phase driver should compile");
+    expect(std::system(exePath.c_str()) == 0, "fine-grained phase driver should pass");
+}
+
 void testNamedResetInputWithClockDoesNotForceInitState()
 {
     Design design;
@@ -3574,6 +3667,7 @@ int main()
         testRegisterLatencyBehavior();
         testRegisterDerivedOutputBehavior();
         testRegisterChainKeepsPreStepState();
+        testFineGrainedPhaseBehavior();
         testNamedResetInputWithClockDoesNotForceInitState();
         testNegedgeRegisterWriteHonorsClockLevel();
         testMixedEdgeRegisterWriteUsesEachEventOperand();

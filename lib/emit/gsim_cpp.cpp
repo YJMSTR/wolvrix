@@ -2665,6 +2665,32 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             return statements;
         }
 
+        std::vector<std::string> collectSettleStatements(const CodegenState &state)
+        {
+            std::vector<std::string> statements;
+            statements.insert(statements.end(), state.combinationalStmts.begin(), state.combinationalStmts.end());
+            const auto combIt = state.sequentialStmts.find("combinational");
+            if (combIt != state.sequentialStmts.end())
+            {
+                statements.insert(statements.end(), combIt->second.begin(), combIt->second.end());
+            }
+            return statements;
+        }
+
+        std::vector<std::string> collectCommitStatements(const CodegenState &state)
+        {
+            std::vector<std::string> statements;
+            for (const auto &[domain, domainStatements] : state.sequentialStmts)
+            {
+                if (domain == "combinational")
+                {
+                    continue;
+                }
+                statements.insert(statements.end(), domainStatements.begin(), domainStatements.end());
+            }
+            return statements;
+        }
+
         constexpr std::size_t statementEmitBytes(std::string_view statement)
         {
             return statement.size() + 1;
@@ -3333,6 +3359,8 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
                 metadataStatements = collectMetadataStatements(metadata, metadataStatementTargetBytes);
                 metadataBytes = estimateMetadataStatementsBytes(metadataStatements);
             }
+            const auto settleStatements = collectSettleStatements(state);
+            const auto commitStatements = collectCommitStatements(state);
             const auto stepStatements = collectStepStatements(state);
             const auto postStepStatements = collectStepStatements(postState);
             std::vector<MetadataShardPlan> shardPlans;
@@ -3416,6 +3444,17 @@ constexpr std::uint8_t reduceAnd(const Bits<Width>& value) {
             }
             os << "}\n\n";
             os << "void SSimTop::settle() {\n";
+            if (behaviorShardPlans.empty())
+            {
+                for (const auto &stmt : settleStatements)
+                {
+                    os << stmt << "\n";
+                }
+                for (const auto &stmt : state.outputStmts)
+                {
+                    os << stmt << "\n";
+                }
+            }
             os << "}\n\n";
             os << "void SSimTop::commit_step() {\n";
             os << "    ++difftest_step_;\n";

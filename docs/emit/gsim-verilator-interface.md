@@ -14,6 +14,8 @@ public:
 
     void set_reset(unsigned reset);  // Assert/deassert reset
     void reset();                    // Initialize all state to zero
+    void settle();                   // Recompute combinational/current-state outputs
+    void commit_step();              // Commit one state update cycle
     void step();                     // Advance simulation by one cycle
 
     // Per-port accessors (generated from GRH ports)
@@ -27,8 +29,8 @@ public:
 | Verilator Pattern | GSim Equivalent | Notes |
 |-------------------|----------------|-------|
 | `new VSimTop()` | `SSimTop sim;` | Constructor calls `reset()` automatically |
-| `top->reset = 1; top->eval()` | `sim.set_reset(1); sim.step();` | Reset cycle |
-| `top->clk = 1; top->eval()` | `sim.set_clk(1); sim.step();` | Clock edge + evaluate |
+| `top->reset = 1; top->eval()` | `sim.set_reset(1); sim.step();` | Compatibility path |
+| `top->clk = 1; top->eval()` | `sim.set_clk(1); sim.step();` | Compatibility path |
 | `top->a = val` | `sim.set_a(val)` | Set input port |
 | `result = top->y` | `result = sim.get_y()` | Read output port |
 | `top->final()` | (destructor) | No explicit finalization needed |
@@ -50,13 +52,40 @@ sim.step();           // Combinational outputs updated; registers capture inputs
 auto y = sim.get_y(); // Read output
 ```
 
+For finer-grained parity wrappers, callers can separate the two phases:
+
+```cpp
+sim.set_a(3);
+sim.set_b(5);
+sim.set_clk(0);
+sim.settle();         // Observe combinational/current-state outputs only
+sim.commit_step();    // Commit one state update and refresh post-state outputs
+```
+
 ## step() Semantics
 
 Each call to `step()`:
-1. Increments the internal step counter
-2. If reset is active: reapplies the emitted reset state before continuing through the cycle
-3. Evaluates the current cycle's logic and applies sequential updates
-4. Updates public outputs from the post-step state
+1. Calls `settle()`
+2. Calls `commit_step()`
+
+## Fine-Grained Phase Semantics
+
+### `settle()`
+
+- Recomputes combinational logic from current inputs and current state
+- Refreshes outputs that should be visible before the next state commit
+- Does not itself advance the cycle counter
+
+### `commit_step()`
+
+- Increments the internal step counter
+- Applies reset/bootstrap-cycle handling
+- Commits one state-update phase and refreshes post-state outputs
+
+### `step()` compatibility
+
+- `step()` remains the compatibility entry point for existing callers
+- Contract: `step()` is equivalent to `settle(); commit_step();`
 
 For combinational DUTs, one `step()` after input changes is enough to observe the new outputs. For stateful DUTs, values visible through `get_*()` reflect the state after that `step()` completes; a reset-active step leaves outputs at the reset state instead of returning early.
 
