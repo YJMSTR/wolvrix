@@ -224,11 +224,7 @@ def main() -> int:
 
         run_dut("115", expect_tb_parity=True)
 
-        runner_162 = (run_dut("162", expect_no_tb_parity=True) / "dut_162_runner.cpp").read_text(encoding="utf-8")
-        expect(
-            "for (uint8_t idx = 0; idx < 128U; ++idx)" in runner_162 and "passed all prediction and training scenarios" in runner_162,
-            "dut_162 runner should preserve the original TB's full PHT sweep and prediction/training workload instead of the reduced fallback sequence",
-        )
+        run_dut("162", expect_tb_parity=True)
 
         run_dut("141", expect_tb_parity=True)
     except Exception as ex:
