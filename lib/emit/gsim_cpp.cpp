@@ -12,36 +12,25 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <unordered_map>
+#include <memory>
 
 namespace wolvrix::lib::emit
 {
 
     namespace
     {
-        // Comparator for ValueId to use in std::map
-        struct ValueIdCompare {
-            bool operator()(const wolvrix::lib::grh::ValueId& lhs, const wolvrix::lib::grh::ValueId& rhs) const {
-                if (lhs.index != rhs.index) return lhs.index < rhs.index;
-                if (lhs.generation != rhs.generation) return lhs.generation < rhs.generation;
-                if (lhs.graph.index != rhs.graph.index) return lhs.graph.index < rhs.graph.index;
-                return lhs.graph.generation < rhs.graph.generation;
-            }
-        };
-
         // Forward declaration
         std::string sanitizeIdentifier(std::string_view text);
 
         // Code generation state for lowering GRH operations to C++
         struct CodegenState
         {
-            // Value expressions: maps ValueId to C++ expression string
-            std::map<wolvrix::lib::grh::ValueId, std::string, ValueIdCompare> valueExprs;
+            // Value variables: maps ValueId to C++ variable name (materialized for sharding)
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> valueVars;
 
             // Storage declarations: register/memory state variables
             std::vector<std::string> storageDecls;
-
-            // Combinational evaluation statements (in topo order)
-            std::vector<std::string> combinationalStmts;
 
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
@@ -52,6 +41,46 @@ namespace wolvrix::lib::emit
 
             // Track unsupported operations for error reporting
             std::vector<std::string> unsupportedOps;
+
+            // Sharding support: output streams for different shards
+            std::vector<std::unique_ptr<std::ostringstream>> shardStreams;
+            int currentShard = 0;
+            int maxShardSize = 2097152; // 2MB per shard
+            int currentShardSize = 0;
+
+            // Helper to get next available shard stream
+            std::ostringstream* getCurrentShardStream() {
+                if (shardStreams.empty() || currentShard >= static_cast<int>(shardStreams.size())) {
+                    shardStreams.push_back(std::make_unique<std::ostringstream>());
+                    currentShard = static_cast<int>(shardStreams.size()) - 1;
+                    currentShardSize = 0;
+                }
+                return shardStreams[currentShard].get();
+            }
+
+            // Helper to create a new shard when current one gets too large
+            void ensureShardSpace(int estimatedSize) {
+                if (currentShardSize + estimatedSize > maxShardSize) {
+                    currentShard++;
+                    currentShardSize = 0;
+                    if (currentShard >= static_cast<int>(shardStreams.size())) {
+                        shardStreams.push_back(std::make_unique<std::ostringstream>());
+                    }
+                }
+            }
+
+            // Set result for a value ID - store as a variable name instead of full expression (for materialization)
+            void setResult(const wolvrix::lib::grh::ValueId& valueId, const std::string& expr) {
+                // Create a unique variable name for this result
+                std::string varName = "var_" + std::to_string(valueId.index) + "_" + std::to_string(valueId.generation);
+                valueVars[valueId] = varName;
+
+                // Add assignment statement to current shard stream
+                std::string assignment = varName + " = " + expr + ";";
+                ensureShardSpace(assignment.length());
+                *getCurrentShardStream() << assignment << "\n";
+                currentShardSize += assignment.length();
+            }
         };
 
         // Convert Verilog-style constant to C++ constant
@@ -138,22 +167,22 @@ namespace wolvrix::lib::emit
             const auto kind = op.kind();
             const auto opId = op.id();
 
-            // Helper to get operand expression
+            // Helper to get operand variable name (now returns var name from valueVars)
             auto getOperandExpr = [&](size_t idx) -> std::string {
                 if (idx >= op.operands().size()) {
                     return "0";
                 }
-                auto it = state.valueExprs.find(op.operands()[idx]);
-                if (it != state.valueExprs.end()) {
+                auto it = state.valueVars.find(op.operands()[idx]);
+                if (it != state.valueVars.end()) {
                     return it->second;
                 }
                 return "0";
             };
 
-            // Helper to set result expression
+            // Helper to set result: materialize expression as variable and write to current shard
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < op.results().size()) {
-                    state.valueExprs[op.results()[idx]] = expr;
+                    state.setResult(op.results()[idx], expr);
                 }
             };
 
@@ -356,9 +385,9 @@ namespace wolvrix::lib::emit
                 auto value = graph.getValue(port.value);
                 std::string type = getCppTypeForWidth(value.width());
                 state.inputPorts.push_back({port.name, type});
-                // Seed input port values into CodegenState
-                std::string portExpr = "input_" + sanitizeIdentifier(port.name) + "_";
-                state.valueExprs[port.value] = portExpr;
+                // Seed input port values into CodegenState as variable names
+                std::string portVar = "input_" + sanitizeIdentifier(port.name) + "_";
+                state.valueVars[port.value] = portVar;
             }
 
             for (const auto& port : graph.outputPorts()) {
@@ -398,7 +427,7 @@ namespace wolvrix::lib::emit
 
                     // Also create a mapping from the register's result ValueId to the register name
                     if (!op.results().empty()) {
-                        state.valueExprs[op.results()[0]] = regName;
+                        state.valueVars[op.results()[0]] = regName;
                     }
                 }
             }
@@ -1233,6 +1262,20 @@ namespace wolvrix::lib::emit
 
         writeHeader(*header, *target, *metadata, state);
         writeSource(*source, *target, *metadata, headerPath.filename().string());
+
+        // Write out all shard files
+        for (size_t i = 0; i < state.shardStreams.size(); ++i) {
+            std::string shardFileName = baseName + "_sched_" + std::to_string(i) + ".cpp";
+            std::filesystem::path shardPath = outputDir / shardFileName;
+
+            auto shardFile = openOutputFile(shardPath);
+            if (shardFile) {
+                *shardFile << "#include \"" << headerPath.filename().string() << "\"\n\n";
+                *shardFile << "// Shard " << i << " of combinational logic\n";
+                *shardFile << state.shardStreams[i]->str();
+                result.artifacts.push_back(shardPath.string());
+            }
+        }
 
         result.artifacts.push_back(headerPath.string());
         result.artifacts.push_back(sourcePath.string());
