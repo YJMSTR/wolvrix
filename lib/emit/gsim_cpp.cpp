@@ -48,8 +48,19 @@ namespace wolvrix::lib::emit
             int maxShardSize = 2097152; // 2MB per shard
             int currentShardSize = 0;
 
+            // Flag to determine if sharding should be enabled based on operation count
+            bool enableSharding = false;
+
             // Helper to get next available shard stream
             std::ostringstream* getCurrentShardStream() {
+                if (!enableSharding) {
+                    // For small designs, don't enable sharding
+                    if (shardStreams.empty()) {
+                        shardStreams.push_back(std::make_unique<std::ostringstream>());
+                    }
+                    return shardStreams[0].get();
+                }
+
                 if (shardStreams.empty() || currentShard >= static_cast<int>(shardStreams.size())) {
                     shardStreams.push_back(std::make_unique<std::ostringstream>());
                     currentShard = static_cast<int>(shardStreams.size()) - 1;
@@ -60,6 +71,10 @@ namespace wolvrix::lib::emit
 
             // Helper to create a new shard when current one gets too large
             void ensureShardSpace(int estimatedSize) {
+                if (!enableSharding) {
+                    return; // Don't shard for small designs
+                }
+
                 if (currentShardSize + estimatedSize > maxShardSize) {
                     currentShard++;
                     currentShardSize = 0;
@@ -79,7 +94,9 @@ namespace wolvrix::lib::emit
                 std::string assignment = varName + " = " + expr + ";";
                 ensureShardSpace(assignment.length());
                 *getCurrentShardStream() << assignment << "\n";
-                currentShardSize += assignment.length();
+                if (enableSharding) {
+                    currentShardSize += assignment.length();
+                }
             }
         };
 
@@ -1224,6 +1241,11 @@ namespace wolvrix::lib::emit
 
         // Generate code from GRH operations
         CodegenState state;
+
+        // Determine if sharding should be enabled based on operation count
+        // For large designs (>1000 operations), enable sharding to improve compile times
+        state.enableSharding = metadata->opCount > 1000;
+
         collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
         collectRegisters(*target->graph, state);
 
@@ -1263,20 +1285,23 @@ namespace wolvrix::lib::emit
         writeHeader(*header, *target, *metadata, state);
         writeSource(*source, *target, *metadata, headerPath.filename().string());
 
-        // Write out all shard files
-        for (size_t i = 0; i < state.shardStreams.size(); ++i) {
-            std::string shardFileName = baseName + "_sched_" + std::to_string(i) + ".cpp";
-            std::filesystem::path shardPath = outputDir / shardFileName;
+        // Write out all shard files if sharding is enabled and there are any
+        if (state.enableSharding && !state.shardStreams.empty()) {
+            for (size_t i = 0; i < state.shardStreams.size(); ++i) {
+                std::string shardFileName = baseName + "_sched_" + std::to_string(i) + ".cpp";
+                std::filesystem::path shardPath = outputDir / shardFileName;
 
-            auto shardFile = openOutputFile(shardPath);
-            if (shardFile) {
-                *shardFile << "#include \"" << headerPath.filename().string() << "\"\n\n";
-                *shardFile << "// Shard " << i << " of combinational logic\n";
-                *shardFile << state.shardStreams[i]->str();
-                result.artifacts.push_back(shardPath.string());
+                auto shardFile = openOutputFile(shardPath);
+                if (shardFile) {
+                    *shardFile << "#include \"" << headerPath.filename().string() << "\"\n\n";
+                    *shardFile << "// Shard " << i << " of combinational logic\n";
+                    *shardFile << state.shardStreams[i]->str();
+                    result.artifacts.push_back(shardPath.string());
+                }
             }
         }
 
+        // Add the main header and source files to artifacts
         result.artifacts.push_back(headerPath.string());
         result.artifacts.push_back(sourcePath.string());
         return result;
