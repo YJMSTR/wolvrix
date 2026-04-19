@@ -416,10 +416,10 @@ namespace wolvrix::lib::emit
                     if (!regName.empty()) {
                         if (mask != "0") {
                             state.sequentialStmts[domainKey].push_back(
-                                "        if (" + condition + ") { " + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
+                                "        if (" + condition + ") { " + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); committed_ = true; }");
                         } else {
                             state.sequentialStmts[domainKey].push_back(
-                                "        if (" + condition + ") { " + regName + " = " + nextValue + "; }");
+                                "        if (" + condition + ") { " + regName + " = " + nextValue + "; committed_ = true; }");
                         }
                     }
                     break;
@@ -984,10 +984,18 @@ namespace wolvrix::lib::emit
             }
             os << "    }\n\n";
 
-            // Step method
-            os << "    void step() {\n";
-            os << "        bool committed_ = false;\n";
+            os << "    void settle() {\n";
+            if (!state.outputPorts.empty()) {
+                for (const auto &[valueId, portInfo] : state.outputPortValues) {
+                    auto valueIt = state.valueVars.find(valueId);
+                    const std::string expr = valueIt != state.valueVars.end() ? valueIt->second : "0";
+                    os << "        output_" << sanitizeIdentifier(portInfo.first) << "_ = " << expr << ";\n";
+                }
+            }
+            os << "    }\n\n";
 
+            os << "    void commit_step() {\n";
+            os << "        bool committed_ = false;\n";
             if (!state.sequentialStmts.empty()) {
                 if (state.sequentialStmts.size() > 1) {
                     os << "        throw std::runtime_error(\"GSIM emitted runtime supports only one clock domain\");\n";
@@ -1010,11 +1018,7 @@ namespace wolvrix::lib::emit
                             os << "        if (reset_) {\n";
                             os << "            reset_ = false;\n";
                             if (!state.outputPorts.empty()) {
-                                for (const auto &[valueId, portInfo] : state.outputPortValues) {
-                                    auto valueIt = state.valueVars.find(valueId);
-                                    const std::string expr = valueIt != state.valueVars.end() ? valueIt->second : "0";
-                                    os << "            output_" << sanitizeIdentifier(portInfo.first) << "_ = " << expr << ";\n";
-                                }
+                                os << "            settle();\n";
                             }
                             os << "            " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
                             os << "            difftest_exit_ = 0;\n";
@@ -1024,23 +1028,28 @@ namespace wolvrix::lib::emit
                             for (const auto& stmt : domain.second) {
                                 os << stmt << "\n";
                             }
-                            os << "            committed_ = true;\n";
                             os << "        }\n";
                             os << "        " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
                         }
                     }
                 }
+            } else {
+                os << "        if (reset_) {\n";
+                os << "            reset_ = false;\n";
+                os << "            settle();\n";
+                os << "            difftest_exit_ = 0;\n";
+                os << "            return;\n";
+                os << "        }\n";
             }
 
-            if (!state.outputPorts.empty()) {
-                for (const auto &[valueId, portInfo] : state.outputPortValues) {
-                    auto valueIt = state.valueVars.find(valueId);
-                    const std::string expr = valueIt != state.valueVars.end() ? valueIt->second : "0";
-                    os << "        output_" << sanitizeIdentifier(portInfo.first) << "_ = " << expr << ";\n";
-                }
-            }
+            os << "        settle();\n";
             os << "        if (committed_) { ++difftest_step_; }\n";
             os << "        difftest_exit_ = 0;\n";
+            os << "    }\n\n";
+
+            os << "    void step() {\n";
+            os << "        settle();\n";
+            os << "        commit_step();\n";
             os << "    }\n\n";
 
             // Input port setters
@@ -1085,10 +1094,6 @@ namespace wolvrix::lib::emit
             // Register storage
             for (const auto& decl : state.storageDecls) {
                 os << "    " << decl << "\n";
-            }
-            // Debug: ensure at least one register exists for testing
-            if (state.storageDecls.empty()) {
-                os << "    std::uint8_t reg_state = 0;\n";
             }
 
             // Difftest state (for compatibility)

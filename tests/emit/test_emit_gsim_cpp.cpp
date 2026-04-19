@@ -227,6 +227,28 @@ Design buildConcatDesign()
     return design;
 }
 
+Design buildNoCommitStatefulOutputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("clk", clk);
+
+    const auto regStorage = makeRegister(graph, "state_storage", "state_reg", 8, "state");
+    (void)regStorage;
+    const auto stateRead = makeRegisterRead(graph, "state_read", "state_read_op", 8, "state");
+    graph.bindOutputPort("y", stateRead);
+
+    const auto zero = makeConstant(graph, "zero", "zero_const", 1, "1'b0");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "reg_write", zero, inA, mask, clk, "state");
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -435,6 +457,8 @@ void testHappyPathAfterRunningGsim()
     const std::string manifest = readFile(manifestPath);
     expect(contains(header, "class SSimTop"), "header should expose the downstream simulator-facing SSimTop class");
     expect(contains(header, "void set_reset(unsigned reset)"), "header should expose set_reset for downstream GSIM runtime");
+    expect(contains(header, "void settle()"), "header should expose settle for downstream GSIM runtime");
+    expect(contains(header, "void commit_step()"), "header should expose commit_step for downstream GSIM runtime");
     expect(contains(header, "void step()"), "header should expose step for downstream GSIM runtime");
     expect(contains(header, "get_difftest__DOT__uart__DOT__out__DOT__valid()"), "header should expose downstream UART out valid accessor");
     expect(contains(header, "get_difftest__DOT__uart__DOT__out__DOT__ch()"), "header should expose downstream UART out char accessor");
@@ -684,6 +708,8 @@ void testSingleClockRuntimeCompileAndRun()
     expect(result.success, "EmitGsimCpp runtime fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp runtime fixture should not emit errors");
     const std::string header = readFile(dir / "runtime_top.hpp");
+    expect(contains(header, "void settle()"), "runtime fixture should expose settle");
+    expect(contains(header, "void commit_step()"), "runtime fixture should expose commit_step");
     expect(!contains(header, "\n        ++difftest_step_;\n"), "runtime fixture should not increment difftest_step unconditionally");
     expect(contains(header, "if (committed_) { ++difftest_step_; }"), "runtime fixture should gate difftest_step increments on committed sequential work");
     expect(contains(header, "output_y_ = reg_state;"), "runtime fixture should drive emitted outputs from executable state expressions");
@@ -696,7 +722,8 @@ int main() {
     SSimTop sim;
     sim.set_a(9);
     sim.set_clk(0);
-    sim.step();
+    sim.settle();
+    sim.commit_step();
     if (sim.get_y() != 0) {
         return 1;
     }
@@ -705,7 +732,8 @@ int main() {
     }
     sim.set_reset(0);
     sim.set_clk(1);
-    sim.step();
+    sim.settle();
+    sim.commit_step();
     if (sim.get_y() != 9) {
         return 3;
     }
@@ -762,6 +790,55 @@ int main() {
     compileAndRunHarness(dir, "concat_top", runner);
 }
 
+void testEdgeWithoutCommitDoesNotAdvanceStep()
+{
+    Design design = buildNoCommitStatefulOutputDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "no_commit_runtime";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("no_commit_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp no-commit fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp no-commit fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "no_commit_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(9);
+    sim.set_clk(0);
+    sim.set_reset(0);
+    sim.settle();
+    sim.commit_step();
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.settle();
+    sim.commit_step();
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 2;
+    }
+    if (sim.get_y() != 0) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "no_commit_top", runner);
+}
+
 } // namespace
 
 int main()
@@ -778,6 +855,7 @@ int main()
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
         testConcatCompileAndRun();
+        testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)
     {
