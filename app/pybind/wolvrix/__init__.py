@@ -86,6 +86,7 @@ class Design:
         top: list[str] | None = None,
         target_path: str | None = None,
         dryrun: bool = False,
+        emit_attributes: dict[str, str] | None = None,
         port_order: str | None = None,
         port_order_names: list[str] | None = None,
     ) -> None:
@@ -95,6 +96,7 @@ class Design:
             )
         _native.write_gsim_cpp(
             self._capsule, output, top or [], target_path,
+            emit_attributes if emit_attributes is not None else {},
             port_order if port_order is not None else "",
             port_order_names if port_order_names is not None else []
         )
@@ -166,8 +168,15 @@ def write_gsim_cpp(
     top: list[str] | None = None,
     target_path: str | None = None,
     dryrun: bool = False,
+    emit_attributes: dict[str, str] | None = None,
 ) -> None:
-    design.write_gsim_cpp(output=output, top=top, target_path=target_path, dryrun=dryrun)
+    design.write_gsim_cpp(
+        output=output,
+        top=top,
+        target_path=target_path,
+        dryrun=dryrun,
+        emit_attributes=emit_attributes,
+    )
 
 
 def _level_rank(level: str) -> int | None:

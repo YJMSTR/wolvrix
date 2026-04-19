@@ -24,6 +24,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <map>
 #include <unistd.h>
 #include <optional>
 #include <string>
@@ -147,6 +148,41 @@ namespace
             out.emplace_back(text);
         }
         Py_DECREF(seq);
+        return true;
+    }
+
+    bool parseStringMap(PyObject *obj,
+                        std::map<std::string, std::string, std::less<>> &out,
+                        std::string &error)
+    {
+        if (obj == Py_None)
+        {
+            return true;
+        }
+        if (!PyDict_Check(obj))
+        {
+            error = "expected a dict of string:string";
+            return false;
+        }
+        PyObject *key = nullptr;
+        PyObject *value = nullptr;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(obj, &pos, &key, &value) != 0)
+        {
+            if (!PyUnicode_Check(key) || !PyUnicode_Check(value))
+            {
+                error = "emit_attributes must map strings to strings";
+                return false;
+            }
+            const char *keyText = PyUnicode_AsUTF8(key);
+            const char *valueText = PyUnicode_AsUTF8(value);
+            if (!keyText || !valueText)
+            {
+                error = "emit_attributes contains invalid unicode text";
+                return false;
+            }
+            out.emplace(keyText, valueText);
+        }
         return true;
     }
 
@@ -1278,11 +1314,12 @@ namespace
         const char *output = nullptr;
         PyObject *top_list_obj = Py_None;
         PyObject *target_path_obj = Py_None;
-        const char *port_order_str = nullptr;
+        PyObject *emit_attributes_obj = Py_None;
+        PyObject *port_order_obj = Py_None;
         PyObject *port_order_names_obj = Py_None;
-        static const char *kwlist[] = {"design", "output", "top", "target_path", "port_order", "port_order_names", nullptr};
-        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OOsO", const_cast<char **>(kwlist),
-                                         &design_obj, &output, &top_list_obj, &target_path_obj, &port_order_str, &port_order_names_obj))
+        static const char *kwlist[] = {"design", "output", "top", "target_path", "emit_attributes", "port_order", "port_order_names", nullptr};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "Os|OOOOO", const_cast<char **>(kwlist),
+                                         &design_obj, &output, &top_list_obj, &target_path_obj, &emit_attributes_obj, &port_order_obj, &port_order_names_obj))
         {
             return nullptr;
         }
@@ -1351,7 +1388,36 @@ namespace
             options.attributes["path"] = target_path;
         }
 
+        std::map<std::string, std::string, std::less<>> emit_attributes;
+        if (!parseStringMap(emit_attributes_obj, emit_attributes, error))
+        {
+            PyErr_SetString(PyExc_ValueError, error.c_str());
+            return nullptr;
+        }
+        for (auto &[key, value] : emit_attributes)
+        {
+            options.attributes[std::move(key)] = std::move(value);
+        }
+        if (target_path)
+        {
+            options.attributes["path"] = target_path;
+        }
+
         // Parse port_order (empty string means use default)
+        const char *port_order_str = nullptr;
+        if (port_order_obj != Py_None)
+        {
+            if (!PyUnicode_Check(port_order_obj))
+            {
+                PyErr_SetString(PyExc_ValueError, "port_order must be a string or None");
+                return nullptr;
+            }
+            port_order_str = PyUnicode_AsUTF8(port_order_obj);
+            if (!port_order_str)
+            {
+                return nullptr;
+            }
+        }
         if (port_order_str && port_order_str[0] != '\0')
         {
             std::string strategy(port_order_str);
@@ -1673,7 +1739,7 @@ static PyMethodDef WolvrixMethods[] = {
      METH_VARARGS | METH_KEYWORDS,
      "write_verilator_repcut_package(design, output, top=None)"},
     {"write_gsim_cpp", reinterpret_cast<PyCFunction>(py_write_gsim_cpp), METH_VARARGS | METH_KEYWORDS,
-     "write_gsim_cpp(design, output, top=None, target_path=None)"},
+     "write_gsim_cpp(design, output, top=None, target_path=None, emit_attributes=None, port_order=None, port_order_names=None)"},
     {"run_pass", reinterpret_cast<PyCFunction>(py_run_pass), METH_VARARGS | METH_KEYWORDS,
      "run_pass(design, name, args=None, dryrun=False, diagnostics='warn', log_level='warn') -> (changed, ok, diagnostics)"},
     {"run_pipeline", reinterpret_cast<PyCFunction>(py_run_pipeline), METH_VARARGS | METH_KEYWORDS,

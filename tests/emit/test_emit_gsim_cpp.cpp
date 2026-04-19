@@ -318,15 +318,18 @@ void testHappyPathAfterRunningGsim()
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp happy path should succeed");
     expect(!diags.hasError(), "EmitGsimCpp happy path should not emit errors");
-    expect(result.artifacts.size() == 2, "EmitGsimCpp should report header and source artifacts");
+    expect(result.artifacts.size() == 3, "EmitGsimCpp should report header, source, and manifest artifacts");
 
     const std::filesystem::path headerPath = dir / "top_metadata.hpp";
     const std::filesystem::path sourcePath = dir / "top_metadata.cpp";
+    const std::filesystem::path manifestPath = dir / "top_metadata.manifest";
     expect(std::filesystem::exists(headerPath), "EmitGsimCpp should create header artifact");
     expect(std::filesystem::exists(sourcePath), "EmitGsimCpp should create source artifact");
+    expect(std::filesystem::exists(manifestPath), "EmitGsimCpp should create manifest artifact");
 
     const std::string header = readFile(headerPath);
     const std::string source = readFile(sourcePath);
+    const std::string manifest = readFile(manifestPath);
     expect(contains(header, "class SSimTop"), "header should expose the downstream simulator-facing SSimTop class");
     expect(contains(header, "void set_reset(unsigned reset)"), "header should expose set_reset for downstream GSIM runtime");
     expect(contains(header, "void step()"), "header should expose step for downstream GSIM runtime");
@@ -349,6 +352,7 @@ void testHappyPathAfterRunningGsim()
     expect(contains(source, "metadata.schedule_activity_order = {"), "source should serialize schedule activity ordering");
     expect(contains(source, "metadata.hypergraph_edge_sinks = {"), "source should serialize hypergraph sink metadata");
     expect(contains(source, "bool validate_top_metadata"), "source should emit validation helper");
+    expect(contains(manifest, "top_metadata.cpp"), "manifest should list the canonical main source");
 }
 
 void testFailureWithoutPriorMetadata()

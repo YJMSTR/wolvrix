@@ -1238,6 +1238,7 @@ namespace wolvrix::lib::emit
                                          : defaultBaseName(*target);
         const std::filesystem::path headerPath = outputDir / (baseName + ".hpp");
         const std::filesystem::path sourcePath = outputDir / (baseName + ".cpp");
+        const std::filesystem::path manifestPath = outputDir / (baseName + ".manifest");
 
         // Generate code from GRH operations
         CodegenState state;
@@ -1285,6 +1286,9 @@ namespace wolvrix::lib::emit
         writeHeader(*header, *target, *metadata, state);
         writeSource(*source, *target, *metadata, headerPath.filename().string());
 
+        std::vector<std::string> manifestEntries;
+        manifestEntries.push_back(sourcePath.filename().string());
+
         // Write out all shard files if sharding is enabled and there are any
         if (state.enableSharding && !state.shardStreams.empty()) {
             for (size_t i = 0; i < state.shardStreams.size(); ++i) {
@@ -1297,13 +1301,26 @@ namespace wolvrix::lib::emit
                     *shardFile << "// Shard " << i << " of combinational logic\n";
                     *shardFile << state.shardStreams[i]->str();
                     result.artifacts.push_back(shardPath.string());
+                    manifestEntries.push_back(shardFileName);
                 }
             }
+        }
+
+        auto manifest = openOutputFile(manifestPath);
+        if (!manifest)
+        {
+            result.success = false;
+            return result;
+        }
+        for (const auto &entry : manifestEntries)
+        {
+            *manifest << entry << '\n';
         }
 
         // Add the main header and source files to artifacts
         result.artifacts.push_back(headerPath.string());
         result.artifacts.push_back(sourcePath.string());
+        result.artifacts.push_back(manifestPath.string());
         return result;
     }
 

@@ -68,6 +68,7 @@ def main() -> int:
         env["PYTHONNOUSERSITE"] = "1"
         env["WOLVRIX_PYTHON_BUILD_DIR"] = str(REPO_ROOT / "wolvrix" / "build" / "python")
         env["PYTHONPATH"] = str(REPO_ROOT / "wolvrix" / "build" / "python")
+        env["WOLVRIX_XS_GSIM_EMIT_METADATA"] = "1"
         result = subprocess.run(
             [
                 sys.executable,
@@ -89,17 +90,22 @@ def main() -> int:
 
         header = out_base.with_suffix(".hpp")
         source = out_base.with_suffix(".cpp")
+        manifest = out_base.with_suffix(".manifest")
         expect(header.exists(), f"missing header artifact: {header}")
         expect(source.exists(), f"missing source artifact: {source}")
+        expect(manifest.exists(), f"missing manifest artifact: {manifest}")
 
         header_text = header.read_text(encoding="utf-8")
         source_text = source.read_text(encoding="utf-8")
+        manifest_text = manifest.read_text(encoding="utf-8")
         expect('class SSimTop' in header_text, 'missing downstream simulator-facing SSimTop API')
         expect('void set_reset(unsigned reset)' in header_text, 'missing set_reset API')
         expect('void step()' in header_text, 'missing step API')
         expect('get_difftest__DOT__exit()' in header_text, 'missing difftest exit accessor')
         expect('metadata.graph_symbol = "SimTop";' in source_text, "missing graph symbol metadata")
         expect('metadata.scratchpad_namespace = "gsim.SimTop";' in source_text, "missing scratchpad namespace metadata")
+        expect("xs_fixture_gsim.cpp" in manifest_text, "manifest should list canonical source")
+        expect("emit attrs" in result.stderr, "script should report emit attribute passthrough in logs")
     except Exception as ex:
         return fail(str(ex))
     return 0

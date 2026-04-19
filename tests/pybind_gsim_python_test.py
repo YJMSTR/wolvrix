@@ -149,11 +149,24 @@ def test_same_design_pipeline_flow() -> None:
 
     header = base.with_suffix(".hpp")
     source = base.with_suffix(".cpp")
+    manifest = base.with_suffix(".manifest")
     expect(header.exists(), "write_gsim_cpp should create header artifact")
     expect(source.exists(), "write_gsim_cpp should create source artifact")
+    expect(manifest.exists(), "write_gsim_cpp should create manifest artifact")
     source_text = source.read_text(encoding="utf-8")
+    manifest_text = manifest.read_text(encoding="utf-8")
     expect('metadata.graph_symbol = "top";' in source_text, "source should embed graph metadata")
     expect('metadata.scratchpad_namespace = "gsim.top";' in source_text, "source should preserve scratchpad namespace")
+    expect("same_design_metadata.cpp" in manifest_text, "manifest should list the canonical source")
+
+    attr_base = out_dir / "same_design_attr"
+    wolvrix.write_gsim_cpp(
+        design,
+        str(attr_base),
+        top=["top"],
+        emit_attributes={"path": "top"},
+    )
+    expect(attr_base.with_suffix(".manifest").exists(), "emit_attributes path should still produce manifest output")
 
     expect_runtime_error_contains(
         lambda: design.write_gsim_cpp(str(out_dir / "bad_path"), top=["top"], target_path="top..bad"),
