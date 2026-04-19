@@ -246,6 +246,29 @@ Design buildMaskedNotDesign()
     return design;
 }
 
+Design buildSliceDynamicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 8, false);
+    const auto index = makeValue(graph, "index", 3, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("index", index);
+
+    const auto out = makeValue(graph, "out", 3, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("dyn_slice"));
+    graph.addOperand(slice, in);
+    graph.addOperand(slice, index);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(3));
+
+    return design;
+}
+
 Design buildNoCommitStatefulOutputDesign()
 {
     Design design;
@@ -851,6 +874,59 @@ int main() {
     compileAndRunHarness(dir, "masked_not_top", runner);
 }
 
+void testDynamicSliceCompileAndRun()
+{
+    Design design = buildSliceDynamicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "slice_dynamic_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("slice_dynamic_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp slice-dynamic fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp slice-dynamic fixture should not emit errors");
+
+    const std::string header = readFile(dir / "slice_dynamic_top.hpp");
+    expect(contains(header, "output_out_ ="), "slice-dynamic fixture should lower the output assignment");
+    expect(contains(header, ">= 8") && contains(header, "? 0ULL"),
+           "slice-dynamic lowering should zero-fill out-of-range shifts instead of clamping the index");
+
+    const std::string runner = R"CPP(
+#include "slice_dynamic_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(0b10110110);
+    sim.set_index(0);
+    sim.step();
+    if (sim.get_out() != 0b110) {
+        return 1;
+    }
+    sim.set_index(2);
+    sim.step();
+    if (sim.get_out() != 0b101) {
+        return 2;
+    }
+    sim.set_index(7);
+    sim.step();
+    if (sim.get_out() != 0b001) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "slice_dynamic_top", runner);
+}
+
 void testEdgeWithoutCommitDoesNotAdvanceStep()
 {
     Design design = buildNoCommitStatefulOutputDesign();
@@ -917,6 +993,7 @@ int main()
         testSingleClockRuntimeCompileAndRun();
         testConcatCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();
+        testDynamicSliceCompileAndRun();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)

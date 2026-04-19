@@ -351,6 +351,43 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kSliceDynamic: {
+                    if (op.operands().size() < 2 || op.results().empty()) {
+                        break;
+                    }
+
+                    auto sliceWidthAttr = op.attr("sliceWidth");
+                    auto *sliceWidth = sliceWidthAttr ? std::get_if<int64_t>(&*sliceWidthAttr) : nullptr;
+                    if (sliceWidth == nullptr || *sliceWidth <= 0 || *sliceWidth > 64) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kSliceDynamic-width (" + opName + ")");
+                        break;
+                    }
+
+                    const auto baseValue = graph.getValue(op.operands()[0]);
+                    const auto operandWidth = baseValue.width();
+                    if (operandWidth <= 0 || operandWidth > 64 || *sliceWidth > operandWidth) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kSliceDynamic-wide (" + opName + ")");
+                        break;
+                    }
+
+                    if (operandWidth == 1) {
+                        setResultExpr(0, maskExprForWidth(getOperandExpr(0), static_cast<int32_t>(*sliceWidth)));
+                        break;
+                    }
+
+                    const std::string rawIndexExpr = getOperandExpr(1);
+                    const std::string indexExpr =
+                        "static_cast<std::uint64_t>(" + rawIndexExpr + ")";
+                    const std::string slicedExpr =
+                        "((" + indexExpr + " >= " + std::to_string(operandWidth) + ") ? 0ULL : ((" +
+                        getOperandExpr(0) + " >> " + indexExpr + ") & " +
+                        generateMask(static_cast<int32_t>(*sliceWidth)) + "))";
+                    setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(*sliceWidth)));
+                    break;
+                }
+
                 case OperationKind::kRegister: {
                     // Register defines storage - handled in port collection
                     break;
