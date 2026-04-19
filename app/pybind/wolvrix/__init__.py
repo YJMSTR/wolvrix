@@ -169,6 +169,8 @@ def write_gsim_cpp(
     target_path: str | None = None,
     dryrun: bool = False,
     emit_attributes: dict[str, str] | None = None,
+    port_order: str | None = None,
+    port_order_names: list[str] | None = None,
 ) -> None:
     design.write_gsim_cpp(
         output=output,
@@ -176,6 +178,8 @@ def write_gsim_cpp(
         target_path=target_path,
         dryrun=dryrun,
         emit_attributes=emit_attributes,
+        port_order=port_order,
+        port_order_names=port_order_names,
     )
 
 

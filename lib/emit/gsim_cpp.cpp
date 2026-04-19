@@ -28,12 +28,17 @@ namespace wolvrix::lib::emit
         {
             // Value variables: maps ValueId to C++ variable name (materialized for sharding)
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> valueVars;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::pair<std::string, std::string>, wolvrix::lib::grh::ValueIdHash> outputPortValues;
 
             // Storage declarations: register/memory state variables
             std::vector<std::string> storageDecls;
+            std::vector<std::string> storageResetStmts;
 
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
+
+            // Non-sharded combinational statements for small designs
+            std::vector<std::string> combinationalStmts;
 
             // Port declarations and accessors
             std::vector<std::pair<std::string, std::string>> inputPorts;  // (name, type)
@@ -84,19 +89,36 @@ namespace wolvrix::lib::emit
                 }
             }
 
-            // Set result for a value ID - store as a variable name instead of full expression (for materialization)
-            void setResult(const wolvrix::lib::grh::ValueId& valueId, const std::string& expr) {
+            // Set result for a value ID
+            void setResult(const wolvrix::lib::grh::ValueId& valueId, const std::string& expr, const std::string& cppType) {
+                if (!enableSharding)
+                {
+                    valueVars[valueId] = expr;
+                    return;
+                }
+
                 // Create a unique variable name for this result
                 std::string varName = "var_" + std::to_string(valueId.index) + "_" + std::to_string(valueId.generation);
                 valueVars[valueId] = varName;
 
-                // Add assignment statement to current shard stream
-                std::string assignment = varName + " = " + expr + ";";
-                ensureShardSpace(assignment.length());
-                *getCurrentShardStream() << assignment << "\n";
-                if (enableSharding) {
-                    currentShardSize += assignment.length();
+                bool alreadyDeclared = false;
+                for (const auto &decl : storageDecls)
+                {
+                    if (decl.find(" " + varName + " = 0;") != std::string::npos)
+                    {
+                        alreadyDeclared = true;
+                        break;
+                    }
                 }
+                if (!alreadyDeclared)
+                {
+                    storageDecls.push_back(cppType + " " + varName + " = 0;");
+                }
+
+                std::string assignment = varName + " = " + expr + ";";
+                ensureShardSpace(static_cast<int>(assignment.length()));
+                *getCurrentShardStream() << assignment << "\n";
+                currentShardSize += static_cast<int>(assignment.length());
             }
         };
 
@@ -199,7 +221,8 @@ namespace wolvrix::lib::emit
             // Helper to set result: materialize expression as variable and write to current shard
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < op.results().size()) {
-                    state.setResult(op.results()[idx], expr);
+                    const auto resultValue = graph.getValue(op.results()[idx]);
+                    state.setResult(op.results()[idx], expr, getCppTypeForWidth(resultValue.width()));
                 }
             };
 
@@ -281,14 +304,56 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kConcat: {
+                    if (op.operands().empty()) {
+                        break;
+                    }
+                    if (op.operands().size() == 1) {
+                        setResultExpr(0, getOperandExpr(0));
+                        break;
+                    }
+                    std::int64_t totalWidth = 0;
+                    bool widthKnown = true;
+                    for (const auto operand : op.operands()) {
+                        const auto value = graph.getValue(operand);
+                        if (value.width() <= 0 || value.width() > 64) {
+                            widthKnown = false;
+                            break;
+                        }
+                        totalWidth += value.width();
+                    }
+                    if (!widthKnown || totalWidth > 64) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kConcat-wide (" + opName + ")");
+                        break;
+                    }
+
+                    std::string expr = getOperandExpr(0);
+                    for (std::size_t i = 1; i < op.operands().size(); ++i) {
+                        const auto value = graph.getValue(op.operands()[i]);
+                        expr = "((" + expr + " << " + std::to_string(value.width()) + ") | (" +
+                               getOperandExpr(i) + " & " + generateMask(value.width()) + "))";
+                    }
+                    setResultExpr(0, expr);
+                    break;
+                }
+
                 case OperationKind::kRegister: {
                     // Register defines storage - handled in port collection
                     break;
                 }
 
                 case OperationKind::kRegisterReadPort: {
-                    // Use operation symbol directly to find register name
-                    std::string sym = std::string(op.symbolText());
+                    auto regSymAttr = op.attr("regSymbol");
+                    std::string sym;
+                    if (regSymAttr) {
+                        if (auto *attrSym = std::get_if<std::string>(&*regSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
                         setResultExpr(0, regName);
@@ -327,12 +392,33 @@ namespace wolvrix::lib::emit
                         }
                     }
 
+                    std::string domainKey = "posedge:clock";
+                    auto clockSymAttr = op.attr("clockSymbol");
+                    std::string clockSymbol = "clock";
+                    if (clockSymAttr) {
+                        if (auto *sym = std::get_if<std::string>(&*clockSymAttr)) {
+                            if (!sym->empty()) {
+                                clockSymbol = *sym;
+                            }
+                        }
+                    }
+                    auto eventEdgeAttr = op.attr("eventEdge");
+                    std::string eventEdge = "posedge";
+                    if (eventEdgeAttr) {
+                        if (auto *edges = std::get_if<std::vector<std::string>>(&*eventEdgeAttr)) {
+                            if (!edges->empty() && !(*edges)[0].empty()) {
+                                eventEdge = (*edges)[0];
+                            }
+                        }
+                    }
+                    domainKey = eventEdge + ":" + clockSymbol;
+
                     if (!regName.empty()) {
                         if (mask != "0") {
-                            state.sequentialStmts["posedge_clock"].push_back(
+                            state.sequentialStmts[domainKey].push_back(
                                 "        if (" + condition + ") { " + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
                         } else {
-                            state.sequentialStmts["posedge_clock"].push_back(
+                            state.sequentialStmts[domainKey].push_back(
                                 "        if (" + condition + ") { " + regName + " = " + nextValue + "; }");
                         }
                     }
@@ -411,6 +497,7 @@ namespace wolvrix::lib::emit
                 auto value = graph.getValue(port.value);
                 std::string type = getCppTypeForWidth(value.width());
                 state.outputPorts.push_back({port.name, type});
+                state.outputPortValues.emplace(port.value, std::make_pair(port.name, type));
             }
 
             // Apply port ordering
@@ -426,8 +513,16 @@ namespace wolvrix::lib::emit
             for (const auto& opId : graph.operations()) {
                 auto op = graph.getOperation(opId);
                 if (op.kind() == wolvrix::lib::grh::OperationKind::kRegister) {
-                    // Use operation symbol directly, not "symbol" attribute
-                    std::string sym = std::string(op.symbolText());
+                    std::string sym;
+                    auto regSymAttr = op.attr("regSymbol");
+                    if (regSymAttr) {
+                        if (auto* attrSym = std::get_if<std::string>(&*regSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
                     if (sym.empty()) {
                         sym = "unnamed_reg_" + std::to_string(opId.index);
                     }
@@ -441,6 +536,7 @@ namespace wolvrix::lib::emit
                     }
                     std::string type = getCppTypeForWidth(width);
                     state.storageDecls.push_back(type + " " + regName + " = 0;");
+                    state.storageResetStmts.push_back(regName + " = 0;");
 
                     // Also create a mapping from the register's result ValueId to the register name
                     if (!op.results().empty()) {
@@ -837,6 +933,16 @@ namespace wolvrix::lib::emit
             return "gsim_" + sanitizeIdentifier(target.scratchGraphSymbol);
         }
 
+        std::optional<std::pair<std::string, std::string>> parseSequentialDomain(std::string_view key)
+        {
+            const std::size_t pos = key.find(':');
+            if (pos == std::string_view::npos || pos == 0 || pos + 1 >= key.size())
+            {
+                return std::nullopt;
+            }
+            return std::make_pair(std::string(key.substr(0, pos)), std::string(key.substr(pos + 1)));
+        }
+
         void writeHeader(std::ostream &os,
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
@@ -863,38 +969,77 @@ namespace wolvrix::lib::emit
             os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
             os << "    void reset() {\n";
             os << "        reset_ = true;\n";
-            for (const auto& decl : state.storageDecls) {
-                os << "        " << decl << "\n";
+            for (const auto& stmt : state.storageResetStmts) {
+                os << "        " << stmt << "\n";
+            }
+            for (const auto& [name, type] : state.outputPorts) {
+                (void)type;
+                os << "        output_" << sanitizeIdentifier(name) << "_ = 0;\n";
+            }
+            for (const auto &domain : state.sequentialStmts) {
+                const auto parsedDomain = parseSequentialDomain(domain.first);
+                if (parsedDomain) {
+                    os << "        prev_" << sanitizeIdentifier(parsedDomain->second) << "_ = false;\n";
+                }
             }
             os << "    }\n\n";
 
             // Step method
             os << "    void step() {\n";
-            os << "        ++difftest_step_;\n";
-
-            // Combinational logic: assign output ports from lowered values
-            if (!state.outputPorts.empty()) {
-                for (const auto& [name, type] : state.outputPorts) {
-                    (void)type;
-                    // Find the value expression for this output port
-                    // This is simplified - real implementation needs proper value tracking
-                    os << "        // output_" << sanitizeIdentifier(name) << "_ = ...;\n";
-                }
-            }
+            os << "        bool committed_ = false;\n";
 
             if (!state.sequentialStmts.empty()) {
-                os << "        if (reset_) {\n";
-                os << "            reset_ = false;\n";
-                os << "            difftest_exit_ = 0;\n";
-                os << "            return;\n";
-                os << "        }\n";
-                for (const auto& [domain, stmts] : state.sequentialStmts) {
-                    (void)domain;
-                    for (const auto& stmt : stmts) {
-                        os << stmt << "\n";
+                if (state.sequentialStmts.size() > 1) {
+                    os << "        throw std::runtime_error(\"GSIM emitted runtime supports only one clock domain\");\n";
+                } else {
+                    const auto &domain = *state.sequentialStmts.begin();
+                    const auto parsedDomain = parseSequentialDomain(domain.first);
+                    if (!parsedDomain) {
+                        os << "        throw std::runtime_error(\"GSIM emitted runtime encountered malformed clock domain metadata\");\n";
+                    } else {
+                        const std::string edge = parsedDomain->first;
+                        const std::string clock = sanitizeIdentifier(parsedDomain->second);
+                        if (edge != "posedge" && edge != "negedge") {
+                            os << "        throw std::runtime_error(\"GSIM emitted runtime supports only posedge/negedge event edges\");\n";
+                        } else {
+                            const std::string currClock = "input_" + clock + "_";
+                            const std::string prevClock = "prev_" + clock + "_";
+                            const std::string edgeExpr = edge == "posedge"
+                                                             ? "(!" + prevClock + " && " + currClock + ")"
+                                                             : "(" + prevClock + " && !" + currClock + ")";
+                            os << "        if (reset_) {\n";
+                            os << "            reset_ = false;\n";
+                            if (!state.outputPorts.empty()) {
+                                for (const auto &[valueId, portInfo] : state.outputPortValues) {
+                                    auto valueIt = state.valueVars.find(valueId);
+                                    const std::string expr = valueIt != state.valueVars.end() ? valueIt->second : "0";
+                                    os << "            output_" << sanitizeIdentifier(portInfo.first) << "_ = " << expr << ";\n";
+                                }
+                            }
+                            os << "            " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
+                            os << "            difftest_exit_ = 0;\n";
+                            os << "            return;\n";
+                            os << "        }\n";
+                            os << "        if (" << edgeExpr << ") {\n";
+                            for (const auto& stmt : domain.second) {
+                                os << stmt << "\n";
+                            }
+                            os << "            committed_ = true;\n";
+                            os << "        }\n";
+                            os << "        " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
+                        }
                     }
                 }
             }
+
+            if (!state.outputPorts.empty()) {
+                for (const auto &[valueId, portInfo] : state.outputPortValues) {
+                    auto valueIt = state.valueVars.find(valueId);
+                    const std::string expr = valueIt != state.valueVars.end() ? valueIt->second : "0";
+                    os << "        output_" << sanitizeIdentifier(portInfo.first) << "_ = " << expr << ";\n";
+                }
+            }
+            os << "        if (committed_) { ++difftest_step_; }\n";
             os << "        difftest_exit_ = 0;\n";
             os << "    }\n\n";
 
@@ -953,6 +1098,12 @@ namespace wolvrix::lib::emit
             os << "    unsigned perf_dump_ = 0;\n";
             os << "    std::uint64_t log_begin_ = 0;\n";
             os << "    std::uint64_t log_end_ = 0;\n";
+            for (const auto &domain : state.sequentialStmts) {
+                const auto parsedDomain = parseSequentialDomain(domain.first);
+                if (parsedDomain) {
+                    os << "    bool prev_" << sanitizeIdentifier(parsedDomain->second) << "_ = false;\n";
+                }
+            }
 
             os << "};\n\n";
 

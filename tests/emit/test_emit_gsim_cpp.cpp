@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <cstdlib>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -70,6 +71,35 @@ ValueId makeConstant(Graph &graph,
     graph.setAttr(op, "value", literal);
     graph.setAttr(op, "width", static_cast<int64_t>(width));
     graph.setAttr(op, "isSigned", false);
+    return value;
+}
+
+ValueId makeRegister(Graph &graph,
+                     const std::string &valueName,
+                     const std::string &opName,
+                     int32_t width,
+                     const std::string &regSymbol)
+{
+    const auto value = graph.createValue(graph.internSymbol(valueName), width, false);
+    const auto op = graph.createOperation(OperationKind::kRegister, graph.internSymbol(opName));
+    graph.addResult(op, value);
+    graph.setAttr(op, "regSymbol", regSymbol);
+    graph.setAttr(op, "width", static_cast<int64_t>(width));
+    graph.setAttr(op, "isSigned", false);
+    graph.setAttr(op, "initValue", std::string("8'd0"));
+    return value;
+}
+
+ValueId makeRegisterRead(Graph &graph,
+                         const std::string &valueName,
+                         const std::string &opName,
+                         int32_t width,
+                         const std::string &regSymbol)
+{
+    const auto value = graph.createValue(graph.internSymbol(valueName), width, false);
+    const auto op = graph.createOperation(OperationKind::kRegisterReadPort, graph.internSymbol(opName));
+    graph.addResult(op, value);
+    graph.setAttr(op, "regSymbol", regSymbol);
     return value;
 }
 
@@ -150,6 +180,50 @@ Design buildSingleGraphDesign()
     graph.addOperand(dbg, addOut);
 
     (void)write;
+    return design;
+}
+
+Design buildStatefulOutputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("clk", clk);
+
+    const auto regStorage = makeRegister(graph, "state_storage", "state_reg", 8, "state");
+    (void)regStorage;
+    const auto stateRead = makeRegisterRead(graph, "state_read", "state_read_op", 8, "state");
+    graph.bindOutputPort("y", stateRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "reg_write", one, inA, mask, clk, "state");
+    return design;
+}
+
+Design buildConcatDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 4, false);
+    const auto inB = makeValue(graph, "b", 4, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("concat_y"));
+    graph.addOperand(concat, inA);
+    graph.addOperand(concat, inB);
+    graph.addResult(concat, outY);
+
     return design;
 }
 
@@ -300,6 +374,35 @@ void cleanDir(const std::filesystem::path &path)
     std::filesystem::remove_all(path, ec);
 }
 
+void compileAndRunHarness(const std::filesystem::path &dir,
+                          const std::string &baseName,
+                          const std::string &sourceText)
+{
+    const std::filesystem::path runnerPath = dir / (baseName + "_runner.cpp");
+    const std::filesystem::path binaryPath = dir / (baseName + "_runner");
+    {
+        std::ofstream out(runnerPath);
+        if (!out.is_open())
+        {
+            throw std::runtime_error("failed to write runtime harness source");
+        }
+        out << sourceText;
+    }
+
+    const char *compiler = std::getenv("CXX");
+    const std::string cxx = (compiler && *compiler) ? compiler : "c++";
+    const std::string compileCmd =
+        cxx + " -std=c++20 -I " + dir.string() + " " + runnerPath.string() + " -o " + binaryPath.string();
+    if (std::system(compileCmd.c_str()) != 0)
+    {
+        throw std::runtime_error("failed to compile emitted runtime harness");
+    }
+    if (std::system(binaryPath.string().c_str()) != 0)
+    {
+        throw std::runtime_error("emitted runtime harness execution failed");
+    }
+}
+
 void testHappyPathAfterRunningGsim()
 {
     Design design = buildSingleGraphDesign();
@@ -340,6 +443,8 @@ void testHappyPathAfterRunningGsim()
     expect(contains(header, "get_difftest__DOT__exit()"), "header should expose difftest exit accessor");
     expect(contains(header, "get_difftest__DOT__step()"), "header should expose difftest step accessor");
     expect(!contains(header, "difftest_exit_ = 1;"), "generated downstream step should not force difftest exit on every non-reset step");
+    expect(!contains(header, "// output_y_ = ...;"), "small emitted models should not leave output placeholders in the runtime");
+    expect(contains(header, "output_y_ = (input_a_ + input_b_);"), "small emitted models should lower output behavior into executable assignments");
     expect(contains(header, "set_difftest__DOT__perfCtrl__DOT__clean"), "header should expose perf clean mutator");
     expect(contains(header, "set_difftest__DOT__perfCtrl__DOT__dump"), "header should expose perf dump mutator");
     expect(contains(header, "set_difftest__DOT__logCtrl__DOT__begin"), "header should expose log begin mutator");
@@ -560,6 +665,103 @@ void testCrossRootInstancePathsStayDistinct()
     }
 }
 
+void testSingleClockRuntimeCompileAndRun()
+{
+    Design design = buildStatefulOutputDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "runtime_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("runtime_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp runtime fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp runtime fixture should not emit errors");
+    const std::string header = readFile(dir / "runtime_top.hpp");
+    expect(!contains(header, "\n        ++difftest_step_;\n"), "runtime fixture should not increment difftest_step unconditionally");
+    expect(contains(header, "if (committed_) { ++difftest_step_; }"), "runtime fixture should gate difftest_step increments on committed sequential work");
+    expect(contains(header, "output_y_ = reg_state;"), "runtime fixture should drive emitted outputs from executable state expressions");
+
+    const std::string runner = R"CPP(
+#include "runtime_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(9);
+    sim.set_clk(0);
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 2;
+    }
+    sim.set_reset(0);
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_y() != 9) {
+        return 3;
+    }
+    if (sim.get_difftest__DOT__step() != 1) {
+        return 4;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_difftest__DOT__step() != 1) {
+        return 5;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "runtime_top", runner);
+}
+
+void testConcatCompileAndRun()
+{
+    Design design = buildConcatDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "concat_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("concat_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp concat fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp concat fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "concat_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0xA);
+    sim.set_b(0x3);
+    sim.step();
+    if (sim.get_y() != 0xA3) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "concat_top", runner);
+}
+
 } // namespace
 
 int main()
@@ -574,6 +776,8 @@ int main()
         testFailureOnStaleMetadataAfterDestructiveMutation();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
+        testSingleClockRuntimeCompileAndRun();
+        testConcatCompileAndRun();
     }
     catch (const std::exception &ex)
     {
