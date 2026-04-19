@@ -227,6 +227,25 @@ Design buildConcatDesign()
     return design;
 }
 
+Design buildMaskedNotDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 1, false);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "out", 1, false);
+    graph.bindOutputPort("out", out);
+
+    const auto notOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("not_out"));
+    graph.addOperand(notOp, in);
+    graph.addResult(notOp, out);
+
+    return design;
+}
+
 Design buildNoCommitStatefulOutputDesign()
 {
     Design design;
@@ -790,6 +809,48 @@ int main() {
     compileAndRunHarness(dir, "concat_top", runner);
 }
 
+void testBitwiseNotMasksToDeclaredWidth()
+{
+    Design design = buildMaskedNotDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "masked_not_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("masked_not_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp masked-not fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp masked-not fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "masked_not_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(0);
+    sim.step();
+    if (sim.get_out() != 1) {
+        return 1;
+    }
+    sim.set_in(1);
+    sim.step();
+    if (sim.get_out() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "masked_not_top", runner);
+}
+
 void testEdgeWithoutCommitDoesNotAdvanceStep()
 {
     Design design = buildNoCommitStatefulOutputDesign();
@@ -855,6 +916,7 @@ int main()
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
         testConcatCompileAndRun();
+        testBitwiseNotMasksToDeclaredWidth();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)

@@ -190,6 +190,15 @@ namespace wolvrix::lib::emit
             return std::to_string((1ULL << width) - 1);
         }
 
+        std::string maskExprForWidth(const std::string &expr, int32_t width)
+        {
+            if (width <= 0 || width >= 64)
+            {
+                return expr;
+            }
+            return "((" + expr + ") & " + generateMask(width) + ")";
+        }
+
         // Forward declaration
         struct GsimScratchpadMetadata;
 
@@ -290,7 +299,11 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kNot: {
-                    setResultExpr(0, "(~" + getOperandExpr(0) + ")");
+                    if (!op.results().empty())
+                    {
+                        const auto resultValue = graph.getValue(op.results()[0]);
+                        setResultExpr(0, maskExprForWidth("(~" + getOperandExpr(0) + ")", resultValue.width()));
+                    }
                     break;
                 }
 
