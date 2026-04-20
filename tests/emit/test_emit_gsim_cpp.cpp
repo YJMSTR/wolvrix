@@ -367,6 +367,51 @@ Design buildThreeStageRegisterPipelineDesign()
     return design;
 }
 
+Design buildKeyClockCarrierDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto key = makeValue(graph, "KEY", 2, false);
+    const auto d = makeValue(graph, "D", 1, false);
+    graph.bindInputPort("KEY", key);
+    graph.bindInputPort("D", d);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 1, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 1, "q");
+    graph.bindOutputPort("Q", qRead);
+
+    const auto idx0 = makeConstant(graph, "idx0", "idx0_const", 1, "1'b0");
+    const auto idx1 = makeConstant(graph, "idx1", "idx1_const", 1, "1'b1");
+    const auto clkBit = makeValue(graph, "clk_bit", 1, false);
+    const auto enBit = makeValue(graph, "en_bit", 1, false);
+
+    const auto clkSlice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("key_clk_slice"));
+    graph.addOperand(clkSlice, key);
+    graph.addOperand(clkSlice, idx0);
+    graph.addResult(clkSlice, clkBit);
+    graph.setAttr(clkSlice, "sliceWidth", static_cast<int64_t>(1));
+
+    const auto enSlice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("key_en_slice"));
+    graph.addOperand(enSlice, key);
+    graph.addOperand(enSlice, idx1);
+    graph.addResult(enSlice, enBit);
+    graph.setAttr(enSlice, "sliceWidth", static_cast<int64_t>(1));
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 1, "1'b1");
+    const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("q_write"));
+    graph.addOperand(write, enBit);
+    graph.addOperand(write, d);
+    graph.addOperand(write, mask);
+    graph.addOperand(write, clkBit);
+    graph.setAttr(write, "regSymbol", std::string("q"));
+    graph.setAttr(write, "clockSymbol", std::string("clock"));
+    graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -1148,6 +1193,52 @@ int main() {
     compileAndRunHarness(dir, "pipeline_top", runner);
 }
 
+void testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias()
+{
+    Design design = buildKeyClockCarrierDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "key_clock_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("key_clock_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp key-clock fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp key-clock fixture should not emit errors");
+
+    const std::string header = readFile(dir / "key_clock_top.hpp");
+    expect(!contains(header, "input_clock_"),
+           "key-clock fixture should not emit unresolved input_clock_ alias");
+    expect(contains(header, "input_KEY_"),
+           "key-clock fixture should drive the clock from the KEY input carrier");
+
+    const std::string runner = R"CPP(
+#include "key_clock_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_KEY(0b10);
+    sim.set_D(1);
+    sim.step();
+    sim.set_KEY(0b11);
+    sim.step();
+    if (sim.get_Q() != 1) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "key_clock_top", runner);
+}
+
 void testEdgeWithoutCommitDoesNotAdvanceStep()
 {
     Design design = buildNoCommitStatefulOutputDesign();
@@ -1224,6 +1315,7 @@ int main()
         testDynamicSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
         testRegisterPipelineUsesNonBlockingSemantics();
+        testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)

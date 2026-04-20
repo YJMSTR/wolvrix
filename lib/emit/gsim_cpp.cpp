@@ -37,6 +37,7 @@ namespace wolvrix::lib::emit
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             std::map<std::string, std::vector<std::string>> sequentialRegs;
+            std::map<std::string, std::string> sequentialClockExprs;
 
             // Non-sharded combinational statements for small designs
             std::vector<std::string> combinationalStmts;
@@ -511,6 +512,13 @@ namespace wolvrix::lib::emit
                         }
                     }
                     domainKey = eventEdge + ":" + clockSymbol;
+
+                    if (op.operands().size() > 3) {
+                        const std::string clockExpr = getOperandExpr(3);
+                        if (clockExpr != "0" && !clockExpr.empty()) {
+                            state.sequentialClockExprs.try_emplace(domainKey, clockExpr);
+                        }
+                    }
 
                     if (!regName.empty()) {
                         auto &domainRegs = state.sequentialRegs[domainKey];
@@ -1130,22 +1138,28 @@ namespace wolvrix::lib::emit
                                 }
                                 return false;
                             };
-                            if (!hasPortNamed(resolvedClock)) {
-                                if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
-                                    resolvedClock = *fallbackClock;
+                            std::string currClockExpr;
+                            auto exprIt = state.sequentialClockExprs.find(domain.first);
+                            if (exprIt != state.sequentialClockExprs.end()) {
+                                currClockExpr = exprIt->second;
+                            } else {
+                                if (!hasPortNamed(resolvedClock)) {
+                                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
+                                        resolvedClock = *fallbackClock;
+                                    }
                                 }
+                                currClockExpr = "input_" + resolvedClock + "_";
                             }
-                            const std::string currClock = "input_" + resolvedClock + "_";
                             const std::string prevClock = "prev_" + resolvedClock + "_";
                             const std::string edgeExpr = edge == "posedge"
-                                                             ? "(!" + prevClock + " && " + currClock + ")"
-                                                             : "(" + prevClock + " && !" + currClock + ")";
+                                                             ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
+                                                             : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                             os << "        if (reset_) {\n";
                             os << "            reset_ = false;\n";
                             if (!state.outputPorts.empty()) {
                                 os << "            settle();\n";
                             }
-                            os << "            " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
+                            os << "            " << prevClock << " = static_cast<bool>(" << currClockExpr << ");\n";
                             os << "            difftest_exit_ = 0;\n";
                             os << "            return;\n";
                             os << "        }\n";
@@ -1165,7 +1179,7 @@ namespace wolvrix::lib::emit
                                 }
                             }
                             os << "        }\n";
-                            os << "        " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
+                            os << "        " << prevClock << " = static_cast<bool>(" << currClockExpr << ");\n";
                         }
                     }
                 }
