@@ -1045,6 +1045,46 @@ namespace wolvrix::lib::emit
             return "gsim_" + sanitizeIdentifier(target.scratchGraphSymbol);
         }
 
+        bool attrEnabled(const EmitOptions &options, std::string_view key, bool defaultValue)
+        {
+            const auto value = attrValue(options, key);
+            if (!value)
+            {
+                return defaultValue;
+            }
+            std::string lowered = *value;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            if (lowered == "0" || lowered == "false" || lowered == "off" || lowered == "no")
+            {
+                return false;
+            }
+            if (lowered == "1" || lowered == "true" || lowered == "on" || lowered == "yes")
+            {
+                return true;
+            }
+            return defaultValue;
+        }
+
+        int parsePositiveIntAttr(const EmitOptions &options, std::string_view key, int defaultValue)
+        {
+            const auto value = attrValue(options, key);
+            if (!value)
+            {
+                return defaultValue;
+            }
+            try
+            {
+                const int parsed = std::stoi(*value);
+                return parsed > 0 ? parsed : defaultValue;
+            }
+            catch (...)
+            {
+                return defaultValue;
+            }
+        }
+
         std::optional<std::pair<std::string, std::string>> parseSequentialDomain(std::string_view key)
         {
             const std::size_t pos = key.find(':');
@@ -1058,11 +1098,11 @@ namespace wolvrix::lib::emit
         void writeHeader(std::ostream &os,
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
-                         const CodegenState& state)
+                         const CodegenState& state,
+                         bool emitMetadata)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
-            const std::string className = "SSimTop_" + ns;
 
             os << "#pragma once\n\n";
             os << "#include <cstdint>\n";
@@ -1276,29 +1316,32 @@ namespace wolvrix::lib::emit
             os << "    std::string scratchpad_namespace;\n";
             os << "    std::int64_t op_count = 0;\n";
             os << "    std::int64_t graph_revision = 0;\n";
-            os << "    std::vector<std::int64_t> roots;\n";
-            os << "    std::vector<std::int64_t> topo_order;\n";
-            os << "    std::vector<std::string> event_group_names;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> event_groups;\n";
-            os << "    std::vector<std::string> schedule_activity_order;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> schedule_activity_members;\n";
-            os << "    std::map<std::string, std::string> schedule_activity_classes;\n";
-            os << "    std::vector<std::string> hypergraph_node_names;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_node_members;\n";
-            os << "    std::vector<std::string> hypergraph_edge_names;\n";
-            os << "    std::map<std::string, std::string> hypergraph_edge_sources;\n";
-            os << "    std::map<std::string, std::string> hypergraph_edge_targets;\n";
-            os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_edge_sinks;\n";
-            os << "    std::map<std::int64_t, std::string> classifications;\n";
-            os << "    std::map<std::int64_t, std::vector<std::int64_t>> predecessors;\n";
-            os << "    std::map<std::int64_t, std::vector<std::int64_t>> successors;\n";
-            os << "    std::vector<std::string> op_descriptors;\n";
-            os << "    std::string schedule_kind;\n";
-            os << "    std::int64_t schedule_version = 0;\n";
-            os << "    std::string schedule_contract;\n";
-            os << "    std::string hypergraph_kind;\n";
-            os << "    std::int64_t hypergraph_version = 0;\n";
-            os << "    std::string hypergraph_contract;\n";
+            if (emitMetadata)
+            {
+                os << "    std::vector<std::int64_t> roots;\n";
+                os << "    std::vector<std::int64_t> topo_order;\n";
+                os << "    std::vector<std::string> event_group_names;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> event_groups;\n";
+                os << "    std::vector<std::string> schedule_activity_order;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> schedule_activity_members;\n";
+                os << "    std::map<std::string, std::string> schedule_activity_classes;\n";
+                os << "    std::vector<std::string> hypergraph_node_names;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_node_members;\n";
+                os << "    std::vector<std::string> hypergraph_edge_names;\n";
+                os << "    std::map<std::string, std::string> hypergraph_edge_sources;\n";
+                os << "    std::map<std::string, std::string> hypergraph_edge_targets;\n";
+                os << "    std::map<std::string, std::vector<std::int64_t>> hypergraph_edge_sinks;\n";
+                os << "    std::map<std::int64_t, std::string> classifications;\n";
+                os << "    std::map<std::int64_t, std::vector<std::int64_t>> predecessors;\n";
+                os << "    std::map<std::int64_t, std::vector<std::int64_t>> successors;\n";
+                os << "    std::vector<std::string> op_descriptors;\n";
+                os << "    std::string schedule_kind;\n";
+                os << "    std::int64_t schedule_version = 0;\n";
+                os << "    std::string schedule_contract;\n";
+                os << "    std::string hypergraph_kind;\n";
+                os << "    std::int64_t hypergraph_version = 0;\n";
+                os << "    std::string hypergraph_contract;\n";
+            }
             os << "};\n\n";
             os << structName << " make_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata();\n";
             os << "bool validate_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata(const " << structName << "& metadata);\n\n";
@@ -1309,7 +1352,8 @@ namespace wolvrix::lib::emit
         void writeSource(std::ostream &os,
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
-                         std::string_view headerFilename)
+                         std::string_view headerFilename,
+                         bool emitMetadata)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
             const std::string structName = "GsimMetadata_" + ns;
@@ -1333,6 +1377,16 @@ namespace wolvrix::lib::emit
             os << "    metadata.scratchpad_namespace = \"" << target.namespacePath << "\";\n";
             os << "    metadata.op_count = " << metadata.opCount << ";\n";
             os << "    metadata.graph_revision = " << metadata.graphRevision << ";\n";
+            if (!emitMetadata)
+            {
+                os << "    return metadata;\n";
+                os << "}\n\n";
+                os << "bool " << validateName << "(const " << structName << "& metadata) {\n";
+                os << "    return metadata.graph_symbol == \"" << target.scratchGraphSymbol << "\";\n";
+                os << "}\n\n";
+                os << "} // namespace wolvrix::gsim\n";
+                return;
+            }
             os << "    metadata.roots = {" << joinInts(metadata.roots, ", ") << "};\n";
             os << "    metadata.topo_order = {" << joinInts(metadata.topoOrder, ", ") << "};\n";
             os << "    metadata.event_group_names = {";
@@ -1554,6 +1608,8 @@ namespace wolvrix::lib::emit
 
         // Generate code from GRH operations
         CodegenState state;
+        state.maxShardSize = parsePositiveIntAttr(options, "behavior_shard_max_bytes", state.maxShardSize);
+        const bool emitMetadata = attrEnabled(options, "emit_metadata", true);
 
         // Determine if sharding should be enabled based on operation count
         // For large designs (>1000 operations), enable sharding to improve compile times
@@ -1562,14 +1618,20 @@ namespace wolvrix::lib::emit
         collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
         collectRegisters(*target->graph, state);
 
+        std::unordered_map<std::int64_t, wolvrix::lib::grh::OperationId> opIdByIndex;
+        opIdByIndex.reserve(target->graph->operations().size());
+        for (const auto &opId : target->graph->operations()) {
+            opIdByIndex.emplace(static_cast<std::int64_t>(opId.index), opId);
+        }
+
         // Traverse operations in topo order
         for (int64_t opIdx : metadata->topoOrder) {
-            auto opIdIt = std::find_if(target->graph->operations().begin(), target->graph->operations().end(),
-                [&](const wolvrix::lib::grh::OperationId& id) { return static_cast<int64_t>(id.index) == opIdx; });
-            if (opIdIt != target->graph->operations().end()) {
-                auto op = target->graph->getOperation(*opIdIt);
-                lowerOperation(*target->graph, op, *metadata, state, diagnostics());
+            auto opIdIt = opIdByIndex.find(opIdx);
+            if (opIdIt == opIdByIndex.end()) {
+                continue;
             }
+            auto op = target->graph->getOperation(opIdIt->second);
+            lowerOperation(*target->graph, op, *metadata, state, diagnostics());
         }
 
         // Check for unsupported operations
@@ -1595,8 +1657,8 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        writeHeader(*header, *target, *metadata, state);
-        writeSource(*source, *target, *metadata, headerPath.filename().string());
+        writeHeader(*header, *target, *metadata, state, emitMetadata);
+        writeSource(*source, *target, *metadata, headerPath.filename().string(), emitMetadata);
 
         std::vector<std::string> manifestEntries;
         manifestEntries.push_back(sourcePath.filename().string());

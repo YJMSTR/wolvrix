@@ -1239,6 +1239,36 @@ int main() {
     compileAndRunHarness(dir, "key_clock_top", runner);
 }
 
+void testEmitMetadataToggleSkipsLargeMetadataPayload()
+{
+    Design design = buildConcatDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "emit_metadata_toggle";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("metadata_toggle_top");
+    options.topOverrides = {"top"};
+    options.attributes["emit_metadata"] = "0";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp metadata-toggle fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp metadata-toggle fixture should not emit errors");
+
+    const std::string header = readFile(dir / "metadata_toggle_top.hpp");
+    const std::string source = readFile(dir / "metadata_toggle_top.cpp");
+    expect(!contains(header, "std::vector<std::int64_t> roots"),
+           "emit_metadata=0 should omit heavyweight metadata fields from the header");
+    expect(!contains(source, "metadata.op_descriptors"),
+           "emit_metadata=0 should omit heavyweight metadata population from the source");
+    expect(contains(source, "return metadata;"),
+           "emit_metadata=0 should still emit a lightweight metadata factory");
+}
+
 void testEdgeWithoutCommitDoesNotAdvanceStep()
 {
     Design design = buildNoCommitStatefulOutputDesign();
@@ -1316,6 +1346,7 @@ int main()
         testWideVectorPortsInitializeAndCompile();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
+        testEmitMetadataToggleSkipsLargeMetadataPayload();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)
