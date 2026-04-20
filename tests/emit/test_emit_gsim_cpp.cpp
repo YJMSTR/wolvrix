@@ -227,6 +227,42 @@ Design buildConcatDesign()
     return design;
 }
 
+Design buildDpicImportNoOpDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inB = makeValue(graph, "b", 8, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto addOut = makeValue(graph, "sum", 8, false);
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto add = graph.createOperation(OperationKind::kAdd, graph.internSymbol("add"));
+    graph.addOperand(add, inA);
+    graph.addOperand(add, inB);
+    graph.addResult(add, addOut);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, addOut);
+    graph.addResult(assign, outY);
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"logic"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    return design;
+}
+
 Design buildEqDesign()
 {
     Design design;
@@ -915,6 +951,48 @@ int main() {
     compileAndRunHarness(dir, "runtime_top", runner);
 }
 
+void testDpicImportNoOpCompileAndRun()
+{
+    Design design = buildDpicImportNoOpDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_import_noop_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_import_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should ignore standalone kDpicImport ops");
+    expect(!diags.hasError(), "EmitGsimCpp should not report standalone kDpicImport ops as unsupported");
+
+    const std::string header = readFile(dir / "dpic_import_top.hpp");
+    expect(contains(header, "output_y_ = (input_a_ + input_b_);"),
+           "dpi-import no-op fixture should still lower surrounding logic");
+
+    const std::string runner = R"CPP(
+#include "dpic_import_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(3);
+    sim.set_b(4);
+    sim.step();
+    if (sim.get_y() != 7) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_import_top", runner);
+}
+
 void testConcatCompileAndRun()
 {
     Design design = buildConcatDesign();
@@ -1339,6 +1417,7 @@ int main()
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
+        testDpicImportNoOpCompileAndRun();
         testConcatCompileAndRun();
         testEqCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();

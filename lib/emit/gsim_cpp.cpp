@@ -526,10 +526,13 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kDpicImport:
                 case OperationKind::kSystemTask:
                 case OperationKind::kSystemFunction: {
-                    // System tasks/functions are debug/diagnostic constructs
-                    // They don't generate simulation logic in the generated C++
+                    // DPI imports are declarations with no operands/results, so GSIM can
+                    // safely ignore them at emit time until call lowering support exists.
+                    // System tasks/functions are debug/diagnostic constructs and likewise
+                    // do not generate simulation logic in the emitted C++ runtime.
                     break;
                 }
 
