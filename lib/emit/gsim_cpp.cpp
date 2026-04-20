@@ -433,6 +433,11 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kLatch: {
+                    // Latch declaration defines storage - handled in storage collection
+                    break;
+                }
+
                 case OperationKind::kRegisterReadPort: {
                     auto regSymAttr = op.attr("regSymbol");
                     std::string sym;
@@ -447,6 +452,24 @@ namespace wolvrix::lib::emit
                     if (!sym.empty()) {
                         std::string regName = "reg_" + sanitizeIdentifier(sym);
                         setResultExpr(0, regName);
+                    }
+                    break;
+                }
+
+                case OperationKind::kLatchReadPort: {
+                    auto latchSymAttr = op.attr("latchSymbol");
+                    std::string sym;
+                    if (latchSymAttr) {
+                        if (auto *attrSym = std::get_if<std::string>(&*latchSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
+                    if (!sym.empty()) {
+                        std::string latchName = "latch_" + sanitizeIdentifier(sym);
+                        setResultExpr(0, latchName);
                     }
                     break;
                 }
@@ -647,6 +670,44 @@ namespace wolvrix::lib::emit
                     if (!op.results().empty()) {
                         state.valueVars[op.results()[0]] = regName;
                     }
+                }
+            }
+        }
+
+        void collectLatches(
+            const wolvrix::lib::grh::Graph& graph,
+            CodegenState& state)
+        {
+            for (const auto& opId : graph.operations()) {
+                auto op = graph.getOperation(opId);
+                if (op.kind() == wolvrix::lib::grh::OperationKind::kLatch) {
+                    std::string sym;
+                    auto latchSymAttr = op.attr("latchSymbol");
+                    if (latchSymAttr) {
+                        if (auto* attrSym = std::get_if<std::string>(&*latchSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
+                    if (sym.empty()) {
+                        sym = "unnamed_latch_" + std::to_string(opId.index);
+                    }
+                    std::string latchName = "latch_" + sanitizeIdentifier(sym);
+
+                    int32_t width = 32;
+                    auto widthAttr = op.attr("width");
+                    if (widthAttr) {
+                        if (auto* attrWidth = std::get_if<int64_t>(&*widthAttr)) {
+                            width = static_cast<int32_t>(*attrWidth);
+                        }
+                    }
+
+                    std::string type = getCppTypeForWidth(width);
+                    const std::string zeroInit = zeroInitializerForType(type);
+                    state.storageDecls.push_back(type + " " + latchName + " = " + zeroInit + ";");
+                    state.storageResetStmts.push_back(latchName + " = " + zeroInit + ";");
                 }
             }
         }
@@ -1610,6 +1671,7 @@ namespace wolvrix::lib::emit
 
         collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
         collectRegisters(*target->graph, state);
+        collectLatches(*target->graph, state);
 
         std::unordered_map<std::int64_t, wolvrix::lib::grh::OperationId> opIdByIndex;
         opIdByIndex.reserve(target->graph->operations().size());

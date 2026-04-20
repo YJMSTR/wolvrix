@@ -103,6 +103,31 @@ ValueId makeRegisterRead(Graph &graph,
     return value;
 }
 
+OperationId makeLatch(Graph &graph,
+                      const std::string &opName,
+                      int32_t width,
+                      const std::string &latchSymbol)
+{
+    const auto op = graph.createOperation(OperationKind::kLatch, graph.internSymbol(opName));
+    graph.setAttr(op, "latchSymbol", latchSymbol);
+    graph.setAttr(op, "width", static_cast<int64_t>(width));
+    graph.setAttr(op, "isSigned", false);
+    return op;
+}
+
+ValueId makeLatchRead(Graph &graph,
+                      const std::string &valueName,
+                      const std::string &opName,
+                      int32_t width,
+                      const std::string &latchSymbol)
+{
+    const auto value = graph.createValue(graph.internSymbol(valueName), width, false);
+    const auto op = graph.createOperation(OperationKind::kLatchReadPort, graph.internSymbol(opName));
+    graph.addResult(op, value);
+    graph.setAttr(op, "latchSymbol", latchSymbol);
+    return value;
+}
+
 OperationId makeRegisterWrite(Graph &graph,
                               const std::string &opName,
                               ValueId updateCond,
@@ -259,6 +284,19 @@ Design buildDpicImportNoOpDesign()
     graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"logic"});
     graph.setAttr(dpiImport, "hasReturn", false);
     graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    return design;
+}
+
+Design buildLatchReadNoOpDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    (void)makeLatch(graph, "state_latch_decl", 4, "state_latch");
+    const auto latchRead = makeLatchRead(graph, "state_latch_q", "state_latch_read", 4, "state_latch");
+    graph.bindOutputPort("y", latchRead);
 
     return design;
 }
@@ -993,6 +1031,47 @@ int main() {
     compileAndRunHarness(dir, "dpic_import_top", runner);
 }
 
+void testLatchReadNoOpCompileAndRun()
+{
+    Design design = buildLatchReadNoOpDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "latch_read_noop_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("latch_read_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower standalone latch declarations and latch reads");
+    expect(!diags.hasError(), "EmitGsimCpp should not report latch declaration/read ops as unsupported");
+
+    const std::string header = readFile(dir / "latch_read_top.hpp");
+    expect(contains(header, "latch_state_latch"),
+           "latch-read fixture should materialize latch storage in the emitted runtime");
+    expect(contains(header, "output_y_ = latch_state_latch;"),
+           "latch-read fixture should drive outputs from latch storage");
+
+    const std::string runner = R"CPP(
+#include "latch_read_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "latch_read_top", runner);
+}
+
 void testConcatCompileAndRun()
 {
     Design design = buildConcatDesign();
@@ -1418,6 +1497,7 @@ int main()
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
         testDpicImportNoOpCompileAndRun();
+        testLatchReadNoOpCompileAndRun();
         testConcatCompileAndRun();
         testEqCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();
