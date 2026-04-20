@@ -316,6 +316,35 @@ Design buildWideMuxDesign()
     return design;
 }
 
+Design buildThreeStageRegisterPipelineDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    (void)makeRegister(graph, "stage1_storage", "stage1_reg", 1, "stage1");
+    (void)makeRegister(graph, "stage2_storage", "stage2_reg", 1, "stage2");
+    (void)makeRegister(graph, "stage3_storage", "stage3_reg", 1, "stage3");
+
+    const auto stage1Read = makeRegisterRead(graph, "stage1_read", "stage1_read_op", 1, "stage1");
+    const auto stage2Read = makeRegisterRead(graph, "stage2_read", "stage2_read_op", 1, "stage2");
+    const auto stage3Read = makeRegisterRead(graph, "stage3_read", "stage3_read_op", 1, "stage3");
+    graph.bindOutputPort("q", stage3Read);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 1, "1'b1");
+    makeRegisterWrite(graph, "stage1_write", one, inD, mask, clk, "stage1");
+    makeRegisterWrite(graph, "stage2_write", one, stage1Read, mask, clk, "stage2");
+    makeRegisterWrite(graph, "stage3_write", one, stage2Read, mask, clk, "stage3");
+
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -999,6 +1028,60 @@ int main() {
     compileAndRunHarness(dir, "wide_vector_top", runner);
 }
 
+void testRegisterPipelineUsesNonBlockingSemantics()
+{
+    Design design = buildThreeStageRegisterPipelineDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "pipeline_runtime";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("pipeline_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp pipeline fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp pipeline fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "pipeline_top.hpp"
+#include <array>
+#include <cstdint>
+
+static void tick(SSimTop& sim, std::uint8_t d) {
+    sim.set_d(d);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    SSimTop sim;
+    const std::array<std::uint8_t, 7> stimuli{{1, 0, 1, 1, 0, 0, 1}};
+    std::uint8_t stage1 = 0;
+    std::uint8_t stage2 = 0;
+    for (const auto din : stimuli) {
+        tick(sim, din);
+        if (sim.get_q() != stage2) {
+            return 1;
+        }
+        const auto nextStage1 = din;
+        const auto nextStage2 = stage1;
+        stage1 = nextStage1;
+        stage2 = nextStage2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "pipeline_top", runner);
+}
+
 void testEdgeWithoutCommitDoesNotAdvanceStep()
 {
     Design design = buildNoCommitStatefulOutputDesign();
@@ -1073,6 +1156,7 @@ int main()
         testBitwiseNotMasksToDeclaredWidth();
         testDynamicSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
+        testRegisterPipelineUsesNonBlockingSemantics();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)

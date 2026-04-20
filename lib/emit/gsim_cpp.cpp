@@ -36,6 +36,7 @@ namespace wolvrix::lib::emit
 
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
+            std::map<std::string, std::vector<std::string>> sequentialRegs;
 
             // Non-sharded combinational statements for small designs
             std::vector<std::string> combinationalStmts;
@@ -507,12 +508,16 @@ namespace wolvrix::lib::emit
                     domainKey = eventEdge + ":" + clockSymbol;
 
                     if (!regName.empty()) {
+                        auto &domainRegs = state.sequentialRegs[domainKey];
+                        if (std::find(domainRegs.begin(), domainRegs.end(), regName) == domainRegs.end()) {
+                            domainRegs.push_back(regName);
+                        }
                         if (mask != "0") {
                             state.sequentialStmts[domainKey].push_back(
-                                "        if (" + condition + ") { " + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); committed_ = true; }");
+                                "        if (" + condition + ") { next_" + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); committed_ = true; }");
                         } else {
                             state.sequentialStmts[domainKey].push_back(
-                                "        if (" + condition + ") { " + regName + " = " + nextValue + "; committed_ = true; }");
+                                "        if (" + condition + ") { next_" + regName + " = " + nextValue + "; committed_ = true; }");
                         }
                     }
                     break;
@@ -1062,7 +1067,7 @@ namespace wolvrix::lib::emit
             // Reset and set_reset (for compatibility)
             os << "    void set_reset(unsigned reset) { reset_ = reset; }\n\n";
             os << "    void reset() {\n";
-            os << "        reset_ = true;\n";
+            os << "        reset_ = false;\n";
             for (const auto& stmt : state.storageResetStmts) {
                 os << "        " << stmt << "\n";
             }
@@ -1140,8 +1145,19 @@ namespace wolvrix::lib::emit
                             os << "            return;\n";
                             os << "        }\n";
                             os << "        if (" << edgeExpr << ") {\n";
+                            auto regIt = state.sequentialRegs.find(domain.first);
+                            if (regIt != state.sequentialRegs.end()) {
+                                for (const auto &regName : regIt->second) {
+                                    os << "            auto next_" << regName << " = " << regName << ";\n";
+                                }
+                            }
                             for (const auto& stmt : domain.second) {
                                 os << stmt << "\n";
+                            }
+                            if (regIt != state.sequentialRegs.end()) {
+                                for (const auto &regName : regIt->second) {
+                                    os << "            " << regName << " = next_" << regName << ";\n";
+                                }
                             }
                             os << "        }\n";
                             os << "        " << prevClock << " = static_cast<bool>(" << currClock << ");\n";
