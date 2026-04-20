@@ -342,6 +342,11 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kEq: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                    break;
+                }
+
                 case OperationKind::kNot: {
                     if (!op.results().empty())
                     {

@@ -227,6 +227,28 @@ Design buildConcatDesign()
     return design;
 }
 
+Design buildEqDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inB = makeValue(graph, "b", 8, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outY = makeValue(graph, "y", 1, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto eq = graph.createOperation(OperationKind::kEq, graph.internSymbol("eq_y"));
+    graph.addOperand(eq, inA);
+    graph.addOperand(eq, inB);
+    graph.addResult(eq, outY);
+
+    return design;
+}
+
 Design buildMaskedNotDesign()
 {
     Design design;
@@ -886,6 +908,50 @@ int main() {
     compileAndRunHarness(dir, "concat_top", runner);
 }
 
+void testEqCompileAndRun()
+{
+    Design design = buildEqDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "eq_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("eq_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp eq fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp eq fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "eq_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0x5A);
+    sim.set_b(0x5A);
+    sim.step();
+    if (sim.get_y() != 1) {
+        return 1;
+    }
+    sim.set_a(0x5A);
+    sim.set_b(0xA5);
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "eq_top", runner);
+}
+
 void testBitwiseNotMasksToDeclaredWidth()
 {
     Design design = buildMaskedNotDesign();
@@ -1153,6 +1219,7 @@ int main()
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
         testConcatCompileAndRun();
+        testEqCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();
         testDynamicSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
