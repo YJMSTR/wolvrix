@@ -103,19 +103,9 @@ namespace wolvrix::lib::emit
                 std::string varName = "var_" + std::to_string(valueId.index) + "_" + std::to_string(valueId.generation);
                 valueVars[valueId] = varName;
 
-                bool alreadyDeclared = false;
-                for (const auto &decl : storageDecls)
-                {
-                    if (decl.find(" " + varName + " = 0;") != std::string::npos)
-                    {
-                        alreadyDeclared = true;
-                        break;
-                    }
-                }
-                if (!alreadyDeclared)
-                {
-                    storageDecls.push_back(cppType + " " + varName + " = 0;");
-                }
+                // GRH result ValueIds are unique and each defining operation is lowered once,
+                // so sharded temporaries do not need a duplicate-declaration scan here.
+                storageDecls.push_back(cppType + " " + varName + " = 0;");
 
                 std::string assignment = varName + " = " + expr + ";";
                 ensureShardSpace(static_cast<int>(assignment.length()));
