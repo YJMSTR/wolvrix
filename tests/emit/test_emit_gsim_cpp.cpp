@@ -291,6 +291,31 @@ Design buildNoCommitStatefulOutputDesign()
     return design;
 }
 
+Design buildWideMuxDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 128, false);
+    const auto inB = makeValue(graph, "b", 128, false);
+    const auto sel = makeValue(graph, "sel", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+    graph.bindInputPort("sel", sel);
+
+    const auto outY = makeValue(graph, "y", 128, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto mux = graph.createOperation(OperationKind::kMux, graph.internSymbol("wide_mux"));
+    graph.addOperand(mux, sel);
+    graph.addOperand(mux, inB);
+    graph.addOperand(mux, inA);
+    graph.addResult(mux, outY);
+
+    return design;
+}
+
 Design buildHierDesign()
 {
     Design design;
@@ -927,6 +952,53 @@ int main() {
     compileAndRunHarness(dir, "slice_dynamic_top", runner);
 }
 
+void testWideVectorPortsInitializeAndCompile()
+{
+    Design design = buildWideMuxDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_vector_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_vector_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-vector fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-vector fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_vector_top.hpp");
+    expect(contains(header, "std::vector<std::uint64_t> input_a_ = {}"),
+           "wide-vector fixture should initialize vector inputs with {}");
+    expect(contains(header, "std::vector<std::uint64_t> output_y_ = {}"),
+           "wide-vector fixture should initialize vector outputs with {}");
+
+    const std::string runner = R"CPP(
+#include "wide_vector_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(std::vector<std::uint64_t>{0x1ULL, 0x2ULL});
+    sim.set_b(std::vector<std::uint64_t>{0xAULL, 0xBULL});
+    sim.set_sel(1);
+    sim.step();
+    const auto out = sim.get_y();
+    if (out.size() != 2 || out[0] != 0xAULL || out[1] != 0xBULL) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_vector_top", runner);
+}
+
 void testEdgeWithoutCommitDoesNotAdvanceStep()
 {
     Design design = buildNoCommitStatefulOutputDesign();
@@ -945,6 +1017,12 @@ void testEdgeWithoutCommitDoesNotAdvanceStep()
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp no-commit fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp no-commit fixture should not emit errors");
+
+    const std::string header = readFile(dir / "no_commit_top.hpp");
+    expect(!contains(header, "input_clock_"),
+           "sequential runtime should not reference missing input_clock_ alias when the input port is clk");
+    expect(contains(header, "input_clk_"),
+           "sequential runtime should keep the declared input_clk_ storage name");
 
     const std::string runner = R"CPP(
 #include "no_commit_top.hpp"
@@ -994,6 +1072,7 @@ int main()
         testConcatCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();
         testDynamicSliceCompileAndRun();
+        testWideVectorPortsInitializeAndCompile();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }
     catch (const std::exception &ex)

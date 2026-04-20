@@ -199,6 +199,49 @@ namespace wolvrix::lib::emit
             return "((" + expr + ") & " + generateMask(width) + ")";
         }
 
+        std::string zeroInitializerForType(std::string_view cppType)
+        {
+            if (cppType == "std::vector<std::uint64_t>")
+            {
+                return "{}";
+            }
+            return "0";
+        }
+
+        std::optional<std::string> findClockLikeInputName(const std::vector<std::pair<std::string, std::string>> &inputPorts)
+        {
+            auto tryMatch = [&](auto predicate) -> std::optional<std::string>
+            {
+                for (const auto &[name, type] : inputPorts)
+                {
+                    (void)type;
+                    if (predicate(sanitizeIdentifier(name)))
+                    {
+                        return sanitizeIdentifier(name);
+                    }
+                }
+                return std::nullopt;
+            };
+
+            if (auto exactClk = tryMatch([](const std::string &name) { return name == "clk"; }))
+            {
+                return exactClk;
+            }
+            if (auto exactClock = tryMatch([](const std::string &name) { return name == "clock"; }))
+            {
+                return exactClock;
+            }
+            if (auto suffixClk = tryMatch([](const std::string &name) { return name.size() > 4 && name.ends_with("_clk"); }))
+            {
+                return suffixClk;
+            }
+            if (auto containsClock = tryMatch([](const std::string &name) { return name.find("clock") != std::string::npos; }))
+            {
+                return containsClock;
+            }
+            return std::nullopt;
+        }
+
         // Forward declaration
         struct GsimScratchpadMetadata;
 
@@ -585,8 +628,9 @@ namespace wolvrix::lib::emit
                         width = val.width();
                     }
                     std::string type = getCppTypeForWidth(width);
-                    state.storageDecls.push_back(type + " " + regName + " = 0;");
-                    state.storageResetStmts.push_back(regName + " = 0;");
+                    const std::string zeroInit = zeroInitializerForType(type);
+                    state.storageDecls.push_back(type + " " + regName + " = " + zeroInit + ";");
+                    state.storageResetStmts.push_back(regName + " = " + zeroInit + ";");
 
                     // Also create a mapping from the register's result ValueId to the register name
                     if (!op.results().empty()) {
@@ -1024,12 +1068,18 @@ namespace wolvrix::lib::emit
             }
             for (const auto& [name, type] : state.outputPorts) {
                 (void)type;
-                os << "        output_" << sanitizeIdentifier(name) << "_ = 0;\n";
+                os << "        output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForType(type) << ";\n";
             }
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
                 if (parsedDomain) {
-                    os << "        prev_" << sanitizeIdentifier(parsedDomain->second) << "_ = false;\n";
+                    std::string resetClock = sanitizeIdentifier(parsedDomain->second);
+                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
+                        if (resetClock == "clock" || resetClock == "unnamed") {
+                            resetClock = *fallbackClock;
+                        }
+                    }
+                    os << "        prev_" << resetClock << "_ = false;\n";
                 }
             }
             os << "    }\n\n";
@@ -1060,8 +1110,23 @@ namespace wolvrix::lib::emit
                         if (edge != "posedge" && edge != "negedge") {
                             os << "        throw std::runtime_error(\"GSIM emitted runtime supports only posedge/negedge event edges\");\n";
                         } else {
-                            const std::string currClock = "input_" + clock + "_";
-                            const std::string prevClock = "prev_" + clock + "_";
+                            std::string resolvedClock = clock;
+                            const auto hasPortNamed = [&](std::string_view candidate) {
+                                for (const auto &[name, type] : state.inputPorts) {
+                                    (void)type;
+                                    if (sanitizeIdentifier(name) == candidate) {
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            };
+                            if (!hasPortNamed(resolvedClock)) {
+                                if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
+                                    resolvedClock = *fallbackClock;
+                                }
+                            }
+                            const std::string currClock = "input_" + resolvedClock + "_";
+                            const std::string prevClock = "prev_" + resolvedClock + "_";
                             const std::string edgeExpr = edge == "posedge"
                                                              ? "(!" + prevClock + " && " + currClock + ")"
                                                              : "(" + prevClock + " && !" + currClock + ")";
@@ -1133,12 +1198,12 @@ namespace wolvrix::lib::emit
 
             // Input port storage
             for (const auto& [name, type] : state.inputPorts) {
-                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = 0;\n";
+                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForType(type) << ";\n";
             }
 
             // Output port storage
             for (const auto& [name, type] : state.outputPorts) {
-                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = 0;\n";
+                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForType(type) << ";\n";
             }
 
             // Register storage
@@ -1156,7 +1221,13 @@ namespace wolvrix::lib::emit
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
                 if (parsedDomain) {
-                    os << "    bool prev_" << sanitizeIdentifier(parsedDomain->second) << "_ = false;\n";
+                    std::string prevClockName = sanitizeIdentifier(parsedDomain->second);
+                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
+                        if (prevClockName == "clock" || prevClockName == "unnamed") {
+                            prevClockName = *fallbackClock;
+                        }
+                    }
+                    os << "    bool prev_" << prevClockName << "_ = false;\n";
                 }
             }
 
