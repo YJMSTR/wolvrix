@@ -128,6 +128,38 @@ ValueId makeLatchRead(Graph &graph,
     return value;
 }
 
+OperationId makeMemory(Graph &graph,
+                       int32_t width,
+                       int64_t row,
+                       const std::string &memSymbol)
+{
+    const auto op = graph.createOperation(OperationKind::kMemory, graph.internSymbol(memSymbol));
+    graph.setAttr(op, "width", static_cast<int64_t>(width));
+    graph.setAttr(op, "row", row);
+    graph.setAttr(op, "isSigned", false);
+    graph.setAttr(op, "initKind", std::vector<std::string>{"literal"});
+    graph.setAttr(op, "initFile", std::vector<std::string>{""});
+    graph.setAttr(op, "initValue", std::vector<std::string>{"8'hA5"});
+    graph.setAttr(op, "initStart", std::vector<int64_t>{2});
+    graph.setAttr(op, "initLen", std::vector<int64_t>{1});
+    return op;
+}
+
+ValueId makeMemoryRead(Graph &graph,
+                       const std::string &valueName,
+                       const std::string &opName,
+                       int32_t width,
+                       ValueId addr,
+                       const std::string &memSymbol)
+{
+    const auto value = graph.createValue(graph.internSymbol(valueName), width, false);
+    const auto op = graph.createOperation(OperationKind::kMemoryReadPort, graph.internSymbol(opName));
+    graph.addOperand(op, addr);
+    graph.addResult(op, value);
+    graph.setAttr(op, "memSymbol", memSymbol);
+    return value;
+}
+
 OperationId makeRegisterWrite(Graph &graph,
                               const std::string &opName,
                               ValueId updateCond,
@@ -301,6 +333,22 @@ Design buildLatchReadNoOpDesign()
     return design;
 }
 
+Design buildMemoryReadDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto addr = makeValue(graph, "addr", 3, false);
+    graph.bindInputPort("addr", addr);
+
+    (void)makeMemory(graph, 8, 4, "mem0");
+    const auto data = makeMemoryRead(graph, "data", "mem0_read", 8, addr, "mem0");
+    graph.bindOutputPort("data", data);
+
+    return design;
+}
+
 Design buildEqDesign()
 {
     Design design;
@@ -319,6 +367,35 @@ Design buildEqDesign()
     graph.addOperand(eq, inA);
     graph.addOperand(eq, inB);
     graph.addResult(eq, outY);
+
+    return design;
+}
+
+Design buildLogicBinaryDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 1, false);
+    const auto inB = makeValue(graph, "b", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outAnd = makeValue(graph, "and_y", 1, false);
+    const auto outOr = makeValue(graph, "or_y", 1, false);
+    graph.bindOutputPort("and_y", outAnd);
+    graph.bindOutputPort("or_y", outOr);
+
+    const auto andOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("logic_and_y"));
+    graph.addOperand(andOp, inA);
+    graph.addOperand(andOp, inB);
+    graph.addResult(andOp, outAnd);
+
+    const auto orOp = graph.createOperation(OperationKind::kLogicOr, graph.internSymbol("logic_or_y"));
+    graph.addOperand(orOp, inA);
+    graph.addOperand(orOp, inB);
+    graph.addResult(orOp, outOr);
 
     return design;
 }
@@ -1072,6 +1149,110 @@ int main() {
     compileAndRunHarness(dir, "latch_read_top", runner);
 }
 
+void testMemoryReadCompileAndRun()
+{
+    Design design = buildMemoryReadDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "memory_read_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("memory_read_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower memory declaration/read fixtures");
+    expect(!diags.hasError(), "EmitGsimCpp should not report memory declaration/read fixtures as unsupported");
+
+    const std::string header = readFile(dir / "memory_read_top.hpp");
+    expect(contains(header, "std::vector<std::uint8_t> mem_mem0_"),
+           "memory-read fixture should materialize byte-addressable memory storage");
+    expect(contains(header, "mem_mem0_[2] = static_cast<std::uint8_t>(0xA5);"),
+           "memory-read fixture should lower literal memory initialization");
+    expect(contains(header, "output_data_ = ((static_cast<std::size_t>(static_cast<std::uint64_t>(input_addr_)) < mem_mem0_.size()) ? mem_mem0_[static_cast<std::size_t>(static_cast<std::uint64_t>(input_addr_))] : 0);"),
+           "memory-read fixture should drive outputs from the emitted memory read expression");
+
+    const std::string runner = R"CPP(
+#include "memory_read_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_addr(0);
+    sim.step();
+    if (sim.get_data() != 0) {
+        return 1;
+    }
+    sim.set_addr(2);
+    sim.step();
+    if (sim.get_data() != 0xA5) {
+        return 2;
+    }
+    sim.set_addr(6);
+    sim.step();
+    if (sim.get_data() != 0) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "memory_read_top", runner);
+}
+
+void testLogicBinaryCompileAndRun()
+{
+    Design design = buildLogicBinaryDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "logic_binary_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("logic_binary_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp logic-and/or fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp logic-and/or fixture should not emit errors");
+
+    const std::string header = readFile(dir / "logic_binary_top.hpp");
+    expect(contains(header, "output_and_y_ = ((input_a_ && input_b_) ? 1U : 0U);"),
+           "logic-and fixture should lower short-circuit logical and");
+    expect(contains(header, "output_or_y_ = ((input_a_ || input_b_) ? 1U : 0U);"),
+           "logic-or fixture should lower short-circuit logical or");
+
+    const std::string runner = R"CPP(
+#include "logic_binary_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0);
+    sim.set_b(1);
+    sim.step();
+    if (sim.get_and_y() != 0 || sim.get_or_y() != 1) {
+        return 1;
+    }
+    sim.set_a(1);
+    sim.set_b(1);
+    sim.step();
+    if (sim.get_and_y() != 1 || sim.get_or_y() != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "logic_binary_top", runner);
+}
+
 void testConcatCompileAndRun()
 {
     Design design = buildConcatDesign();
@@ -1498,6 +1679,8 @@ int main()
         testSingleClockRuntimeCompileAndRun();
         testDpicImportNoOpCompileAndRun();
         testLatchReadNoOpCompileAndRun();
+        testMemoryReadCompileAndRun();
+        testLogicBinaryCompileAndRun();
         testConcatCompileAndRun();
         testEqCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();

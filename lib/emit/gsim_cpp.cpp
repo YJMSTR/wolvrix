@@ -23,6 +23,15 @@ namespace wolvrix::lib::emit
         // Forward declaration
         std::string sanitizeIdentifier(std::string_view text);
 
+        struct MemoryInfo
+        {
+            std::string storageName;
+            std::string rowType;
+            std::string zeroExpr;
+            std::int64_t rows = 0;
+            std::int32_t width = 0;
+        };
+
         // Code generation state for lowering GRH operations to C++
         struct CodegenState
         {
@@ -48,6 +57,9 @@ namespace wolvrix::lib::emit
 
             // Track unsupported operations for error reporting
             std::vector<std::string> unsupportedOps;
+
+            // Memory declarations/read lowering support
+            std::unordered_map<std::string, MemoryInfo> memories;
 
             // Sharding support: output streams for different shards
             std::vector<std::unique_ptr<std::ostringstream>> shardStreams;
@@ -198,6 +210,25 @@ namespace wolvrix::lib::emit
                 return "{}";
             }
             return "0";
+        }
+
+        std::string zeroInitializerForWidth(int32_t width)
+        {
+            if (width > 64)
+            {
+                const auto chunkCount = static_cast<int32_t>((width + 63) / 64);
+                return "std::vector<std::uint64_t>(" + std::to_string(chunkCount) + ", 0ULL)";
+            }
+            return zeroInitializerForType(getCppTypeForWidth(width));
+        }
+
+        std::string castScalarExprForWidth(const std::string &expr, int32_t width)
+        {
+            if (width > 64)
+            {
+                return expr;
+            }
+            return "static_cast<" + getCppTypeForWidth(width) + ">(" + expr + ")";
         }
 
         std::optional<std::string> findClockLikeInputName(const std::vector<std::pair<std::string, std::string>> &inputPorts)
@@ -352,6 +383,16 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kLogicAnd: {
+                    setResultExpr(0, "((" + getOperandExpr(0) + " && " + getOperandExpr(1) + ") ? 1U : 0U)");
+                    break;
+                }
+
+                case OperationKind::kLogicOr: {
+                    setResultExpr(0, "((" + getOperandExpr(0) + " || " + getOperandExpr(1) + ") ? 1U : 0U)");
+                    break;
+                }
+
                 case OperationKind::kMux: {
                     setResultExpr(0, "(" + getOperandExpr(0) + " ? " + getOperandExpr(1) + " : " + getOperandExpr(2) + ")");
                     break;
@@ -438,6 +479,11 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kMemory: {
+                    // Memory declarations are handled during storage collection.
+                    break;
+                }
+
                 case OperationKind::kRegisterReadPort: {
                     auto regSymAttr = op.attr("regSymbol");
                     std::string sym;
@@ -471,6 +517,33 @@ namespace wolvrix::lib::emit
                         std::string latchName = "latch_" + sanitizeIdentifier(sym);
                         setResultExpr(0, latchName);
                     }
+                    break;
+                }
+
+                case OperationKind::kMemoryReadPort: {
+                    auto memSymAttr = op.attr("memSymbol");
+                    std::string sym;
+                    if (memSymAttr) {
+                        if (auto *attrSym = std::get_if<std::string>(&*memSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
+                    const auto memoryIt = state.memories.find(sym);
+                    if (memoryIt == state.memories.end()) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kMemoryReadPort-unresolved (" + opName + ")");
+                        break;
+                    }
+                    const auto &memory = memoryIt->second;
+                    const std::string indexExpr =
+                        "static_cast<std::size_t>(static_cast<std::uint64_t>(" + getOperandExpr(0) + "))";
+                    setResultExpr(
+                        0,
+                        "((" + indexExpr + " < " + memory.storageName + ".size()) ? " +
+                            memory.storageName + "[" + indexExpr + "] : " + memory.zeroExpr + ")");
                     break;
                 }
 
@@ -708,6 +781,107 @@ namespace wolvrix::lib::emit
                     const std::string zeroInit = zeroInitializerForType(type);
                     state.storageDecls.push_back(type + " " + latchName + " = " + zeroInit + ";");
                     state.storageResetStmts.push_back(latchName + " = " + zeroInit + ";");
+                }
+            }
+        }
+
+        void collectMemories(
+            const wolvrix::lib::grh::Graph &graph,
+            CodegenState &state)
+        {
+            for (const auto &opId : graph.operations()) {
+                const auto op = graph.getOperation(opId);
+                if (op.kind() != wolvrix::lib::grh::OperationKind::kMemory) {
+                    continue;
+                }
+
+                const std::string sym = op.symbolText().empty()
+                                            ? "unnamed_mem_" + std::to_string(opId.index)
+                                            : std::string(op.symbolText());
+                const auto widthAttr = op.attr("width");
+                const auto rowAttr = op.attr("row");
+                const auto *widthPtr = widthAttr ? std::get_if<int64_t>(&*widthAttr) : nullptr;
+                const auto *rowPtr = rowAttr ? std::get_if<int64_t>(&*rowAttr) : nullptr;
+                if (widthPtr == nullptr || rowPtr == nullptr || *widthPtr <= 0 || *rowPtr <= 0) {
+                    state.unsupportedOps.push_back("kMemory-metadata (" + sym + ")");
+                    continue;
+                }
+
+                MemoryInfo memory;
+                memory.storageName = "mem_" + sanitizeIdentifier(sym) + "_";
+                memory.rowType = getCppTypeForWidth(static_cast<int32_t>(*widthPtr));
+                memory.zeroExpr = zeroInitializerForWidth(static_cast<int32_t>(*widthPtr));
+                memory.rows = *rowPtr;
+                memory.width = static_cast<int32_t>(*widthPtr);
+
+                const std::string storageType = "std::vector<" + memory.rowType + ">";
+                const std::string initExpr =
+                    storageType + "(" + std::to_string(memory.rows) + ", " + memory.zeroExpr + ")";
+                state.storageDecls.push_back(storageType + " " + memory.storageName + " = " + initExpr + ";");
+                state.storageResetStmts.push_back(memory.storageName + " = " + initExpr + ";");
+                state.memories.emplace(sym, memory);
+
+                auto initKindsAttr = op.attr("initKind");
+                if (!initKindsAttr) {
+                    continue;
+                }
+                auto initStartsAttr = op.attr("initStart");
+                auto initLensAttr = op.attr("initLen");
+                auto initValuesAttr = op.attr("initValue");
+                const auto *initKinds = std::get_if<std::vector<std::string>>(&*initKindsAttr);
+                const auto *initStarts =
+                    initStartsAttr ? std::get_if<std::vector<int64_t>>(&*initStartsAttr) : nullptr;
+                const auto *initLens =
+                    initLensAttr ? std::get_if<std::vector<int64_t>>(&*initLensAttr) : nullptr;
+                const auto *initValues =
+                    initValuesAttr ? std::get_if<std::vector<std::string>>(&*initValuesAttr) : nullptr;
+                if (initKinds == nullptr || initStarts == nullptr || initLens == nullptr ||
+                    initKinds->size() != initStarts->size() || initKinds->size() != initLens->size()) {
+                    state.unsupportedOps.push_back("kMemory-init-metadata (" + sym + ")");
+                    continue;
+                }
+
+                for (std::size_t i = 0; i < initKinds->size(); ++i) {
+                    if ((*initKinds)[i] != "literal") {
+                        state.unsupportedOps.push_back("kMemory-init-kind (" + sym + ")");
+                        continue;
+                    }
+                    if (memory.width > 64) {
+                        state.unsupportedOps.push_back("kMemory-init-wide (" + sym + ")");
+                        continue;
+                    }
+
+                    const std::string literal =
+                        (initValues != nullptr && i < initValues->size()) ? (*initValues)[i] : "0";
+                    const std::string valueExpr =
+                        castScalarExprForWidth(convertVerilogConstant(literal), memory.width);
+                    const auto start = (*initStarts)[i];
+                    const auto len = (*initLens)[i];
+                    if (start < 0) {
+                        const std::string fillExpr =
+                            storageType + "(" + std::to_string(memory.rows) + ", " + valueExpr + ")";
+                        state.storageResetStmts.push_back(memory.storageName + " = " + fillExpr + ";");
+                        continue;
+                    }
+                    if (len <= 0) {
+                        state.unsupportedOps.push_back("kMemory-init-range (" + sym + ")");
+                        continue;
+                    }
+
+                    const auto clampedStart = std::min<std::int64_t>(start, memory.rows);
+                    const auto clampedEnd = std::min<std::int64_t>(start + len, memory.rows);
+                    if (clampedStart >= clampedEnd) {
+                        continue;
+                    }
+                    if (clampedEnd - clampedStart == 1) {
+                        state.storageResetStmts.push_back(
+                            memory.storageName + "[" + std::to_string(clampedStart) + "] = " + valueExpr + ";");
+                        continue;
+                    }
+                    state.storageResetStmts.push_back(
+                        "for (std::size_t __mem_idx = " + std::to_string(clampedStart) + "; __mem_idx < " +
+                        std::to_string(clampedEnd) + "; ++__mem_idx) { " + memory.storageName +
+                        "[__mem_idx] = " + valueExpr + "; }");
                 }
             }
         }
@@ -1672,6 +1846,7 @@ namespace wolvrix::lib::emit
         collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
         collectRegisters(*target->graph, state);
         collectLatches(*target->graph, state);
+        collectMemories(*target->graph, state);
 
         std::unordered_map<std::int64_t, wolvrix::lib::grh::OperationId> opIdByIndex;
         opIdByIndex.reserve(target->graph->operations().size());
