@@ -484,17 +484,34 @@ namespace wolvrix::lib::emit
                     }
                     std::int64_t totalWidth = 0;
                     bool widthKnown = true;
+                    bool hasWideOperand = false;
                     for (const auto operand : op.operands()) {
                         const auto value = graph.getValue(operand);
-                        if (value.width() <= 0 || value.width() > 64) {
+                        if (value.width() <= 0) {
                             widthKnown = false;
                             break;
                         }
+                        if (value.width() > 64) {
+                            hasWideOperand = true;
+                        }
                         totalWidth += value.width();
                     }
-                    if (!widthKnown || totalWidth > 64) {
+                    if (!widthKnown) {
                         std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
                         state.unsupportedOps.push_back("kConcat-wide (" + opName + ")");
+                        break;
+                    }
+
+                    if (totalWidth > 64 || hasWideOperand) {
+                        std::string expr = getOperandExpr(0);
+                        std::int64_t exprWidth = graph.getValue(op.operands()[0]).width();
+                        for (std::size_t i = 1; i < op.operands().size(); ++i) {
+                            const auto value = graph.getValue(op.operands()[i]);
+                            expr = "wolvrix_gsim_concat(" + expr + ", " + std::to_string(exprWidth) + ", " +
+                                   getOperandExpr(i) + ", " + std::to_string(value.width()) + ")";
+                            exprWidth += value.width();
+                        }
+                        setResultExpr(0, expr);
                         break;
                     }
 
@@ -1487,6 +1504,7 @@ namespace wolvrix::lib::emit
             os << "#include <map>\n";
             os << "#include <stdexcept>\n";
             os << "#include <string>\n";
+            os << "#include <type_traits>\n";
             os << "#include <vector>\n\n";
             os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_to_u64(\n";
             os << "    const std::vector<std::uint64_t>& value,\n";
@@ -1505,6 +1523,38 @@ namespace wolvrix::lib::emit
             os << "        const std::uint64_t word = wordIndex < value.size() ? value[wordIndex] : 0ULL;\n";
             os << "        result |= ((word >> bitOffset) & 1ULL) << offset;\n";
             os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n\n";
+            os << "template <typename T>\n";
+            os << "inline void wolvrix_gsim_store_bits(std::vector<std::uint64_t>& out, std::uint64_t bitOffset, const T& value, std::uint32_t width) {\n";
+            os << "    static_assert(std::is_integral_v<T> || std::is_enum_v<T>);\n";
+            os << "    const std::uint64_t word = static_cast<std::uint64_t>(value);\n";
+            os << "    const auto availableBits = std::min<std::uint32_t>(width, 64U);\n";
+            os << "    for (std::uint32_t i = 0; i < availableBits; ++i) {\n";
+            os << "        if (((word >> i) & 1ULL) == 0ULL) continue;\n";
+            os << "        const std::uint64_t absoluteBit = bitOffset + i;\n";
+            os << "        const auto wordIndex = static_cast<std::size_t>(absoluteBit / 64ULL);\n";
+            os << "        const auto bitInWord = static_cast<std::uint32_t>(absoluteBit % 64ULL);\n";
+            os << "        if (wordIndex < out.size()) out[wordIndex] |= (1ULL << bitInWord);\n";
+            os << "    }\n";
+            os << "}\n";
+            os << "inline void wolvrix_gsim_store_bits(std::vector<std::uint64_t>& out, std::uint64_t bitOffset, const std::vector<std::uint64_t>& value, std::uint32_t width) {\n";
+            os << "    for (std::uint32_t i = 0; i < width; ++i) {\n";
+            os << "        const auto srcWord = static_cast<std::size_t>(i / 64U);\n";
+            os << "        const auto srcBit = static_cast<std::uint32_t>(i % 64U);\n";
+            os << "        const std::uint64_t word = srcWord < value.size() ? value[srcWord] : 0ULL;\n";
+            os << "        if (((word >> srcBit) & 1ULL) == 0ULL) continue;\n";
+            os << "        const std::uint64_t absoluteBit = bitOffset + i;\n";
+            os << "        const auto dstWord = static_cast<std::size_t>(absoluteBit / 64ULL);\n";
+            os << "        const auto dstBit = static_cast<std::uint32_t>(absoluteBit % 64ULL);\n";
+            os << "        if (dstWord < out.size()) out[dstWord] |= (1ULL << dstBit);\n";
+            os << "    }\n";
+            os << "}\n";
+            os << "template <typename L, typename R>\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_concat(const L& lhs, std::uint32_t lhsWidth, const R& rhs, std::uint32_t rhsWidth) {\n";
+            os << "    std::vector<std::uint64_t> result((static_cast<std::uint64_t>(lhsWidth) + rhsWidth + 63ULL) / 64ULL, 0ULL);\n";
+            os << "    wolvrix_gsim_store_bits(result, 0ULL, rhs, rhsWidth);\n";
+            os << "    wolvrix_gsim_store_bits(result, rhsWidth, lhs, lhsWidth);\n";
             os << "    return result;\n";
             os << "}\n\n";
 

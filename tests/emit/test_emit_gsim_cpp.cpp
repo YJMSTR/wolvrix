@@ -713,6 +713,28 @@ Design buildWideMuxDesign()
     return design;
 }
 
+Design buildWideConcatDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto msb = makeValue(graph, "msb", 1, false);
+    const auto rest = makeValue(graph, "rest", 100, false);
+    graph.bindInputPort("msb", msb);
+    graph.bindInputPort("rest", rest);
+
+    const auto out = makeValue(graph, "y", 101, false);
+    graph.bindOutputPort("y", out);
+
+    const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("wide_concat_y"));
+    graph.addOperand(concat, msb);
+    graph.addOperand(concat, rest);
+    graph.addResult(concat, out);
+
+    return design;
+}
+
 Design buildThreeStageRegisterPipelineDesign()
 {
     Design design;
@@ -2101,6 +2123,55 @@ int main() {
     compileAndRunHarness(dir, "wide_vector_top", runner);
 }
 
+void testWideConcatCompileAndRun()
+{
+    Design design = buildWideConcatDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_concat_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_concat_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-concat fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-concat fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_concat_top.hpp");
+    expect(contains(header, "wolvrix_gsim_concat("),
+           "wide-concat fixture should use the concat helper for >64-bit outputs");
+
+    const std::string runner = R"CPP(
+#include "wide_concat_top.hpp"
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_msb(1);
+    sim.set_rest(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0x5ULL});
+    sim.step();
+    const auto out = sim.get_y();
+    if (out.size() != 2) {
+        return 1;
+    }
+    if (out[0] != 0x0123456789ABCDEFULL) {
+        return 2;
+    }
+    if (out[1] != (0x5ULL | (1ULL << 36))) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_concat_top", runner);
+}
+
 void testRegisterPipelineUsesNonBlockingSemantics()
 {
     Design design = buildThreeStageRegisterPipelineDesign();
@@ -2387,6 +2458,7 @@ int main()
         testWideBitDynamicSliceCompileAndRun();
         testWideNibbleDynamicSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
+        testWideConcatCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();
