@@ -10,6 +10,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <iomanip>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -22,6 +23,7 @@ namespace wolvrix::lib::emit
     {
         // Forward declaration
         std::string sanitizeIdentifier(std::string_view text);
+        std::string zeroInitializerForType(std::string_view cppType);
 
         struct MemoryInfo
         {
@@ -42,6 +44,7 @@ namespace wolvrix::lib::emit
             // Storage declarations: register/memory state variables
             std::vector<std::string> storageDecls;
             std::vector<std::string> storageResetStmts;
+            std::unordered_map<std::string, int32_t> storageWidths;
 
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
@@ -55,6 +58,8 @@ namespace wolvrix::lib::emit
             // Port declarations and accessors
             std::vector<std::pair<std::string, std::string>> inputPorts;  // (name, type)
             std::vector<std::pair<std::string, std::string>> outputPorts; // (name, type)
+            std::unordered_map<std::string, int32_t> inputPortWidths;
+            std::unordered_map<std::string, int32_t> outputPortWidths;
 
             // Track unsupported operations for error reporting
             std::vector<std::string> unsupportedOps;
@@ -118,7 +123,8 @@ namespace wolvrix::lib::emit
 
                 // GRH result ValueIds are unique and each defining operation is lowered once,
                 // so sharded temporaries do not need a duplicate-declaration scan here.
-                storageDecls.push_back(cppType + " " + varName + " = 0;");
+                storageDecls.push_back("[[maybe_unused]] " + cppType + " " + varName + " = " +
+                                       zeroInitializerForType(cppType) + ";");
 
                 std::string assignment = varName + " = " + expr + ";";
                 ensureShardSpace(static_cast<int>(assignment.length()));
@@ -152,10 +158,11 @@ namespace wolvrix::lib::emit
                 case 'h': // Hexadecimal
                     return "0x" + value;
                 case 'b': // Binary
-                    // Convert binary to hex for readability
                     try {
-                        unsigned long val = std::stoul(value, nullptr, 2);
-                        return std::to_string(val);
+                        unsigned long long val = std::stoull(value, nullptr, 2);
+                        std::ostringstream oss;
+                        oss << "0x" << std::hex << std::uppercase << val << "ULL";
+                        return oss.str();
                     } catch (...) {
                         return "0";
                     }
@@ -163,8 +170,10 @@ namespace wolvrix::lib::emit
                     return value;
                 case 'o': // Octal
                     try {
-                        unsigned long val = std::stoul(value, nullptr, 8);
-                        return std::to_string(val);
+                        unsigned long long val = std::stoull(value, nullptr, 8);
+                        std::ostringstream oss;
+                        oss << "0x" << std::hex << std::uppercase << val << "ULL";
+                        return oss.str();
                     } catch (...) {
                         return "0";
                     }
@@ -361,7 +370,19 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kAdd: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " + " + getOperandExpr(1) + ")");
+                    const auto lhsWidth = graph.getValue(op.operands()[0]).width();
+                    const auto rhsWidth = graph.getValue(op.operands()[1]).width();
+                    const auto resultWidth = op.results().empty() ? std::max(lhsWidth, rhsWidth)
+                                                                  : graph.getValue(op.results()[0]).width();
+                    if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "wolvrix_gsim_add(" + getOperandExpr(0) + ", " + getOperandExpr(1) + ")");
+                    }
+                    else
+                    {
+                        setResultExpr(0, "(" + getOperandExpr(0) + " + " + getOperandExpr(1) + ")");
+                    }
                     break;
                 }
 
@@ -381,17 +402,56 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kAnd: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " & " + getOperandExpr(1) + ")");
+                    const auto lhsWidth = graph.getValue(op.operands()[0]).width();
+                    const auto rhsWidth = graph.getValue(op.operands()[1]).width();
+                    const auto resultWidth = op.results().empty() ? std::max(lhsWidth, rhsWidth)
+                                                                  : graph.getValue(op.results()[0]).width();
+                    if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "wolvrix_gsim_bitwise_and(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                          ")");
+                    }
+                    else
+                    {
+                        setResultExpr(0, "(" + getOperandExpr(0) + " & " + getOperandExpr(1) + ")");
+                    }
                     break;
                 }
 
                 case OperationKind::kOr: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " | " + getOperandExpr(1) + ")");
+                    const auto lhsWidth = graph.getValue(op.operands()[0]).width();
+                    const auto rhsWidth = graph.getValue(op.operands()[1]).width();
+                    const auto resultWidth = op.results().empty() ? std::max(lhsWidth, rhsWidth)
+                                                                  : graph.getValue(op.results()[0]).width();
+                    if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "wolvrix_gsim_bitwise_or(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                          ")");
+                    }
+                    else
+                    {
+                        setResultExpr(0, "(" + getOperandExpr(0) + " | " + getOperandExpr(1) + ")");
+                    }
                     break;
                 }
 
                 case OperationKind::kXor: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + ")");
+                    const auto lhsWidth = graph.getValue(op.operands()[0]).width();
+                    const auto rhsWidth = graph.getValue(op.operands()[1]).width();
+                    const auto resultWidth = op.results().empty() ? std::max(lhsWidth, rhsWidth)
+                                                                  : graph.getValue(op.results()[0]).width();
+                    if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "wolvrix_gsim_bitwise_xor(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                          ")");
+                    }
+                    else
+                    {
+                        setResultExpr(0, "(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + ")");
+                    }
                     break;
                 }
 
@@ -421,17 +481,52 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kReduceAnd: {
-                    setResultExpr(0, "((" + getOperandExpr(0) + " == " + generateMask(graph.getValue(op.operands()[0]).width()) + ") ? 1U : 0U)");
+                    const auto operandWidth = graph.getValue(op.operands()[0]).width();
+                    if (operandWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "(wolvrix_gsim_reduce_and(" + getOperandExpr(0) + ", " +
+                                          std::to_string(operandWidth) + ") ? 1U : 0U)");
+                    }
+                    else
+                    {
+                        setResultExpr(
+                            0,
+                            "((" + getOperandExpr(0) + " == " + generateMask(operandWidth) + ") ? 1U : 0U)");
+                    }
                     break;
                 }
 
                 case OperationKind::kReduceOr: {
-                    setResultExpr(0, "((" + getOperandExpr(0) + " != 0) ? 1U : 0U)");
+                    const auto operandWidth = graph.getValue(op.operands()[0]).width();
+                    if (operandWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "(wolvrix_gsim_reduce_or(" + getOperandExpr(0) + ", " +
+                                          std::to_string(operandWidth) + ") ? 1U : 0U)");
+                    }
+                    else
+                    {
+                        setResultExpr(0, "((" + getOperandExpr(0) + " != 0) ? 1U : 0U)");
+                    }
                     break;
                 }
 
                 case OperationKind::kReduceXor: {
-                    setResultExpr(0, "(static_cast<unsigned>(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + "))))");
+                    const auto operandWidth = graph.getValue(op.operands()[0]).width();
+                    if (operandWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "(wolvrix_gsim_reduce_xor(" + getOperandExpr(0) + ", " +
+                                          std::to_string(operandWidth) + ") ? 1U : 0U)");
+                    }
+                    else
+                    {
+                        setResultExpr(
+                            0,
+                            "(static_cast<unsigned>(__builtin_parityll(static_cast<unsigned long long>(" +
+                                getOperandExpr(0) + "))))");
+                    }
                     break;
                 }
 
@@ -464,7 +559,17 @@ namespace wolvrix::lib::emit
                     if (!op.results().empty())
                     {
                         const auto resultValue = graph.getValue(op.results()[0]);
-                        setResultExpr(0, maskExprForWidth("(~" + getOperandExpr(0) + ")", resultValue.width()));
+                        if (resultValue.width() > 64)
+                        {
+                            setResultExpr(
+                                0,
+                                "wolvrix_gsim_bitwise_not(" + getOperandExpr(0) + ", " +
+                                    std::to_string(resultValue.width()) + ")");
+                        }
+                        else
+                        {
+                            setResultExpr(0, maskExprForWidth("(~" + getOperandExpr(0) + ")", resultValue.width()));
+                        }
                     }
                     break;
                 }
@@ -533,8 +638,9 @@ namespace wolvrix::lib::emit
                     std::string expr = getOperandExpr(0);
                     for (std::size_t i = 1; i < op.operands().size(); ++i) {
                         const auto value = graph.getValue(op.operands()[i]);
-                        expr = "((" + expr + " << " + std::to_string(value.width()) + ") | (" +
-                               getOperandExpr(i) + " & " + generateMask(value.width()) + "))";
+                        expr = "((static_cast<std::uint64_t>(" + expr + ") << " +
+                               std::to_string(value.width()) + ") | (static_cast<std::uint64_t>(" +
+                               getOperandExpr(i) + ") & " + generateMask(value.width()) + "))";
                     }
                     setResultExpr(0, expr);
                     break;
@@ -547,7 +653,7 @@ namespace wolvrix::lib::emit
 
                     auto sliceWidthAttr = op.attr("sliceWidth");
                     auto *sliceWidth = sliceWidthAttr ? std::get_if<int64_t>(&*sliceWidthAttr) : nullptr;
-                    if (sliceWidth == nullptr || *sliceWidth <= 0 || *sliceWidth > 64) {
+                    if (sliceWidth == nullptr || *sliceWidth <= 0) {
                         std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
                         state.unsupportedOps.push_back("kSliceDynamic-width (" + opName + ")");
                         break;
@@ -569,6 +675,14 @@ namespace wolvrix::lib::emit
                     const std::string rawIndexExpr = getOperandExpr(1);
                     const std::string indexExpr =
                         "static_cast<std::uint64_t>(" + rawIndexExpr + ")";
+                    if (operandWidth > 64 && *sliceWidth > 64) {
+                        setResultExpr(0,
+                                      "wolvrix_gsim_slice_dynamic_to_bits(" + getOperandExpr(0) + ", " + indexExpr +
+                                          ", " + std::to_string(*sliceWidth) + ", " +
+                                          std::to_string(operandWidth) + ")");
+                        break;
+                    }
+
                     if (operandWidth > 64) {
                         const std::string slicedExpr =
                             "wolvrix_gsim_slice_dynamic_to_u64(" + getOperandExpr(0) + ", " + indexExpr + ", " +
@@ -603,9 +717,29 @@ namespace wolvrix::lib::emit
                     const auto baseValue = graph.getValue(op.operands()[0]);
                     const auto operandWidth = baseValue.width();
                     const auto sliceWidth = *sliceEnd - *sliceStart + 1;
-                    if (operandWidth <= 0 || operandWidth > 64 || *sliceEnd >= operandWidth || sliceWidth <= 0 || sliceWidth > 64) {
+                    if (operandWidth <= 0 || *sliceEnd >= operandWidth || sliceWidth <= 0) {
                         std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
                         state.unsupportedOps.push_back("kSliceStatic-wide (" + opName + ")");
+                        break;
+                    }
+
+                    if (operandWidth > 64 && sliceWidth > 64)
+                    {
+                        setResultExpr(0,
+                                      "wolvrix_gsim_slice_dynamic_to_bits(" + getOperandExpr(0) + ", " +
+                                          std::to_string(*sliceStart) + "ULL, " +
+                                          std::to_string(sliceWidth) + ", " +
+                                          std::to_string(operandWidth) + ")");
+                        break;
+                    }
+
+                    if (operandWidth > 64)
+                    {
+                        const std::string slicedExpr =
+                            "wolvrix_gsim_slice_dynamic_to_u64(" + getOperandExpr(0) + ", " +
+                            std::to_string(*sliceStart) + "ULL, " + std::to_string(sliceWidth) + ", " +
+                            std::to_string(operandWidth) + ")";
+                        setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(sliceWidth)));
                         break;
                     }
 
@@ -735,6 +869,70 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kMemoryWritePort: {
+                    if (op.operands().size() < 5) {
+                        break;
+                    }
+
+                    auto memSymAttr = op.attr("memSymbol");
+                    std::string sym;
+                    if (memSymAttr) {
+                        if (auto *attrSym = std::get_if<std::string>(&*memSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
+                    const auto memoryIt = state.memories.find(sym);
+                    if (memoryIt == state.memories.end()) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kMemoryWritePort-unresolved (" + opName + ")");
+                        break;
+                    }
+
+                    auto eventEdgeAttr = op.attr("eventEdge");
+                    std::string eventEdge = "posedge";
+                    if (eventEdgeAttr) {
+                        if (auto *edges = std::get_if<std::vector<std::string>>(&*eventEdgeAttr)) {
+                            if (!edges->empty() && !(*edges)[0].empty()) {
+                                eventEdge = (*edges)[0];
+                            }
+                        }
+                    }
+
+                    const auto eventValue = graph.getValue(op.operands()[4]);
+                    std::string clockSymbol = eventValue.symbolText().empty()
+                                                  ? "clock"
+                                                  : std::string(eventValue.symbolText());
+                    const std::string domainKey = eventEdge + ":" + clockSymbol;
+                    const std::string clockExpr = getOperandExpr(4);
+                    if (clockExpr != "0" && !clockExpr.empty()) {
+                        state.sequentialClockExprs.try_emplace(domainKey, clockExpr);
+                    }
+
+                    const auto &memory = memoryIt->second;
+                    const std::string condition = getOperandExpr(0);
+                    const std::string indexExpr =
+                        "static_cast<std::size_t>(static_cast<std::uint64_t>(" + getOperandExpr(1) + "))";
+                    const std::string dataExpr = getOperandExpr(2);
+                    const std::string maskExpr = getOperandExpr(3);
+                    std::string writeExpr;
+                    if (memory.width > 64) {
+                        writeExpr = memory.storageName + "[__mem_idx] = wolvrix_gsim_mask_merge(" +
+                                    memory.storageName + "[__mem_idx], " + dataExpr + ", " + maskExpr + ");";
+                    } else if (maskExpr != "0") {
+                        writeExpr = memory.storageName + "[__mem_idx] = (" + memory.storageName +
+                                    "[__mem_idx] & ~" + maskExpr + ") | (" + dataExpr + " & " + maskExpr + ");";
+                    } else {
+                        writeExpr = memory.storageName + "[__mem_idx] = " + dataExpr + ";";
+                    }
+                    state.sequentialStmts[domainKey].push_back(
+                        "        if (" + condition + ") { const auto __mem_idx = " + indexExpr + "; if (__mem_idx < " +
+                        memory.storageName + ".size()) { " + writeExpr + " committed_ = true; } }");
+                    break;
+                }
+
                 case OperationKind::kLatchWritePort: {
                     if (op.operands().size() < 3) {
                         break;
@@ -759,10 +957,20 @@ namespace wolvrix::lib::emit
                     const std::string nextValue = getOperandExpr(1);
                     const std::string mask = getOperandExpr(2);
 
+                    const auto latchWidthIt = state.storageWidths.find(latchName);
+                    const bool wideLatch = latchWidthIt != state.storageWidths.end() && latchWidthIt->second > 64;
+
                     if (mask != "0") {
-                        state.latchStmts.push_back(
-                            "        if (" + condition + ") { " + latchName + " = (" + latchName +
-                            " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
+                        if (wideLatch) {
+                            state.latchStmts.push_back(
+                                "        if (" + condition + ") { " + latchName +
+                                " = wolvrix_gsim_mask_merge(" + latchName + ", " + nextValue + ", " + mask +
+                                "); }");
+                        } else {
+                            state.latchStmts.push_back(
+                                "        if (" + condition + ") { " + latchName + " = (" + latchName +
+                                " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
+                        }
                     } else {
                         state.latchStmts.push_back(
                             "        if (" + condition + ") { " + latchName + " = " + nextValue + "; }");
@@ -834,9 +1042,20 @@ namespace wolvrix::lib::emit
                         if (std::find(domainRegs.begin(), domainRegs.end(), regName) == domainRegs.end()) {
                             domainRegs.push_back(regName);
                         }
+                        const auto regWidthIt = state.storageWidths.find(regName);
+                        const bool wideReg = regWidthIt != state.storageWidths.end() && regWidthIt->second > 64;
                         if (mask != "0") {
-                            state.sequentialStmts[domainKey].push_back(
-                                "        if (" + condition + ") { next_" + regName + " = (" + regName + " & ~" + mask + ") | (" + nextValue + " & " + mask + "); committed_ = true; }");
+                            if (wideReg) {
+                                state.sequentialStmts[domainKey].push_back(
+                                    "        if (" + condition + ") { next_" + regName +
+                                    " = wolvrix_gsim_mask_merge(" + regName + ", " + nextValue + ", " + mask +
+                                    "); committed_ = true; }");
+                            } else {
+                                state.sequentialStmts[domainKey].push_back(
+                                    "        if (" + condition + ") { next_" + regName + " = (" + regName +
+                                    " & ~" + mask + ") | (" + nextValue + " & " + mask +
+                                    "); committed_ = true; }");
+                            }
                         } else {
                             state.sequentialStmts[domainKey].push_back(
                                 "        if (" + condition + ") { next_" + regName + " = " + nextValue + "; committed_ = true; }");
@@ -911,6 +1130,7 @@ namespace wolvrix::lib::emit
                 auto value = graph.getValue(port.value);
                 std::string type = getCppTypeForWidth(value.width());
                 state.inputPorts.push_back({port.name, type});
+                state.inputPortWidths.emplace(port.name, value.width());
                 // Seed input port values into CodegenState as variable names
                 std::string portVar = "input_" + sanitizeIdentifier(port.name) + "_";
                 state.valueVars[port.value] = portVar;
@@ -920,6 +1140,7 @@ namespace wolvrix::lib::emit
                 auto value = graph.getValue(port.value);
                 std::string type = getCppTypeForWidth(value.width());
                 state.outputPorts.push_back({port.name, type});
+                state.outputPortWidths.emplace(port.name, value.width());
                 state.outputPortValues.emplace(port.value, std::make_pair(port.name, type));
             }
 
@@ -951,16 +1172,23 @@ namespace wolvrix::lib::emit
                     }
                     std::string regName = "reg_" + sanitizeIdentifier(sym);
 
-                    // Get width from result value
                     int32_t width = 32; // Default width
+                    if (auto widthAttr = op.attr("width")) {
+                        if (auto *attrWidth = std::get_if<int64_t>(&*widthAttr)) {
+                            width = static_cast<int32_t>(*attrWidth);
+                        }
+                    }
                     if (!op.results().empty()) {
                         auto val = graph.getValue(op.results()[0]);
-                        width = val.width();
+                        if (val.width() > 0) {
+                            width = val.width();
+                        }
                     }
                     std::string type = getCppTypeForWidth(width);
                     const std::string zeroInit = zeroInitializerForType(type);
                     state.storageDecls.push_back(type + " " + regName + " = " + zeroInit + ";");
                     state.storageResetStmts.push_back(regName + " = " + zeroInit + ";");
+                    state.storageWidths[regName] = width;
 
                     // Also create a mapping from the register's result ValueId to the register name
                     if (!op.results().empty()) {
@@ -1004,6 +1232,7 @@ namespace wolvrix::lib::emit
                     const std::string zeroInit = zeroInitializerForType(type);
                     state.storageDecls.push_back(type + " " + latchName + " = " + zeroInit + ";");
                     state.storageResetStmts.push_back(latchName + " = " + zeroInit + ";");
+                    state.storageWidths[latchName] = width;
                 }
             }
         }
@@ -1556,6 +1785,7 @@ namespace wolvrix::lib::emit
             const std::string structName = "GsimMetadata_" + ns;
 
             os << "#pragma once\n\n";
+            os << "#include <algorithm>\n";
             os << "#include <cstdint>\n";
             os << "#include <map>\n";
             os << "#include <stdexcept>\n";
@@ -1578,6 +1808,141 @@ namespace wolvrix::lib::emit
             os << "        const auto bitOffset = static_cast<std::uint32_t>(absoluteBit % 64ULL);\n";
             os << "        const std::uint64_t word = wordIndex < value.size() ? value[wordIndex] : 0ULL;\n";
             os << "        result |= ((word >> bitOffset) & 1ULL) << offset;\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_slice_dynamic_to_bits(\n";
+            os << "    const std::vector<std::uint64_t>& value,\n";
+            os << "    std::uint64_t bitIndex,\n";
+            os << "    std::uint32_t sliceWidth,\n";
+            os << "    std::uint32_t operandWidth) {\n";
+            os << "    std::vector<std::uint64_t> result((sliceWidth + 63U) / 64U, 0ULL);\n";
+            os << "    if (sliceWidth == 0 || bitIndex >= operandWidth) {\n";
+            os << "        return result;\n";
+            os << "    }\n";
+            os << "    const auto availableBits = std::min<std::uint64_t>(sliceWidth, operandWidth - bitIndex);\n";
+            os << "    for (std::uint64_t offset = 0; offset < availableBits; ++offset) {\n";
+            os << "        const std::uint64_t absoluteBit = bitIndex + offset;\n";
+            os << "        const auto wordIndex = static_cast<std::size_t>(absoluteBit / 64ULL);\n";
+            os << "        const auto bitOffset = static_cast<std::uint32_t>(absoluteBit % 64ULL);\n";
+            os << "        const std::uint64_t word = wordIndex < value.size() ? value[wordIndex] : 0ULL;\n";
+            os << "        if (((word >> bitOffset) & 1ULL) != 0ULL) {\n";
+            os << "            result[static_cast<std::size_t>(offset / 64ULL)] |=\n";
+            os << "                (1ULL << static_cast<std::uint32_t>(offset % 64ULL));\n";
+            os << "        }\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n\n";
+            os << "inline unsigned wolvrix_gsim_reduce_or(const std::vector<std::uint64_t>& value, std::uint32_t width) {\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        std::uint64_t word = i < value.size() ? value[i] : 0ULL;\n";
+            os << "        if (i + 1 == wordCount && (width % 64U) != 0U) {\n";
+            os << "            word &= ((1ULL << (width % 64U)) - 1ULL);\n";
+            os << "        }\n";
+            os << "        if (word != 0ULL) return 1U;\n";
+            os << "    }\n";
+            os << "    return 0U;\n";
+            os << "}\n";
+            os << "inline unsigned wolvrix_gsim_reduce_and(const std::vector<std::uint64_t>& value, std::uint32_t width) {\n";
+            os << "    if (width == 0U) return 0U;\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t expected = (i + 1 == wordCount && (width % 64U) != 0U)\n";
+            os << "            ? ((1ULL << (width % 64U)) - 1ULL)\n";
+            os << "            : ~0ULL;\n";
+            os << "        const std::uint64_t word = i < value.size() ? value[i] : 0ULL;\n";
+            os << "        if ((word & expected) != expected) return 0U;\n";
+            os << "    }\n";
+            os << "    return 1U;\n";
+            os << "}\n";
+            os << "inline unsigned wolvrix_gsim_reduce_xor(const std::vector<std::uint64_t>& value, std::uint32_t width) {\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    unsigned parity = 0U;\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        std::uint64_t word = i < value.size() ? value[i] : 0ULL;\n";
+            os << "        if (i + 1 == wordCount && (width % 64U) != 0U) {\n";
+            os << "            word &= ((1ULL << (width % 64U)) - 1ULL);\n";
+            os << "        }\n";
+            os << "        parity ^= static_cast<unsigned>(__builtin_parityll(word));\n";
+            os << "    }\n";
+            os << "    return parity & 1U;\n";
+            os << "}\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_mask_merge(\n";
+            os << "    const std::vector<std::uint64_t>& current,\n";
+            os << "    const std::vector<std::uint64_t>& next,\n";
+            os << "    const std::vector<std::uint64_t>& mask) {\n";
+            os << "    const auto wordCount = std::max(current.size(), std::max(next.size(), mask.size()));\n";
+            os << "    std::vector<std::uint64_t> result(wordCount, 0ULL);\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t currWord = i < current.size() ? current[i] : 0ULL;\n";
+            os << "        const std::uint64_t nextWord = i < next.size() ? next[i] : 0ULL;\n";
+            os << "        const std::uint64_t maskWord = i < mask.size() ? mask[i] : 0ULL;\n";
+            os << "        result[i] = (currWord & ~maskWord) | (nextWord & maskWord);\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_and(\n";
+            os << "    const std::vector<std::uint64_t>& lhs,\n";
+            os << "    const std::vector<std::uint64_t>& rhs) {\n";
+            os << "    const auto wordCount = std::max(lhs.size(), rhs.size());\n";
+            os << "    std::vector<std::uint64_t> result(wordCount, 0ULL);\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t lhsWord = i < lhs.size() ? lhs[i] : 0ULL;\n";
+            os << "        const std::uint64_t rhsWord = i < rhs.size() ? rhs[i] : 0ULL;\n";
+            os << "        result[i] = lhsWord & rhsWord;\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_or(\n";
+            os << "    const std::vector<std::uint64_t>& lhs,\n";
+            os << "    const std::vector<std::uint64_t>& rhs) {\n";
+            os << "    const auto wordCount = std::max(lhs.size(), rhs.size());\n";
+            os << "    std::vector<std::uint64_t> result(wordCount, 0ULL);\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t lhsWord = i < lhs.size() ? lhs[i] : 0ULL;\n";
+            os << "        const std::uint64_t rhsWord = i < rhs.size() ? rhs[i] : 0ULL;\n";
+            os << "        result[i] = lhsWord | rhsWord;\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_xor(\n";
+            os << "    const std::vector<std::uint64_t>& lhs,\n";
+            os << "    const std::vector<std::uint64_t>& rhs) {\n";
+            os << "    const auto wordCount = std::max(lhs.size(), rhs.size());\n";
+            os << "    std::vector<std::uint64_t> result(wordCount, 0ULL);\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t lhsWord = i < lhs.size() ? lhs[i] : 0ULL;\n";
+            os << "        const std::uint64_t rhsWord = i < rhs.size() ? rhs[i] : 0ULL;\n";
+            os << "        result[i] = lhsWord ^ rhsWord;\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_not(\n";
+            os << "    const std::vector<std::uint64_t>& value,\n";
+            os << "    std::uint32_t width) {\n";
+            os << "    std::vector<std::uint64_t> result = value;\n";
+            os << "    for (auto& word : result) {\n";
+            os << "        word = ~word;\n";
+            os << "    }\n";
+            os << "    if (!result.empty() && (width % 64U) != 0U) {\n";
+            os << "        result.back() &= ((1ULL << (width % 64U)) - 1ULL);\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_add(\n";
+            os << "    const std::vector<std::uint64_t>& lhs,\n";
+            os << "    const std::vector<std::uint64_t>& rhs) {\n";
+            os << "    const auto wordCount = std::max(lhs.size(), rhs.size());\n";
+            os << "    std::vector<std::uint64_t> result(wordCount, 0ULL);\n";
+            os << "    std::uint64_t carry = 0ULL;\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t lhsWord = i < lhs.size() ? lhs[i] : 0ULL;\n";
+            os << "        const std::uint64_t rhsWord = i < rhs.size() ? rhs[i] : 0ULL;\n";
+            os << "        const std::uint64_t partial = lhsWord + carry;\n";
+            os << "        const std::uint64_t sum = partial + rhsWord;\n";
+            os << "        carry = (partial < lhsWord || sum < partial) ? 1ULL : 0ULL;\n";
+            os << "        result[i] = sum;\n";
             os << "    }\n";
             os << "    return result;\n";
             os << "}\n\n";
@@ -1628,15 +1993,19 @@ namespace wolvrix::lib::emit
                 os << "        " << stmt << "\n";
             }
             for (const auto& [name, type] : state.outputPorts) {
-                (void)type;
-                os << "        output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForType(type) << ";\n";
+                const auto widthIt = state.outputPortWidths.find(name);
+                const int32_t width = widthIt != state.outputPortWidths.end() ? widthIt->second : 0;
+                os << "        output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
             }
+            std::set<std::string> resetClockNames;
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
                 if (parsedDomain) {
                     const std::string resetClock =
                         resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                    os << "        prev_" << resetClock << "_ = false;\n";
+                    if (resetClockNames.insert(resetClock).second) {
+                        os << "        prev_" << resetClock << "_ = false;\n";
+                    }
                 }
             }
             os << "    }\n\n";
@@ -1765,12 +2134,16 @@ namespace wolvrix::lib::emit
 
             // Input port storage
             for (const auto& [name, type] : state.inputPorts) {
-                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForType(type) << ";\n";
+                const auto widthIt = state.inputPortWidths.find(name);
+                const int32_t width = widthIt != state.inputPortWidths.end() ? widthIt->second : 0;
+                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
             }
 
             // Output port storage
             for (const auto& [name, type] : state.outputPorts) {
-                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForType(type) << ";\n";
+                const auto widthIt = state.outputPortWidths.find(name);
+                const int32_t width = widthIt != state.outputPortWidths.end() ? widthIt->second : 0;
+                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
             }
 
             // Register storage
@@ -1785,12 +2158,15 @@ namespace wolvrix::lib::emit
             os << "    unsigned perf_dump_ = 0;\n";
             os << "    std::uint64_t log_begin_ = 0;\n";
             os << "    std::uint64_t log_end_ = 0;\n";
+            std::set<std::string> prevClockNames;
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
                 if (parsedDomain) {
                     const std::string prevClockName =
                         resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                    os << "    bool prev_" << prevClockName << "_ = false;\n";
+                    if (prevClockNames.insert(prevClockName).second) {
+                        os << "    bool prev_" << prevClockName << "_ = false;\n";
+                    }
                 }
             }
 
@@ -2099,9 +2475,12 @@ namespace wolvrix::lib::emit
         state.maxShardSize = parsePositiveIntAttr(options, "behavior_shard_max_bytes", state.maxShardSize);
         const bool emitMetadata = attrEnabled(options, "emit_metadata", true);
 
-        // Determine if sharding should be enabled based on operation count
-        // For large designs (>1000 operations), enable sharding to improve compile times
-        state.enableSharding = metadata->opCount > 1000;
+        // Determine if sharding should be enabled based on operation count.
+        // HDLBits contains medium-size graphs that still explode into giant inline
+        // expressions well below XiangShan scale, so keep the threshold low enough
+        // to materialize those graphs into sched shards before C++ compile time or
+        // emitted file size becomes pathological.
+        state.enableSharding = metadata->opCount > 128;
 
         collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
         collectRegisters(*target->graph, state);

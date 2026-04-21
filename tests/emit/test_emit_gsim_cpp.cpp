@@ -50,6 +50,18 @@ bool contains(std::string_view text, std::string_view needle)
     return text.find(needle) != std::string_view::npos;
 }
 
+std::size_t countOccurrences(std::string_view text, std::string_view needle)
+{
+    std::size_t count = 0;
+    std::size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string_view::npos)
+    {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
+
 ValueId makeValue(Graph &graph,
                   const std::string &name,
                   int32_t width = 1,
@@ -160,6 +172,27 @@ ValueId makeMemoryRead(Graph &graph,
     return value;
 }
 
+OperationId makeMemoryWrite(Graph &graph,
+                            const std::string &opName,
+                            ValueId updateCond,
+                            ValueId addr,
+                            ValueId data,
+                            ValueId maskValue,
+                            ValueId clk,
+                            const std::string &memSymbol)
+{
+    const auto op = graph.createOperation(OperationKind::kMemoryWritePort,
+                                          graph.internSymbol(opName));
+    graph.addOperand(op, updateCond);
+    graph.addOperand(op, addr);
+    graph.addOperand(op, data);
+    graph.addOperand(op, maskValue);
+    graph.addOperand(op, clk);
+    graph.setAttr(op, "memSymbol", memSymbol);
+    graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+    return op;
+}
+
 OperationId makeRegisterWrite(Graph &graph,
                               const std::string &opName,
                               ValueId updateCond,
@@ -177,6 +210,27 @@ OperationId makeRegisterWrite(Graph &graph,
     graph.setAttr(op, "regSymbol", regSymbol);
     graph.setAttr(op, "clockSymbol", std::string("clk"));
     graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+    return op;
+}
+
+OperationId makeRegisterWriteWithEdge(Graph &graph,
+                                      const std::string &opName,
+                                      ValueId updateCond,
+                                      ValueId nextValue,
+                                      ValueId maskValue,
+                                      ValueId clk,
+                                      const std::string &regSymbol,
+                                      const std::string &edge)
+{
+    const auto op = graph.createOperation(OperationKind::kRegisterWritePort,
+                                          graph.internSymbol(opName));
+    graph.addOperand(op, updateCond);
+    graph.addOperand(op, nextValue);
+    graph.addOperand(op, maskValue);
+    graph.addOperand(op, clk);
+    graph.setAttr(op, "regSymbol", regSymbol);
+    graph.setAttr(op, "clockSymbol", std::string("clk"));
+    graph.setAttr(op, "eventEdge", std::vector<std::string>{edge});
     return op;
 }
 
@@ -345,6 +399,31 @@ Design buildMemoryReadDesign()
     (void)makeMemory(graph, 8, 4, "mem0");
     const auto data = makeMemoryRead(graph, "data", "mem0_read", 8, addr, "mem0");
     graph.bindOutputPort("data", data);
+
+    return design;
+}
+
+Design buildMemoryWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto wen = makeValue(graph, "wen", 1, false);
+    const auto addr = makeValue(graph, "addr", 2, false);
+    const auto data = makeValue(graph, "data", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("wen", wen);
+    graph.bindInputPort("addr", addr);
+    graph.bindInputPort("data", data);
+
+    (void)makeMemory(graph, 8, 4, "mem0");
+    const auto read = makeMemoryRead(graph, "read_data", "read_data_op", 8, addr, "mem0");
+    graph.bindOutputPort("q", read);
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeMemoryWrite(graph, "write_port", wen, addr, data, mask, clk, "mem0");
 
     return design;
 }
@@ -635,6 +714,50 @@ Design buildWideNibbleSliceDynamicDesign()
     return design;
 }
 
+Design buildWideVectorSliceDynamicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 130, false);
+    const auto index = makeValue(graph, "index", 8, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("index", index);
+
+    const auto out = makeValue(graph, "out", 70, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("wide_vector_slice"));
+    graph.addOperand(slice, in);
+    graph.addOperand(slice, index);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(70));
+
+    return design;
+}
+
+Design buildWideStaticSliceDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 130, false);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "out", 70, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("wide_static_slice"));
+    graph.addOperand(slice, in);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceStart", static_cast<int64_t>(5));
+    graph.setAttr(slice, "sliceEnd", static_cast<int64_t>(74));
+
+    return design;
+}
+
 Design buildNoCommitStatefulOutputDesign()
 {
     Design design;
@@ -735,6 +858,108 @@ Design buildWideConcatDesign()
     return design;
 }
 
+Design buildWideBitwiseDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto a = makeValue(graph, "a", 100, false);
+    const auto b = makeValue(graph, "b", 100, false);
+    graph.bindInputPort("a", a);
+    graph.bindInputPort("b", b);
+
+    const auto outAnd = makeValue(graph, "and_y", 100, false);
+    const auto outOr = makeValue(graph, "or_y", 100, false);
+    const auto outXor = makeValue(graph, "xor_y", 100, false);
+    graph.bindOutputPort("and_y", outAnd);
+    graph.bindOutputPort("or_y", outOr);
+    graph.bindOutputPort("xor_y", outXor);
+
+    const auto andOp = graph.createOperation(OperationKind::kAnd, graph.internSymbol("wide_and_y"));
+    graph.addOperand(andOp, a);
+    graph.addOperand(andOp, b);
+    graph.addResult(andOp, outAnd);
+
+    const auto orOp = graph.createOperation(OperationKind::kOr, graph.internSymbol("wide_or_y"));
+    graph.addOperand(orOp, a);
+    graph.addOperand(orOp, b);
+    graph.addResult(orOp, outOr);
+
+    const auto xorOp = graph.createOperation(OperationKind::kXor, graph.internSymbol("wide_xor_y"));
+    graph.addOperand(xorOp, a);
+    graph.addOperand(xorOp, b);
+    graph.addResult(xorOp, outXor);
+
+    return design;
+}
+
+Design buildWideAdderSplitDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto a = makeValue(graph, "a", 100, false);
+    const auto b = makeValue(graph, "b", 100, false);
+    const auto cin = makeValue(graph, "cin", 1, false);
+    graph.bindInputPort("a", a);
+    graph.bindInputPort("b", b);
+    graph.bindInputPort("cin", cin);
+
+    const auto aExt = makeValue(graph, "a_ext", 101, false);
+    const auto bExt = makeValue(graph, "b_ext", 101, false);
+    const auto cinExt = makeValue(graph, "cin_ext", 101, false);
+    const auto sumWide = makeValue(graph, "sum_wide", 101, false);
+    const auto sum = makeValue(graph, "sum", 100, false);
+    const auto cout = makeValue(graph, "cout", 1, false);
+    graph.bindOutputPort("sum", sum);
+    graph.bindOutputPort("cout", cout);
+
+    const auto aConcat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("a_ext_op"));
+    const auto zeroA = makeConstant(graph, "zero_a", "zero_a_const", 1, "1'b0");
+    graph.addOperand(aConcat, zeroA);
+    graph.addOperand(aConcat, a);
+    graph.addResult(aConcat, aExt);
+
+    const auto bConcat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("b_ext_op"));
+    const auto zeroB = makeConstant(graph, "zero_b", "zero_b_const", 1, "1'b0");
+    graph.addOperand(bConcat, zeroB);
+    graph.addOperand(bConcat, b);
+    graph.addResult(bConcat, bExt);
+
+    const auto cinConcat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("cin_ext_op"));
+    const auto zeroCin = makeConstant(graph, "zero_cin", "zero_cin_const", 100, "100'd0");
+    graph.addOperand(cinConcat, zeroCin);
+    graph.addOperand(cinConcat, cin);
+    graph.addResult(cinConcat, cinExt);
+
+    const auto add0 = graph.createOperation(OperationKind::kAdd, graph.internSymbol("sum_ab_op"));
+    graph.addOperand(add0, aExt);
+    graph.addOperand(add0, bExt);
+    graph.addResult(add0, sumWide);
+
+    const auto sumWithCin = makeValue(graph, "sum_with_cin", 101, false);
+    const auto add1 = graph.createOperation(OperationKind::kAdd, graph.internSymbol("sum_with_cin_op"));
+    graph.addOperand(add1, sumWide);
+    graph.addOperand(add1, cinExt);
+    graph.addResult(add1, sumWithCin);
+
+    const auto sliceSum = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("sum_slice"));
+    graph.addOperand(sliceSum, sumWithCin);
+    graph.addResult(sliceSum, sum);
+    graph.setAttr(sliceSum, "sliceStart", static_cast<int64_t>(0));
+    graph.setAttr(sliceSum, "sliceEnd", static_cast<int64_t>(99));
+
+    const auto sliceCout = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("cout_slice"));
+    graph.addOperand(sliceCout, sumWithCin);
+    graph.addResult(sliceCout, cout);
+    graph.setAttr(sliceCout, "sliceStart", static_cast<int64_t>(100));
+    graph.setAttr(sliceCout, "sliceEnd", static_cast<int64_t>(100));
+
+    return design;
+}
+
 Design buildReplicateDesign()
 {
     Design design;
@@ -783,6 +1008,106 @@ Design buildReduceDesign()
     graph.addOperand(xorOp, in);
     graph.addResult(xorOp, outXor);
 
+    return design;
+}
+
+Design buildWideReduceDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 130, false);
+    graph.bindInputPort("in", in);
+
+    const auto outAnd = makeValue(graph, "and_y", 1, false);
+    const auto outOr = makeValue(graph, "or_y", 1, false);
+    const auto outXor = makeValue(graph, "xor_y", 1, false);
+    graph.bindOutputPort("and_y", outAnd);
+    graph.bindOutputPort("or_y", outOr);
+    graph.bindOutputPort("xor_y", outXor);
+
+    const auto andOp = graph.createOperation(OperationKind::kReduceAnd, graph.internSymbol("wide_reduce_and_y"));
+    graph.addOperand(andOp, in);
+    graph.addResult(andOp, outAnd);
+
+    const auto orOp = graph.createOperation(OperationKind::kReduceOr, graph.internSymbol("wide_reduce_or_y"));
+    graph.addOperand(orOp, in);
+    graph.addResult(orOp, outOr);
+
+    const auto xorOp = graph.createOperation(OperationKind::kReduceXor, graph.internSymbol("wide_reduce_xor_y"));
+    graph.addOperand(xorOp, in);
+    graph.addResult(xorOp, outXor);
+
+    return design;
+}
+
+Design buildWideMaskedRegisterDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto d = makeValue(graph, "d", 130, false);
+    const auto mask = makeValue(graph, "mask", 130, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", d);
+    graph.bindInputPort("mask", mask);
+
+    (void)makeRegister(graph, "state_storage", "state_reg", 130, "state");
+    const auto stateRead = makeRegisterRead(graph, "state_read", "state_read_op", 130, "state");
+    graph.bindOutputPort("q", stateRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    makeRegisterWrite(graph, "state_write", one, d, mask, clk, "state");
+
+    return design;
+}
+
+Design buildDualEdgeClockDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto d = makeValue(graph, "d", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", d);
+
+    (void)makeRegister(graph, "pos_storage", "pos_reg", 1, "pos_state");
+    (void)makeRegister(graph, "neg_storage", "neg_reg", 1, "neg_state");
+    const auto posRead = makeRegisterRead(graph, "pos_read", "pos_read_op", 1, "pos_state");
+    graph.bindOutputPort("q", posRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 1, "1'b1");
+    makeRegisterWriteWithEdge(graph, "pos_write", one, d, mask, clk, "pos_state", "posedge");
+    makeRegisterWriteWithEdge(graph, "neg_write", one, d, mask, clk, "neg_state", "negedge");
+
+    return design;
+}
+
+Design buildMediumShardedDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    auto current = makeValue(graph, "in", 1, false);
+    graph.bindInputPort("in", current);
+
+    for (int i = 0; i < 140; ++i)
+    {
+        const auto next = makeValue(graph, "tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("not_" + std::to_string(i)));
+        graph.addOperand(op, current);
+        graph.addResult(op, next);
+        current = next;
+    }
+
+    graph.bindOutputPort("out", current);
     return design;
 }
 
@@ -1530,6 +1855,63 @@ int main() {
     compileAndRunHarness(dir, "memory_read_top", runner);
 }
 
+void testMemoryWriteCompileAndRun()
+{
+    Design design = buildMemoryWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "memory_write_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("memory_write_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp memory-write fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp memory-write fixture should not emit errors");
+
+    const std::string header = readFile(dir / "memory_write_top.hpp");
+    expect(contains(header, "mem_mem0_[__mem_idx]"),
+           "memory-write fixture should lower sequential row updates into the emitted runtime");
+
+    const std::string runner = R"CPP(
+#include "memory_write_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.set_wen(0);
+    sim.set_addr(2);
+    sim.step();
+    if (sim.get_q() != 0xA5) {
+        return 1;
+    }
+    sim.set_wen(1);
+    sim.set_data(0x3C);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0x3C) {
+        return 2;
+    }
+    sim.set_clk(0);
+    sim.set_wen(0);
+    sim.step();
+    if (sim.get_q() != 0x3C) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "memory_write_top", runner);
+}
+
 void testLatchWriteCompileAndRun()
 {
     Design design = buildLatchWriteDesign();
@@ -2156,6 +2538,106 @@ int main() {
     compileAndRunHarness(dir, "wide_nibble_slice_dynamic_top", runner);
 }
 
+void testWideVectorDynamicSliceCompileAndRun()
+{
+    Design design = buildWideVectorSliceDynamicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_vector_slice_dynamic_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_vector_slice_dynamic_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-vector slice-dynamic fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-vector slice-dynamic fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_vector_slice_dynamic_top.hpp");
+    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_bits"),
+           "wide-vector slice-dynamic fixture should use the vector-result slice helper");
+
+    const std::string runner = R"CPP(
+#include "wide_vector_slice_dynamic_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL, 0x2ULL});
+
+    sim.set_index(5);
+    sim.step();
+    const auto out = sim.get_out();
+    if (out.size() != 2) {
+        return 1;
+    }
+    if (out[0] != 0x80091A2B3C4D5E6FULL) {
+        return 2;
+    }
+    if (out[1] != 0x10ULL) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_vector_slice_dynamic_top", runner);
+}
+
+void testWideStaticSliceCompileAndRun()
+{
+    Design design = buildWideStaticSliceDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_static_slice_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_static_slice_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-static slice fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-static slice fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_static_slice_top.hpp");
+    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_bits"),
+           "wide-static slice fixture should reuse the vector-result slice helper");
+
+    const std::string runner = R"CPP(
+#include "wide_static_slice_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL, 0x2ULL});
+    sim.step();
+    const auto out = sim.get_out();
+    if (out.size() != 2) {
+        return 1;
+    }
+    if (out[0] != 0x80091A2B3C4D5E6FULL) {
+        return 2;
+    }
+    if (out[1] != 0x10ULL) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_static_slice_top", runner);
+}
+
 void testWideVectorPortsInitializeAndCompile()
 {
     Design design = buildWideMuxDesign();
@@ -2176,10 +2658,10 @@ void testWideVectorPortsInitializeAndCompile()
     expect(!diags.hasError(), "EmitGsimCpp wide-vector fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_vector_top.hpp");
-    expect(contains(header, "std::vector<std::uint64_t> input_a_ = {}"),
-           "wide-vector fixture should initialize vector inputs with {}");
-    expect(contains(header, "std::vector<std::uint64_t> output_y_ = {}"),
-           "wide-vector fixture should initialize vector outputs with {}");
+    expect(contains(header, "std::vector<std::uint64_t> input_a_ = std::vector<std::uint64_t>(2, 0ULL)"),
+           "wide-vector fixture should size vector inputs to their emitted word count");
+    expect(contains(header, "std::vector<std::uint64_t> output_y_ = std::vector<std::uint64_t>(2, 0ULL)"),
+           "wide-vector fixture should size vector outputs to their emitted word count");
 
     const std::string runner = R"CPP(
 #include "wide_vector_top.hpp"
@@ -2250,6 +2732,114 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "wide_concat_top", runner);
+}
+
+void testWideBitwiseCompileAndRun()
+{
+    Design design = buildWideBitwiseDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_bitwise_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_bitwise_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-bitwise fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-bitwise fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_bitwise_top.hpp");
+    expect(contains(header, "wolvrix_gsim_bitwise_and") &&
+               contains(header, "wolvrix_gsim_bitwise_or") &&
+               contains(header, "wolvrix_gsim_bitwise_xor"),
+           "wide-bitwise fixture should use vector bitwise helpers");
+
+    const std::string runner = R"CPP(
+#include "wide_bitwise_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(std::vector<std::uint64_t>{0x00FF00FF00FF00FFULL, 0xFULL});
+    sim.set_b(std::vector<std::uint64_t>{0x0F0F0F0F0F0F0F0FULL, 0x3ULL});
+    sim.step();
+    const auto andY = sim.get_and_y();
+    const auto orY = sim.get_or_y();
+    const auto xorY = sim.get_xor_y();
+    if (andY.size() != 2 || orY.size() != 2 || xorY.size() != 2) {
+        return 1;
+    }
+    if (andY[0] != 0x000F000F000F000FULL || andY[1] != 0x3ULL) {
+        return 2;
+    }
+    if (orY[0] != 0x0FFF0FFF0FFF0FFFULL || orY[1] != 0xFULL) {
+        return 3;
+    }
+    if (xorY[0] != 0x0FF00FF00FF00FF0ULL || xorY[1] != 0xCULL) {
+        return 4;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_bitwise_top", runner);
+}
+
+void testWideAdderSplitCompileAndRun()
+{
+    Design design = buildWideAdderSplitDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_adder_split_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_adder_split_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-adder split fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-adder split fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_adder_split_top.hpp");
+    expect(contains(header, "wolvrix_gsim_add("),
+           "wide-adder split fixture should use the vector add helper");
+
+    const std::string runner = R"CPP(
+#include "wide_adder_split_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(std::vector<std::uint64_t>{~0ULL, 0xFFFFFFFFFULL});
+    sim.set_b(std::vector<std::uint64_t>{0ULL, 0ULL});
+    sim.set_cin(1);
+    sim.step();
+    const auto sum = sim.get_sum();
+    if (sum.size() != 2) {
+        return 1;
+    }
+    if (sum[0] != 0ULL || sum[1] != 0ULL) {
+        return 2;
+    }
+    if (sim.get_cout() != 1) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_adder_split_top", runner);
 }
 
 void testReplicateCompileAndRun()
@@ -2327,6 +2917,165 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "reduce_top", runner);
+}
+
+void testWideReduceCompileAndRun()
+{
+    Design design = buildWideReduceDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_reduce_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_reduce_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-reduce fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-reduce fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_reduce_top.hpp");
+    expect(contains(header, "wolvrix_gsim_reduce_and") &&
+               contains(header, "wolvrix_gsim_reduce_or") &&
+               contains(header, "wolvrix_gsim_reduce_xor"),
+           "wide-reduce fixture should use wide vector reduction helpers");
+
+    const std::string runner = R"CPP(
+#include "wide_reduce_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{~0ULL, ~0ULL, 0x3ULL});
+    sim.step();
+    if (sim.get_and_y() != 1 || sim.get_or_y() != 1 || sim.get_xor_y() != 0) {
+        return 1;
+    }
+    sim.set_in(std::vector<std::uint64_t>{0ULL, 0ULL, 0ULL});
+    sim.step();
+    if (sim.get_and_y() != 0 || sim.get_or_y() != 0 || sim.get_xor_y() != 0) {
+        return 2;
+    }
+    sim.set_in(std::vector<std::uint64_t>{1ULL, 0ULL, 0ULL});
+    sim.step();
+    if (sim.get_and_y() != 0 || sim.get_or_y() != 1 || sim.get_xor_y() != 1) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_reduce_top", runner);
+}
+
+void testWideMaskedRegisterCompileAndRun()
+{
+    Design design = buildWideMaskedRegisterDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_masked_register_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_masked_register_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide masked-register fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide masked-register fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_masked_register_top.hpp");
+    expect(contains(header, "wolvrix_gsim_mask_merge("),
+           "wide masked-register fixture should use the vector masked-merge helper");
+
+    const std::string runner = R"CPP(
+#include "wide_masked_register_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.set_d(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0x000000000000001FULL, 0x0ULL});
+    sim.set_mask(std::vector<std::uint64_t>{~0ULL, 0xFULL, 0x0ULL});
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    const auto out = sim.get_q();
+    if (out.size() != 3) {
+        return 1;
+    }
+    if (out[0] != 0x0123456789ABCDEFULL || out[1] != 0xFULL || out[2] != 0x0ULL) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_masked_register_top", runner);
+}
+
+void testDualEdgeClockMetadataDeduplicatesPrevClockState()
+{
+    Design design = buildDualEdgeClockDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dual_edge_clock_compile_only";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dual_edge_clock_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp dual-edge fixture should still emit");
+    expect(!diags.hasError(), "EmitGsimCpp dual-edge fixture should not emit diagnostics");
+
+    const std::string header = readFile(dir / "dual_edge_clock_top.hpp");
+    expect(countOccurrences(header, "bool prev_clk_ = false;") == 1,
+           "dual-edge fixture should deduplicate prev clock storage by resolved clock name");
+    expect(contains(header, "supports only one clock domain"),
+           "dual-edge fixture should keep the explicit runtime limitation");
+
+    const char *compiler = std::getenv("CXX");
+    const std::string compileCmd =
+        std::string((compiler && *compiler) ? compiler : "c++") +
+        " -std=c++20 -fsyntax-only -I " + dir.string() + " " + (dir / "dual_edge_clock_top.cpp").string();
+    expect(std::system(compileCmd.c_str()) == 0,
+           "dual-edge fixture should remain syntactically compilable after prev-clock deduplication");
+}
+
+void testMediumGraphsEnableSharding()
+{
+    Design design = buildMediumShardedDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "medium_sharded_emit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("medium_sharded_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp medium sharded fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp medium sharded fixture should not emit diagnostics");
+    expect(std::filesystem::exists(dir / "medium_sharded_top_sched_0.cpp"),
+           "medium-size graphs should emit at least one sched shard once sharding is enabled");
 }
 
 void testShiftCompileAndRun()
@@ -2640,6 +3389,7 @@ int main()
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
         testMemoryReadCompileAndRun();
+        testMemoryWriteCompileAndRun();
         testLogicBinaryCompileAndRun();
         testCaseEqCompileAndRun();
         testCompareCompileAndRun();
@@ -2651,10 +3401,18 @@ int main()
         testDynamicSliceCompileAndRun();
         testWideBitDynamicSliceCompileAndRun();
         testWideNibbleDynamicSliceCompileAndRun();
+        testWideVectorDynamicSliceCompileAndRun();
+        testWideStaticSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
         testWideConcatCompileAndRun();
+        testWideBitwiseCompileAndRun();
+        testWideAdderSplitCompileAndRun();
         testReplicateCompileAndRun();
         testReduceCompileAndRun();
+        testWideReduceCompileAndRun();
+        testWideMaskedRegisterCompileAndRun();
+        testDualEdgeClockMetadataDeduplicatesPrevClockState();
+        testMediumGraphsEnableSharding();
         testShiftCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
