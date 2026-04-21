@@ -50,6 +50,7 @@ namespace wolvrix::lib::emit
 
             // Non-sharded combinational statements for small designs
             std::vector<std::string> combinationalStmts;
+            std::vector<std::string> latchStmts;
 
             // Port declarations and accessors
             std::vector<std::pair<std::string, std::string>> inputPorts;  // (name, type)
@@ -623,6 +624,41 @@ namespace wolvrix::lib::emit
                         0,
                         "((" + indexExpr + " < " + memory.storageName + ".size()) ? " +
                             memory.storageName + "[" + indexExpr + "] : " + memory.zeroExpr + ")");
+                    break;
+                }
+
+                case OperationKind::kLatchWritePort: {
+                    if (op.operands().size() < 3) {
+                        break;
+                    }
+
+                    auto latchSymAttr = op.attr("latchSymbol");
+                    std::string sym;
+                    if (latchSymAttr) {
+                        if (auto *attrSym = std::get_if<std::string>(&*latchSymAttr)) {
+                            sym = *attrSym;
+                        }
+                    }
+                    if (sym.empty()) {
+                        sym = std::string(op.symbolText());
+                    }
+                    if (sym.empty()) {
+                        break;
+                    }
+
+                    const std::string latchName = "latch_" + sanitizeIdentifier(sym);
+                    const std::string condition = getOperandExpr(0);
+                    const std::string nextValue = getOperandExpr(1);
+                    const std::string mask = getOperandExpr(2);
+
+                    if (mask != "0") {
+                        state.latchStmts.push_back(
+                            "        if (" + condition + ") { " + latchName + " = (" + latchName +
+                            " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
+                    } else {
+                        state.latchStmts.push_back(
+                            "        if (" + condition + ") { " + latchName + " = " + nextValue + "; }");
+                    }
                     break;
                 }
 
@@ -1465,6 +1501,9 @@ namespace wolvrix::lib::emit
             os << "    }\n\n";
 
             os << "    void settle() {\n";
+            for (const auto &stmt : state.latchStmts) {
+                os << stmt << "\n";
+            }
             if (!state.outputPorts.empty()) {
                 for (const auto &[valueId, portInfo] : state.outputPortValues) {
                     auto valueIt = state.valueVars.find(valueId);

@@ -349,6 +349,31 @@ Design buildMemoryReadDesign()
     return design;
 }
 
+Design buildLatchWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto en = makeValue(graph, "en", 1, false);
+    const auto d = makeValue(graph, "d", 4, false);
+    graph.bindInputPort("en", en);
+    graph.bindInputPort("d", d);
+
+    (void)makeLatch(graph, "state_latch_decl", 4, "state_latch");
+    const auto latchRead = makeLatchRead(graph, "state_latch_q", "state_latch_read", 4, "state_latch");
+    graph.bindOutputPort("y", latchRead);
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 4, "4'hF");
+    const auto latchWrite = graph.createOperation(OperationKind::kLatchWritePort, graph.internSymbol("state_latch_write"));
+    graph.addOperand(latchWrite, en);
+    graph.addOperand(latchWrite, d);
+    graph.addOperand(latchWrite, mask);
+    graph.setAttr(latchWrite, "latchSymbol", std::string("state_latch"));
+
+    return design;
+}
+
 Design buildEqDesign()
 {
     Design design;
@@ -1331,6 +1356,58 @@ int main() {
     compileAndRunHarness(dir, "memory_read_top", runner);
 }
 
+void testLatchWriteCompileAndRun()
+{
+    Design design = buildLatchWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "latch_write_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("latch_write_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp latch-write fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp latch-write fixture should not emit errors");
+
+    const std::string header = readFile(dir / "latch_write_top.hpp");
+    expect(contains(header, "if (input_en_) { latch_state_latch ="),
+           "latch-write fixture should lower latch writes into settle-time updates");
+
+    const std::string runner = R"CPP(
+#include "latch_write_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_en(0);
+    sim.set_d(0x3);
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+    sim.set_en(1);
+    sim.set_d(0xA);
+    sim.step();
+    if (sim.get_y() != 0xA) {
+        return 2;
+    }
+    sim.set_d(0x5);
+    sim.step();
+    if (sim.get_y() != 0x5) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "latch_write_top", runner);
+}
+
 void testLogicBinaryCompileAndRun()
 {
     Design design = buildLogicBinaryDesign();
@@ -2116,6 +2193,7 @@ int main()
         testSingleClockRuntimeCompileAndRun();
         testDpicImportNoOpCompileAndRun();
         testLatchReadNoOpCompileAndRun();
+        testLatchWriteCompileAndRun();
         testMemoryReadCompileAndRun();
         testLogicBinaryCompileAndRun();
         testCaseEqCompileAndRun();
