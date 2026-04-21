@@ -395,6 +395,16 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kXnor: {
+                    if (!op.results().empty())
+                    {
+                        const auto resultValue = graph.getValue(op.results()[0]);
+                        setResultExpr(0, maskExprForWidth("(~(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + "))",
+                                                          resultValue.width()));
+                    }
+                    break;
+                }
+
                 case OperationKind::kEq: {
                     setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
                     break;
@@ -406,6 +416,31 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kCaseNe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kLt: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " < " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kLe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " <= " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kGt: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " > " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kGe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " >= " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kNe: {
                     setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
                     break;
                 }
@@ -1546,10 +1581,10 @@ namespace wolvrix::lib::emit
                                                              ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
                                                              : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                             os << "        if (reset_) {\n";
-                            os << "            reset_ = false;\n";
                             if (!state.outputPorts.empty()) {
                                 os << "            settle();\n";
                             }
+                            os << "            reset_ = false;\n";
                             os << "            " << prevClock << " = static_cast<bool>(" << currClockExpr << ");\n";
                             os << "            difftest_exit_ = 0;\n";
                             os << "            return;\n";
@@ -1576,8 +1611,8 @@ namespace wolvrix::lib::emit
                 }
             } else {
                 os << "        if (reset_) {\n";
-                os << "            reset_ = false;\n";
                 os << "            settle();\n";
+                os << "            reset_ = false;\n";
                 os << "            difftest_exit_ = 0;\n";
                 os << "            return;\n";
                 os << "        }\n";

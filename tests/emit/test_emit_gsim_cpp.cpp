@@ -454,6 +454,64 @@ Design buildCaseEqDesign()
     return design;
 }
 
+Design buildCompareDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inB = makeValue(graph, "b", 8, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outLt = makeValue(graph, "lt_y", 1, false);
+    const auto outGt = makeValue(graph, "gt_y", 1, false);
+    const auto outNe = makeValue(graph, "ne_y", 1, false);
+    graph.bindOutputPort("lt_y", outLt);
+    graph.bindOutputPort("gt_y", outGt);
+    graph.bindOutputPort("ne_y", outNe);
+
+    const auto ltOp = graph.createOperation(OperationKind::kLt, graph.internSymbol("lt_y_op"));
+    graph.addOperand(ltOp, inA);
+    graph.addOperand(ltOp, inB);
+    graph.addResult(ltOp, outLt);
+
+    const auto gtOp = graph.createOperation(OperationKind::kGt, graph.internSymbol("gt_y_op"));
+    graph.addOperand(gtOp, inA);
+    graph.addOperand(gtOp, inB);
+    graph.addResult(gtOp, outGt);
+
+    const auto neOp = graph.createOperation(OperationKind::kNe, graph.internSymbol("ne_y_op"));
+    graph.addOperand(neOp, inA);
+    graph.addOperand(neOp, inB);
+    graph.addResult(neOp, outNe);
+
+    return design;
+}
+
+Design buildXnorDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inB = makeValue(graph, "b", 8, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto xnorOp = graph.createOperation(OperationKind::kXnor, graph.internSymbol("xnor_y_op"));
+    graph.addOperand(xnorOp, inA);
+    graph.addOperand(xnorOp, inB);
+    graph.addResult(xnorOp, outY);
+
+    return design;
+}
+
 Design buildSliceStaticDesign()
 {
     Design design;
@@ -1515,6 +1573,100 @@ int main() {
     compileAndRunHarness(dir, "caseeq_top", runner);
 }
 
+void testCompareCompileAndRun()
+{
+    Design design = buildCompareDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "compare_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("compare_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp compare fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp compare fixture should not emit errors");
+
+    const std::string header = readFile(dir / "compare_top.hpp");
+    expect(contains(header, "output_lt_y_ = (input_a_ < input_b_);"),
+           "compare fixture should lower lt");
+    expect(contains(header, "output_gt_y_ = (input_a_ > input_b_);"),
+           "compare fixture should lower gt");
+    expect(contains(header, "output_ne_y_ = (input_a_ != input_b_);"),
+           "compare fixture should lower ne");
+
+    const std::string runner = R"CPP(
+#include "compare_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(3);
+    sim.set_b(5);
+    sim.step();
+    if (sim.get_lt_y() != 1 || sim.get_gt_y() != 0 || sim.get_ne_y() != 1) {
+        return 1;
+    }
+    sim.set_a(8);
+    sim.set_b(8);
+    sim.step();
+    if (sim.get_lt_y() != 0 || sim.get_gt_y() != 0 || sim.get_ne_y() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "compare_top", runner);
+}
+
+void testXnorCompileAndRun()
+{
+    Design design = buildXnorDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "xnor_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("xnor_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp xnor fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp xnor fixture should not emit errors");
+
+    const std::string header = readFile(dir / "xnor_top.hpp");
+    expect(contains(header, "output_y_ =") &&
+           contains(header, "~(input_a_ ^ input_b_)") &&
+           contains(header, "& 255"),
+           "xnor fixture should lower xnor with width masking");
+
+    const std::string runner = R"CPP(
+#include "xnor_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0xAA);
+    sim.set_b(0x0F);
+    sim.step();
+    if (sim.get_y() != static_cast<unsigned char>(~(0xAA ^ 0x0F))) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "xnor_top", runner);
+}
+
 void testSliceStaticCompileAndRun()
 {
     Design design = buildSliceStaticDesign();
@@ -2207,6 +2359,8 @@ int main()
         testMemoryReadCompileAndRun();
         testLogicBinaryCompileAndRun();
         testCaseEqCompileAndRun();
+        testCompareCompileAndRun();
+        testXnorCompileAndRun();
         testSliceStaticCompileAndRun();
         testConcatCompileAndRun();
         testEqCompileAndRun();
