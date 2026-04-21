@@ -735,6 +735,86 @@ Design buildWideConcatDesign()
     return design;
 }
 
+Design buildReplicateDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 5, false);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "y", 25, false);
+    graph.bindOutputPort("y", out);
+
+    const auto rep = graph.createOperation(OperationKind::kReplicate, graph.internSymbol("replicate_y"));
+    graph.addOperand(rep, in);
+    graph.addResult(rep, out);
+    graph.setAttr(rep, "rep", static_cast<int64_t>(5));
+
+    return design;
+}
+
+Design buildReduceDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 8, false);
+    graph.bindInputPort("in", in);
+
+    const auto outAnd = makeValue(graph, "and_y", 1, false);
+    const auto outOr = makeValue(graph, "or_y", 1, false);
+    const auto outXor = makeValue(graph, "xor_y", 1, false);
+    graph.bindOutputPort("and_y", outAnd);
+    graph.bindOutputPort("or_y", outOr);
+    graph.bindOutputPort("xor_y", outXor);
+
+    const auto andOp = graph.createOperation(OperationKind::kReduceAnd, graph.internSymbol("reduce_and_y"));
+    graph.addOperand(andOp, in);
+    graph.addResult(andOp, outAnd);
+
+    const auto orOp = graph.createOperation(OperationKind::kReduceOr, graph.internSymbol("reduce_or_y"));
+    graph.addOperand(orOp, in);
+    graph.addResult(orOp, outOr);
+
+    const auto xorOp = graph.createOperation(OperationKind::kReduceXor, graph.internSymbol("reduce_xor_y"));
+    graph.addOperand(xorOp, in);
+    graph.addResult(xorOp, outXor);
+
+    return design;
+}
+
+Design buildShiftDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 8, false);
+    const auto amount = makeValue(graph, "amount", 3, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("amount", amount);
+
+    const auto outL = makeValue(graph, "shl_y", 8, false);
+    const auto outR = makeValue(graph, "lshr_y", 8, false);
+    graph.bindOutputPort("shl_y", outL);
+    graph.bindOutputPort("lshr_y", outR);
+
+    const auto shlOp = graph.createOperation(OperationKind::kShl, graph.internSymbol("shl_y_op"));
+    graph.addOperand(shlOp, in);
+    graph.addOperand(shlOp, amount);
+    graph.addResult(shlOp, outL);
+
+    const auto lshrOp = graph.createOperation(OperationKind::kLShr, graph.internSymbol("lshr_y_op"));
+    graph.addOperand(lshrOp, in);
+    graph.addOperand(lshrOp, amount);
+    graph.addResult(lshrOp, outR);
+
+    return design;
+}
+
 Design buildThreeStageRegisterPipelineDesign()
 {
     Design design;
@@ -2172,6 +2252,120 @@ int main() {
     compileAndRunHarness(dir, "wide_concat_top", runner);
 }
 
+void testReplicateCompileAndRun()
+{
+    Design design = buildReplicateDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "replicate_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("replicate_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp replicate fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp replicate fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "replicate_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_in(0x15);
+    sim.step();
+    if (sim.get_y() != 0x15AD6B5) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "replicate_top", runner);
+}
+
+void testReduceCompileAndRun()
+{
+    Design design = buildReduceDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "reduce_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reduce_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp reduce fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp reduce fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "reduce_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_in(0xFF);
+    sim.step();
+    if (sim.get_and_y() != 1 || sim.get_or_y() != 1 || sim.get_xor_y() != 0) {
+        return 1;
+    }
+    sim.set_in(0x01);
+    sim.step();
+    if (sim.get_and_y() != 0 || sim.get_or_y() != 1 || sim.get_xor_y() != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "reduce_top", runner);
+}
+
+void testShiftCompileAndRun()
+{
+    Design design = buildShiftDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "shift_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("shift_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp shift fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp shift fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "shift_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_in(0x81);
+    sim.set_amount(1);
+    sim.step();
+    if (sim.get_shl_y() != 0x02 || sim.get_lshr_y() != 0x40) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "shift_top", runner);
+}
+
 void testRegisterPipelineUsesNonBlockingSemantics()
 {
     Design design = buildThreeStageRegisterPipelineDesign();
@@ -2459,6 +2653,9 @@ int main()
         testWideNibbleDynamicSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
         testWideConcatCompileAndRun();
+        testReplicateCompileAndRun();
+        testReduceCompileAndRun();
+        testShiftCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();

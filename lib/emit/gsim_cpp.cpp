@@ -420,6 +420,21 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kReduceAnd: {
+                    setResultExpr(0, "((" + getOperandExpr(0) + " == " + generateMask(graph.getValue(op.operands()[0]).width()) + ") ? 1U : 0U)");
+                    break;
+                }
+
+                case OperationKind::kReduceOr: {
+                    setResultExpr(0, "((" + getOperandExpr(0) + " != 0) ? 1U : 0U)");
+                    break;
+                }
+
+                case OperationKind::kReduceXor: {
+                    setResultExpr(0, "(static_cast<unsigned>(__builtin_parityll(static_cast<unsigned long long>(" + getOperandExpr(0) + "))))");
+                    break;
+                }
+
                 case OperationKind::kLt: {
                     setResultExpr(0, "(" + getOperandExpr(0) + " < " + getOperandExpr(1) + ")");
                     break;
@@ -598,6 +613,47 @@ namespace wolvrix::lib::emit
                         "((" + getOperandExpr(0) + " >> " + std::to_string(*sliceStart) + ") & " +
                         generateMask(static_cast<int32_t>(sliceWidth)) + ")";
                     setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(sliceWidth)));
+                    break;
+                }
+
+                case OperationKind::kReplicate: {
+                    if (op.operands().empty() || op.results().empty()) {
+                        break;
+                    }
+                    auto repAttr = op.attr("rep");
+                    auto *rep = repAttr ? std::get_if<int64_t>(&*repAttr) : nullptr;
+                    if (rep == nullptr || *rep <= 0) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kReplicate-attr (" + opName + ")");
+                        break;
+                    }
+                    const auto operandWidth = graph.getValue(op.operands()[0]).width();
+                    const auto totalWidth = operandWidth * *rep;
+                    if (operandWidth <= 0 || operandWidth > 64 || totalWidth > 64) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kReplicate-wide (" + opName + ")");
+                        break;
+                    }
+                    std::string expr = "0";
+                    for (int64_t i = 0; i < *rep; ++i) {
+                        expr = "((" + expr + " << " + std::to_string(operandWidth) + ") | (" +
+                               getOperandExpr(0) + " & " + generateMask(operandWidth) + "))";
+                    }
+                    setResultExpr(0, maskExprForWidth(expr, static_cast<int32_t>(totalWidth)));
+                    break;
+                }
+
+                case OperationKind::kShl: {
+                    if (!op.results().empty()) {
+                        const auto resultWidth = graph.getValue(op.results()[0]).width();
+                        setResultExpr(0, maskExprForWidth("(" + getOperandExpr(0) + " << " + getOperandExpr(1) + ")",
+                                                          resultWidth));
+                    }
+                    break;
+                }
+
+                case OperationKind::kLShr: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ")");
                     break;
                 }
 
