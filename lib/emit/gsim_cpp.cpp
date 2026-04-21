@@ -265,6 +265,36 @@ namespace wolvrix::lib::emit
             return std::nullopt;
         }
 
+        bool hasInputPortNamed(const std::vector<std::pair<std::string, std::string>> &inputPorts,
+                               std::string_view candidate)
+        {
+            for (const auto &[name, type] : inputPorts)
+            {
+                (void)type;
+                if (sanitizeIdentifier(name) == candidate)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        std::string resolveSequentialClockStateName(
+            std::string_view clockSymbol,
+            const std::vector<std::pair<std::string, std::string>> &inputPorts)
+        {
+            std::string resolvedClock = sanitizeIdentifier(clockSymbol);
+            if (hasInputPortNamed(inputPorts, resolvedClock))
+            {
+                return resolvedClock;
+            }
+            if (auto fallbackClock = findClockLikeInputName(inputPorts))
+            {
+                return *fallbackClock;
+            }
+            return resolvedClock;
+        }
+
         // Forward declaration
         struct GsimScratchpadMetadata;
 
@@ -457,7 +487,7 @@ namespace wolvrix::lib::emit
 
                     const auto baseValue = graph.getValue(op.operands()[0]);
                     const auto operandWidth = baseValue.width();
-                    if (operandWidth <= 0 || operandWidth > 64 || *sliceWidth > operandWidth) {
+                    if (operandWidth <= 0 || *sliceWidth > operandWidth) {
                         std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
                         state.unsupportedOps.push_back("kSliceDynamic-wide (" + opName + ")");
                         break;
@@ -471,6 +501,14 @@ namespace wolvrix::lib::emit
                     const std::string rawIndexExpr = getOperandExpr(1);
                     const std::string indexExpr =
                         "static_cast<std::uint64_t>(" + rawIndexExpr + ")";
+                    if (operandWidth > 64) {
+                        const std::string slicedExpr =
+                            "wolvrix_gsim_slice_dynamic_to_u64(" + getOperandExpr(0) + ", " + indexExpr + ", " +
+                            std::to_string(*sliceWidth) + ", " + std::to_string(operandWidth) + ")";
+                        setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(*sliceWidth)));
+                        break;
+                    }
+
                     const std::string slicedExpr =
                         "((" + indexExpr + " >= " + std::to_string(operandWidth) + ") ? 0ULL : ((" +
                         getOperandExpr(0) + " >> " + indexExpr + ") & " +
@@ -1379,6 +1417,25 @@ namespace wolvrix::lib::emit
             os << "#include <stdexcept>\n";
             os << "#include <string>\n";
             os << "#include <vector>\n\n";
+            os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_to_u64(\n";
+            os << "    const std::vector<std::uint64_t>& value,\n";
+            os << "    std::uint64_t bitIndex,\n";
+            os << "    std::uint32_t sliceWidth,\n";
+            os << "    std::uint32_t operandWidth) {\n";
+            os << "    if (sliceWidth == 0 || sliceWidth > 64 || bitIndex >= operandWidth) {\n";
+            os << "        return 0ULL;\n";
+            os << "    }\n";
+            os << "    const auto availableBits = std::min<std::uint64_t>(sliceWidth, operandWidth - bitIndex);\n";
+            os << "    std::uint64_t result = 0ULL;\n";
+            os << "    for (std::uint64_t offset = 0; offset < availableBits; ++offset) {\n";
+            os << "        const std::uint64_t absoluteBit = bitIndex + offset;\n";
+            os << "        const auto wordIndex = static_cast<std::size_t>(absoluteBit / 64ULL);\n";
+            os << "        const auto bitOffset = static_cast<std::uint32_t>(absoluteBit % 64ULL);\n";
+            os << "        const std::uint64_t word = wordIndex < value.size() ? value[wordIndex] : 0ULL;\n";
+            os << "        result |= ((word >> bitOffset) & 1ULL) << offset;\n";
+            os << "    }\n";
+            os << "    return result;\n";
+            os << "}\n\n";
 
             // Generated Simulator Class (use SSimTop for compatibility)
             os << "class SSimTop {\n";
@@ -1400,12 +1457,8 @@ namespace wolvrix::lib::emit
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
                 if (parsedDomain) {
-                    std::string resetClock = sanitizeIdentifier(parsedDomain->second);
-                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
-                        if (resetClock == "clock" || resetClock == "unnamed") {
-                            resetClock = *fallbackClock;
-                        }
-                    }
+                    const std::string resetClock =
+                        resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                     os << "        prev_" << resetClock << "_ = false;\n";
                 }
             }
@@ -1433,37 +1486,16 @@ namespace wolvrix::lib::emit
                         os << "        throw std::runtime_error(\"GSIM emitted runtime encountered malformed clock domain metadata\");\n";
                     } else {
                         const std::string edge = parsedDomain->first;
-                        const std::string clock = sanitizeIdentifier(parsedDomain->second);
                         if (edge != "posedge" && edge != "negedge") {
                             os << "        throw std::runtime_error(\"GSIM emitted runtime supports only posedge/negedge event edges\");\n";
                         } else {
-                            std::string resolvedClock = clock;
-                            const auto hasPortNamed = [&](std::string_view candidate) {
-                                for (const auto &[name, type] : state.inputPorts) {
-                                    (void)type;
-                                    if (sanitizeIdentifier(name) == candidate) {
-                                        return true;
-                                    }
-                                }
-                                return false;
-                            };
+                            std::string resolvedClock =
+                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                             std::string currClockExpr;
                             auto exprIt = state.sequentialClockExprs.find(domain.first);
                             if (exprIt != state.sequentialClockExprs.end()) {
-                                if (!hasPortNamed(resolvedClock)) {
-                                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
-                                        if (resolvedClock == "clock" || resolvedClock == "unnamed") {
-                                            resolvedClock = *fallbackClock;
-                                        }
-                                    }
-                                }
                                 currClockExpr = exprIt->second;
                             } else {
-                                if (!hasPortNamed(resolvedClock)) {
-                                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
-                                        resolvedClock = *fallbackClock;
-                                    }
-                                }
                                 currClockExpr = "input_" + resolvedClock + "_";
                             }
                             const std::string prevClock = "prev_" + resolvedClock + "_";
@@ -1572,12 +1604,8 @@ namespace wolvrix::lib::emit
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
                 if (parsedDomain) {
-                    std::string prevClockName = sanitizeIdentifier(parsedDomain->second);
-                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
-                        if (prevClockName == "clock" || prevClockName == "unnamed") {
-                            prevClockName = *fallbackClock;
-                        }
-                    }
+                    const std::string prevClockName =
+                        resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                     os << "    bool prev_" << prevClockName << "_ = false;\n";
                 }
             }

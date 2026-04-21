@@ -492,6 +492,52 @@ Design buildSliceDynamicDesign()
     return design;
 }
 
+Design buildWideBitSliceDynamicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 130, false);
+    const auto index = makeValue(graph, "index", 8, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("index", index);
+
+    const auto out = makeValue(graph, "out", 1, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("wide_bit_slice"));
+    graph.addOperand(slice, in);
+    graph.addOperand(slice, index);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(1));
+
+    return design;
+}
+
+Design buildWideNibbleSliceDynamicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 130, false);
+    const auto index = makeValue(graph, "index", 8, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("index", index);
+
+    const auto out = makeValue(graph, "out", 4, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("wide_nibble_slice"));
+    graph.addOperand(slice, in);
+    graph.addOperand(slice, index);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(4));
+
+    return design;
+}
+
 Design buildNoCommitStatefulOutputDesign()
 {
     Design design;
@@ -511,6 +557,37 @@ Design buildNoCommitStatefulOutputDesign()
     const auto zero = makeConstant(graph, "zero", "zero_const", 1, "1'b0");
     const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
     makeRegisterWrite(graph, "reg_write", zero, inA, mask, clk, "state");
+    return design;
+}
+
+Design buildClockAliasWithoutMaterializedExprDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto d = makeValue(graph, "d", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", d);
+
+    (void)makeRegister(graph, "state_storage", "state_reg", 1, "state");
+    const auto stateRead = makeRegisterRead(graph, "state_read", "state_read_op", 1, "state");
+    graph.bindOutputPort("q", stateRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 1, "1'b1");
+    const auto missingClockCarrier = makeValue(graph, "clock_alias_wire", 1, false);
+
+    const auto write = graph.createOperation(OperationKind::kRegisterWritePort, graph.internSymbol("state_write"));
+    graph.addOperand(write, one);
+    graph.addOperand(write, d);
+    graph.addOperand(write, mask);
+    graph.addOperand(write, missingClockCarrier);
+    graph.setAttr(write, "regSymbol", std::string("state"));
+    graph.setAttr(write, "clockSymbol", std::string("clock_alias"));
+    graph.setAttr(write, "eventEdge", std::vector<std::string>{"posedge"});
+
     return design;
 }
 
@@ -1570,6 +1647,156 @@ int main() {
     compileAndRunHarness(dir, "slice_dynamic_top", runner);
 }
 
+void testWideBitDynamicSliceCompileAndRun()
+{
+    Design design = buildWideBitSliceDynamicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_bit_slice_dynamic_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_bit_slice_dynamic_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-bit slice-dynamic fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-bit slice-dynamic fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_bit_slice_dynamic_top.hpp");
+    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_u64"),
+           "wide-bit slice-dynamic fixture should use the wide-vector dynamic-slice helper");
+
+    const std::string runner = R"CPP(
+#include "wide_bit_slice_dynamic_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x8000000000000001ULL, 0x5ULL, 0x2ULL});
+
+    sim.set_index(0);
+    sim.step();
+    if (sim.get_out() != 1) {
+        return 1;
+    }
+
+    sim.set_index(63);
+    sim.step();
+    if (sim.get_out() != 1) {
+        return 2;
+    }
+
+    sim.set_index(64);
+    sim.step();
+    if (sim.get_out() != 1) {
+        return 3;
+    }
+
+    sim.set_index(65);
+    sim.step();
+    if (sim.get_out() != 0) {
+        return 4;
+    }
+
+    sim.set_index(129);
+    sim.step();
+    if (sim.get_out() != 1) {
+        return 5;
+    }
+
+    sim.set_index(130);
+    sim.step();
+    if (sim.get_out() != 0) {
+        return 6;
+    }
+
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_bit_slice_dynamic_top", runner);
+}
+
+void testWideNibbleDynamicSliceCompileAndRun()
+{
+    Design design = buildWideNibbleSliceDynamicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_nibble_slice_dynamic_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_nibble_slice_dynamic_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-nibble slice-dynamic fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-nibble slice-dynamic fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_nibble_slice_dynamic_top.hpp");
+    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_u64") && contains(header, ", 4, 130)"),
+           "wide-nibble slice-dynamic fixture should call the wide-vector dynamic-slice helper with slice metadata");
+
+    const std::string runner = R"CPP(
+#include "wide_nibble_slice_dynamic_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x8000000000000001ULL, 0x5ULL, 0x2ULL});
+
+    sim.set_index(0);
+    sim.step();
+    if (sim.get_out() != 0x1) {
+        return 1;
+    }
+
+    sim.set_index(63);
+    sim.step();
+    if (sim.get_out() != 0xB) {
+        return 2;
+    }
+
+    sim.set_index(64);
+    sim.step();
+    if (sim.get_out() != 0x5) {
+        return 3;
+    }
+
+    sim.set_index(128);
+    sim.step();
+    if (sim.get_out() != 0x2) {
+        return 4;
+    }
+
+    sim.set_index(129);
+    sim.step();
+    if (sim.get_out() != 0x1) {
+        return 5;
+    }
+
+    sim.set_index(130);
+    sim.step();
+    if (sim.get_out() != 0x0) {
+        return 6;
+    }
+
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_nibble_slice_dynamic_top", runner);
+}
+
 void testWideVectorPortsInitializeAndCompile()
 {
     Design design = buildWideMuxDesign();
@@ -1828,6 +2055,50 @@ int main() {
     compileAndRunHarness(dir, "no_commit_top", runner);
 }
 
+void testClockAliasFallbackUsesOnePrevClockStateName()
+{
+    Design design = buildClockAliasWithoutMaterializedExprDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "clock_alias_prev_name";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("clock_alias_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp clock-alias fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp clock-alias fixture should not emit errors");
+
+    const std::string header = readFile(dir / "clock_alias_top.hpp");
+    expect(!contains(header, "prev_clock_alias_"),
+           "clock-alias fallback should not emit an unresolved prev_clock_alias_ state name");
+    expect(contains(header, "prev_clk_"),
+           "clock-alias fallback should reuse the resolved input clk storage name");
+
+    const std::string runner = R"CPP(
+#include "clock_alias_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_d(0);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_d(1);
+    sim.set_clk(1);
+    sim.step();
+    return sim.get_q() == 1 ? 0 : 1;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "clock_alias_top", runner);
+}
+
 } // namespace
 
 int main()
@@ -1853,12 +2124,15 @@ int main()
         testEqCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();
         testDynamicSliceCompileAndRun();
+        testWideBitDynamicSliceCompileAndRun();
+        testWideNibbleDynamicSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();
         testEmitMetadataToggleSkipsLargeMetadataPayload();
         testEdgeWithoutCommitDoesNotAdvanceStep();
+        testClockAliasFallbackUsesOnePrevClockStateName();
     }
     catch (const std::exception &ex)
     {
