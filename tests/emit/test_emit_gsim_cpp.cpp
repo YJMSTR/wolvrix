@@ -466,10 +466,14 @@ Design buildCompareDesign()
     graph.bindInputPort("b", inB);
 
     const auto outLt = makeValue(graph, "lt_y", 1, false);
+    const auto outLe = makeValue(graph, "le_y", 1, false);
     const auto outGt = makeValue(graph, "gt_y", 1, false);
+    const auto outGe = makeValue(graph, "ge_y", 1, false);
     const auto outNe = makeValue(graph, "ne_y", 1, false);
     graph.bindOutputPort("lt_y", outLt);
+    graph.bindOutputPort("le_y", outLe);
     graph.bindOutputPort("gt_y", outGt);
+    graph.bindOutputPort("ge_y", outGe);
     graph.bindOutputPort("ne_y", outNe);
 
     const auto ltOp = graph.createOperation(OperationKind::kLt, graph.internSymbol("lt_y_op"));
@@ -481,6 +485,16 @@ Design buildCompareDesign()
     graph.addOperand(gtOp, inA);
     graph.addOperand(gtOp, inB);
     graph.addResult(gtOp, outGt);
+
+    const auto leOp = graph.createOperation(OperationKind::kLe, graph.internSymbol("le_y_op"));
+    graph.addOperand(leOp, inA);
+    graph.addOperand(leOp, inB);
+    graph.addResult(leOp, outLe);
+
+    const auto geOp = graph.createOperation(OperationKind::kGe, graph.internSymbol("ge_y_op"));
+    graph.addOperand(geOp, inA);
+    graph.addOperand(geOp, inB);
+    graph.addResult(geOp, outGe);
 
     const auto neOp = graph.createOperation(OperationKind::kNe, graph.internSymbol("ne_y_op"));
     graph.addOperand(neOp, inA);
@@ -1595,8 +1609,12 @@ void testCompareCompileAndRun()
     const std::string header = readFile(dir / "compare_top.hpp");
     expect(contains(header, "output_lt_y_ = (input_a_ < input_b_);"),
            "compare fixture should lower lt");
+    expect(contains(header, "output_le_y_ = (input_a_ <= input_b_);"),
+           "compare fixture should lower le");
     expect(contains(header, "output_gt_y_ = (input_a_ > input_b_);"),
            "compare fixture should lower gt");
+    expect(contains(header, "output_ge_y_ = (input_a_ >= input_b_);"),
+           "compare fixture should lower ge");
     expect(contains(header, "output_ne_y_ = (input_a_ != input_b_);"),
            "compare fixture should lower ne");
 
@@ -1608,13 +1626,13 @@ int main() {
     sim.set_a(3);
     sim.set_b(5);
     sim.step();
-    if (sim.get_lt_y() != 1 || sim.get_gt_y() != 0 || sim.get_ne_y() != 1) {
+    if (sim.get_lt_y() != 1 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 0 || sim.get_ne_y() != 1) {
         return 1;
     }
     sim.set_a(8);
     sim.set_b(8);
     sim.step();
-    if (sim.get_lt_y() != 0 || sim.get_gt_y() != 0 || sim.get_ne_y() != 0) {
+    if (sim.get_lt_y() != 0 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 1 || sim.get_ne_y() != 0) {
         return 2;
     }
     return 0;
