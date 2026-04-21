@@ -369,6 +369,16 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
+                case OperationKind::kCaseEq: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                    break;
+                }
+
+                case OperationKind::kCaseNe: {
+                    setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                    break;
+                }
+
                 case OperationKind::kNot: {
                     if (!op.results().empty())
                     {
@@ -466,6 +476,37 @@ namespace wolvrix::lib::emit
                         getOperandExpr(0) + " >> " + indexExpr + ") & " +
                         generateMask(static_cast<int32_t>(*sliceWidth)) + "))";
                     setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(*sliceWidth)));
+                    break;
+                }
+
+                case OperationKind::kSliceStatic: {
+                    if (op.operands().empty() || op.results().empty()) {
+                        break;
+                    }
+
+                    auto sliceStartAttr = op.attr("sliceStart");
+                    auto sliceEndAttr = op.attr("sliceEnd");
+                    auto *sliceStart = sliceStartAttr ? std::get_if<int64_t>(&*sliceStartAttr) : nullptr;
+                    auto *sliceEnd = sliceEndAttr ? std::get_if<int64_t>(&*sliceEndAttr) : nullptr;
+                    if (sliceStart == nullptr || sliceEnd == nullptr || *sliceStart < 0 || *sliceEnd < *sliceStart) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kSliceStatic-attr (" + opName + ")");
+                        break;
+                    }
+
+                    const auto baseValue = graph.getValue(op.operands()[0]);
+                    const auto operandWidth = baseValue.width();
+                    const auto sliceWidth = *sliceEnd - *sliceStart + 1;
+                    if (operandWidth <= 0 || operandWidth > 64 || *sliceEnd >= operandWidth || sliceWidth <= 0 || sliceWidth > 64) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kSliceStatic-wide (" + opName + ")");
+                        break;
+                    }
+
+                    const std::string slicedExpr =
+                        "((" + getOperandExpr(0) + " >> " + std::to_string(*sliceStart) + ") & " +
+                        generateMask(static_cast<int32_t>(sliceWidth)) + ")";
+                    setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(sliceWidth)));
                     break;
                 }
 

@@ -400,6 +400,56 @@ Design buildLogicBinaryDesign()
     return design;
 }
 
+Design buildCaseEqDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto inB = makeValue(graph, "b", 8, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outEq = makeValue(graph, "eq_y", 1, false);
+    const auto outNe = makeValue(graph, "ne_y", 1, false);
+    graph.bindOutputPort("eq_y", outEq);
+    graph.bindOutputPort("ne_y", outNe);
+
+    const auto eqOp = graph.createOperation(OperationKind::kCaseEq, graph.internSymbol("case_eq_y"));
+    graph.addOperand(eqOp, inA);
+    graph.addOperand(eqOp, inB);
+    graph.addResult(eqOp, outEq);
+
+    const auto neOp = graph.createOperation(OperationKind::kCaseNe, graph.internSymbol("case_ne_y"));
+    graph.addOperand(neOp, inA);
+    graph.addOperand(neOp, inB);
+    graph.addResult(neOp, outNe);
+
+    return design;
+}
+
+Design buildSliceStaticDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    graph.bindInputPort("a", inA);
+
+    const auto outY = makeValue(graph, "y", 4, false);
+    graph.bindOutputPort("y", outY);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceStatic, graph.internSymbol("slice_hi_nibble"));
+    graph.addOperand(slice, inA);
+    graph.addResult(slice, outY);
+    graph.setAttr(slice, "sliceStart", static_cast<int64_t>(4));
+    graph.setAttr(slice, "sliceEnd", static_cast<int64_t>(7));
+
+    return design;
+}
+
 Design buildMaskedNotDesign()
 {
     Design design;
@@ -1253,6 +1303,95 @@ int main() {
     compileAndRunHarness(dir, "logic_binary_top", runner);
 }
 
+void testCaseEqCompileAndRun()
+{
+    Design design = buildCaseEqDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "caseeq_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("caseeq_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp caseeq fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp caseeq fixture should not emit errors");
+
+    const std::string header = readFile(dir / "caseeq_top.hpp");
+    expect(contains(header, "output_eq_y_ = (input_a_ == input_b_);"),
+           "caseeq fixture should lower case equality to emitted compare");
+    expect(contains(header, "output_ne_y_ = (input_a_ != input_b_);"),
+           "caseeq fixture should lower case inequality to emitted compare");
+
+    const std::string runner = R"CPP(
+#include "caseeq_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0xAA);
+    sim.set_b(0xAA);
+    sim.step();
+    if (sim.get_eq_y() != 1 || sim.get_ne_y() != 0) {
+        return 1;
+    }
+    sim.set_b(0x55);
+    sim.step();
+    if (sim.get_eq_y() != 0 || sim.get_ne_y() != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "caseeq_top", runner);
+}
+
+void testSliceStaticCompileAndRun()
+{
+    Design design = buildSliceStaticDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "slice_static_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("slice_static_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp slice-static fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp slice-static fixture should not emit errors");
+
+    const std::string header = readFile(dir / "slice_static_top.hpp");
+    expect(contains(header, "output_y_ = (((input_a_ >> 4) & 15) & 15);") ||
+           contains(header, "output_y_ = ((input_a_ >> 4) & 15);"),
+           "slice-static fixture should lower constant bit slicing to shift-and-mask");
+
+    const std::string runner = R"CPP(
+#include "slice_static_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0xAB);
+    sim.step();
+    if (sim.get_y() != 0xA) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "slice_static_top", runner);
+}
+
 void testConcatCompileAndRun()
 {
     Design design = buildConcatDesign();
@@ -1681,6 +1820,8 @@ int main()
         testLatchReadNoOpCompileAndRun();
         testMemoryReadCompileAndRun();
         testLogicBinaryCompileAndRun();
+        testCaseEqCompileAndRun();
+        testSliceStaticCompileAndRun();
         testConcatCompileAndRun();
         testEqCompileAndRun();
         testBitwiseNotMasksToDeclaredWidth();
