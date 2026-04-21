@@ -1501,8 +1501,12 @@ namespace wolvrix::lib::emit
             os << "    }\n\n";
 
             os << "    void settle() {\n";
-            for (const auto &stmt : state.latchStmts) {
-                os << stmt << "\n";
+            if (!state.latchStmts.empty()) {
+                os << "        if (!reset_) {\n";
+                for (const auto &stmt : state.latchStmts) {
+                    os << stmt << "\n";
+                }
+                os << "        }\n";
             }
             if (!state.outputPorts.empty()) {
                 for (const auto &[valueId, portInfo] : state.outputPortValues) {

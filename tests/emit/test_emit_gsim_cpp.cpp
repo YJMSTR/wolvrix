@@ -1378,28 +1378,38 @@ void testLatchWriteCompileAndRun()
     const std::string header = readFile(dir / "latch_write_top.hpp");
     expect(contains(header, "if (input_en_) { latch_state_latch ="),
            "latch-write fixture should lower latch writes into settle-time updates");
+    expect(contains(header, "if (!reset_) {"),
+           "latch-write fixture should guard latch state updates while reset is asserted");
 
     const std::string runner = R"CPP(
 #include "latch_write_top.hpp"
 
 int main() {
     SSimTop sim;
+    sim.set_reset(1);
+    sim.set_en(1);
+    sim.set_d(0xF);
+    sim.commit_step();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+    sim.set_reset(0);
     sim.set_en(0);
     sim.set_d(0x3);
     sim.step();
     if (sim.get_y() != 0) {
-        return 1;
+        return 2;
     }
     sim.set_en(1);
     sim.set_d(0xA);
     sim.step();
     if (sim.get_y() != 0xA) {
-        return 2;
+        return 3;
     }
     sim.set_d(0x5);
     sim.step();
     if (sim.get_y() != 0x5) {
-        return 3;
+        return 4;
     }
     return 0;
 }
