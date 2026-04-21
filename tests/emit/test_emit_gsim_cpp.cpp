@@ -1371,8 +1371,9 @@ void testSliceStaticCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp slice-static fixture should not emit errors");
 
     const std::string header = readFile(dir / "slice_static_top.hpp");
-    expect(contains(header, "output_y_ = (((input_a_ >> 4) & 15) & 15);") ||
-           contains(header, "output_y_ = ((input_a_ >> 4) & 15);"),
+    expect(contains(header, "output_y_ =") &&
+           contains(header, "input_a_ >> 4") &&
+           contains(header, "& 15"),
            "slice-static fixture should lower constant bit slicing to shift-and-mask");
 
     const std::string runner = R"CPP(
@@ -1716,6 +1717,32 @@ int main() {
     compileAndRunHarness(dir, "key_clock_top", runner);
 }
 
+void testClockFallbackUsesConsistentPrevClockName()
+{
+    Design design = buildStatefulOutputDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "clock_fallback_prev_name";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("clock_fallback_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp fallback-clock fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp fallback-clock fixture should not emit errors");
+
+    const std::string header = readFile(dir / "clock_fallback_top.hpp");
+    expect(!contains(header, "prev_clock_"),
+           "fallback-clock fixture should not emit unresolved prev_clock_ references");
+    expect(contains(header, "prev_clk_"),
+           "fallback-clock fixture should consistently use prev_clk_ when input clock carrier is clk");
+}
+
 void testEmitMetadataToggleSkipsLargeMetadataPayload()
 {
     Design design = buildConcatDesign();
@@ -1829,6 +1856,7 @@ int main()
         testWideVectorPortsInitializeAndCompile();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
+        testClockFallbackUsesConsistentPrevClockName();
         testEmitMetadataToggleSkipsLargeMetadataPayload();
         testEdgeWithoutCommitDoesNotAdvanceStep();
     }

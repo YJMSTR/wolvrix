@@ -1450,6 +1450,13 @@ namespace wolvrix::lib::emit
                             std::string currClockExpr;
                             auto exprIt = state.sequentialClockExprs.find(domain.first);
                             if (exprIt != state.sequentialClockExprs.end()) {
+                                if (!hasPortNamed(resolvedClock)) {
+                                    if (auto fallbackClock = findClockLikeInputName(state.inputPorts)) {
+                                        if (resolvedClock == "clock" || resolvedClock == "unnamed") {
+                                            resolvedClock = *fallbackClock;
+                                        }
+                                    }
+                                }
                                 currClockExpr = exprIt->second;
                             } else {
                                 if (!hasPortNamed(resolvedClock)) {
