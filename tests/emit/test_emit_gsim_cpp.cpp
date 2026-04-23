@@ -1792,6 +1792,8 @@ void testSingleClockRuntimeCompileAndRun()
     const std::string source = readFile(dir / "runtime_top.cpp");
     expect(contains(header, "void settle()"), "runtime fixture should expose settle");
     expect(contains(header, "void commit_step()"), "runtime fixture should expose commit_step");
+    expect(contains(header, "bool non_clock_inputs_dirty_ = true;"),
+           "runtime fixture should track non-clock input dirtiness");
 
     const std::string runner = R"CPP(
 #include "runtime_top.hpp"

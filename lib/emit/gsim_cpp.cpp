@@ -1543,7 +1543,8 @@ namespace wolvrix::lib::emit
             const wolvrix::lib::grh::Graph& graph,
             CodegenState& state,
             PortOrderStrategy strategy = PortOrderStrategy::Decl,
-            const std::vector<std::string>& customOrder = {})
+            const std::vector<std::string>& customOrder = {},
+            const std::vector<std::string>& outputKeepPrefixes = {})
         {
             for (const auto& port : graph.inputPorts()) {
                 auto value = graph.getValue(port.value);
@@ -1556,6 +1557,18 @@ namespace wolvrix::lib::emit
             }
 
             for (const auto& port : graph.outputPorts()) {
+                if (!outputKeepPrefixes.empty()) {
+                    bool keep = false;
+                    for (const auto& prefix : outputKeepPrefixes) {
+                        if (port.name.rfind(prefix, 0) == 0) {
+                            keep = true;
+                            break;
+                        }
+                    }
+                    if (!keep) {
+                        continue;
+                    }
+                }
                 auto value = graph.getValue(port.value);
                 std::string type = getCppTypeForWidth(value.width());
                 state.outputPorts.push_back({port.name, type});
@@ -1810,6 +1823,30 @@ namespace wolvrix::lib::emit
                 return std::nullopt;
             }
             return it->second;
+        }
+
+        std::vector<std::string> splitCsv(std::string_view text)
+        {
+            std::vector<std::string> out;
+            std::size_t start = 0;
+            while (start < text.size())
+            {
+                const std::size_t comma = text.find(',', start);
+                const std::size_t end = comma == std::string_view::npos ? text.size() : comma;
+                std::string item(text.substr(start, end - start));
+                item.erase(item.begin(), std::find_if(item.begin(), item.end(), [](unsigned char ch) { return !std::isspace(ch); }));
+                item.erase(std::find_if(item.rbegin(), item.rend(), [](unsigned char ch) { return !std::isspace(ch); }).base(), item.end());
+                if (!item.empty())
+                {
+                    out.push_back(std::move(item));
+                }
+                if (comma == std::string_view::npos)
+                {
+                    break;
+                }
+                start = comma + 1;
+            }
+            return out;
         }
 
         std::string sanitizeIdentifier(std::string_view text)
@@ -2645,9 +2682,23 @@ namespace wolvrix::lib::emit
             os << "    void step();\n\n";
 
             // Input port setters
+            std::set<std::string> sequentialClockInputs;
+            for (const auto &domain : state.sequentialStmts) {
+                const auto parsedDomain = parseSequentialDomain(domain.first);
+                if (!parsedDomain) {
+                    continue;
+                }
+                sequentialClockInputs.insert(resolveSequentialClockStateName(parsedDomain->second, state.inputPorts));
+            }
             for (const auto& [name, type] : state.inputPorts) {
                 std::string methodName = "set_" + sanitizeIdentifier(name);
-                os << "    void " << methodName << "(" << type << " value) { input_" << sanitizeIdentifier(name) << "_ = value; }\n";
+                if (sequentialClockInputs.count(name) > 0) {
+                    os << "    void " << methodName << "(" << type << " value) { input_" << sanitizeIdentifier(name) << "_ = value; }\n";
+                } else {
+                    os << "    void " << methodName << "(" << type << " value) { if (!(input_"
+                       << sanitizeIdentifier(name) << "_ == value)) { input_" << sanitizeIdentifier(name)
+                       << "_ = value; non_clock_inputs_dirty_ = true; } }\n";
+                }
             }
             if (!state.inputPorts.empty()) os << "\n";
 
@@ -2704,6 +2755,7 @@ namespace wolvrix::lib::emit
             os << "    std::uint64_t log_end_ = 0;\n";
             os << "    std::unique_ptr<SSimTopState> state_;\n";
             os << "    std::unique_ptr<SSimTopEvalTemps> evalTemps_;\n";
+            os << "    bool non_clock_inputs_dirty_ = true;\n";
             std::set<std::string> prevClockNames;
             for (const auto &domain : state.sequentialStmts) {
                 const auto parsedDomain = parseSequentialDomain(domain.first);
@@ -2864,6 +2916,7 @@ namespace wolvrix::lib::emit
                 const int32_t width = widthIt != state.outputPortWidths.end() ? widthIt->second : 0;
                 os << "    output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
             }
+            os << "    non_clock_inputs_dirty_ = true;\n";
             {
                 std::set<std::string> resetClockNames;
                 for (const auto &domain : state.sequentialStmts) {
@@ -2901,6 +2954,7 @@ namespace wolvrix::lib::emit
                     os << "    output_" << sanitizeIdentifier(portInfo.first) << "_ = " << expr << ";\n";
                 }
             }
+            os << "    non_clock_inputs_dirty_ = false;\n";
             os << "}\n\n";
 
             os << "void SSimTop::commit_step() {\n";
@@ -2972,9 +3026,11 @@ namespace wolvrix::lib::emit
                                                          : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
+                            os << "        if (non_clock_inputs_dirty_) {\n";
                             for (int i = 0; i < state.shardCount(); ++i) {
-                                os << "        sched_" << i << "();\n";
+                                os << "            sched_" << i << "();\n";
                             }
+                            os << "        }\n";
                         }
                         auto regIt = state.sequentialRegs.find(domain.first);
                         if (regIt != state.sequentialRegs.end()) {
@@ -3320,6 +3376,11 @@ namespace wolvrix::lib::emit
         CodegenState state;
         state.maxShardSize = parsePositiveIntAttr(options, "behavior_shard_max_bytes", state.maxShardSize);
         const bool emitMetadata = attrEnabled(options, "emit_metadata", true);
+        std::vector<std::string> outputKeepPrefixes;
+        if (auto keepPrefixesAttr = attrValue(options, "output_keep_prefixes"))
+        {
+            outputKeepPrefixes = splitCsv(*keepPrefixesAttr);
+        }
 
         // Determine if sharding should be enabled based on operation count.
         // HDLBits contains medium-size graphs that still explode into giant inline
@@ -3328,7 +3389,7 @@ namespace wolvrix::lib::emit
         // emitted file size becomes pathological.
         state.enableSharding = metadata->opCount > 128;
 
-        collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames);
+        collectPorts(*target->graph, state, options.portOrderStrategy, options.portOrderNames, outputKeepPrefixes);
         collectRegisters(*target->graph, state);
         collectLatches(*target->graph, state);
         collectMemories(*target->graph, state);
