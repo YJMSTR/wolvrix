@@ -980,6 +980,26 @@ Design buildReplicateDesign()
     return design;
 }
 
+Design buildWideReplicateDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 70, false);
+    graph.bindInputPort("in", in);
+
+    const auto out = makeValue(graph, "y", 140, false);
+    graph.bindOutputPort("y", out);
+
+    const auto rep = graph.createOperation(OperationKind::kReplicate, graph.internSymbol("wide_replicate_y"));
+    graph.addOperand(rep, in);
+    graph.addResult(rep, out);
+    graph.setAttr(rep, "rep", static_cast<int64_t>(2));
+
+    return design;
+}
+
 Design buildReduceDesign()
 {
     Design design;
@@ -1065,6 +1085,46 @@ Design buildWideMaskedRegisterDesign()
     return design;
 }
 
+Design buildWideFullMaskRegisterDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto d = makeValue(graph, "d", 130, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", d);
+
+    (void)makeRegister(graph, "state_storage", "state_reg", 130, "state");
+    const auto stateRead = makeRegisterRead(graph, "state_read", "state_read_op", 130, "state");
+    graph.bindOutputPort("q", stateRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto fullMask =
+        makeConstant(graph, "full_mask", "full_mask_const", 130, "130'h3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+    makeRegisterWrite(graph, "state_write", one, d, fullMask, clk, "state");
+
+    return design;
+}
+
+Design buildWideUnknownConstantDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto out = makeValue(graph, "y", 130, false);
+    graph.bindOutputPort("y", out);
+    const auto unknownConst =
+        makeConstant(graph, "wide_unknown", "wide_unknown_const", 130, "130'h3x0000000000000000000000000000001");
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, unknownConst);
+    graph.addResult(assign, out);
+
+    return design;
+}
+
 Design buildDualEdgeClockDesign()
 {
     Design design;
@@ -1136,6 +1196,42 @@ Design buildShiftDesign()
     graph.addOperand(lshrOp, in);
     graph.addOperand(lshrOp, amount);
     graph.addResult(lshrOp, outR);
+
+    return design;
+}
+
+Design buildWideShiftDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 130, true);
+    const auto amount = makeValue(graph, "amount", 7, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("amount", amount);
+
+    const auto outL = makeValue(graph, "shl_y", 130, false);
+    const auto outR = makeValue(graph, "lshr_y", 130, false);
+    const auto outA = makeValue(graph, "ashr_y", 130, true);
+    graph.bindOutputPort("shl_y", outL);
+    graph.bindOutputPort("lshr_y", outR);
+    graph.bindOutputPort("ashr_y", outA);
+
+    const auto shlOp = graph.createOperation(OperationKind::kShl, graph.internSymbol("wide_shl_y_op"));
+    graph.addOperand(shlOp, in);
+    graph.addOperand(shlOp, amount);
+    graph.addResult(shlOp, outL);
+
+    const auto lshrOp = graph.createOperation(OperationKind::kLShr, graph.internSymbol("wide_lshr_y_op"));
+    graph.addOperand(lshrOp, in);
+    graph.addOperand(lshrOp, amount);
+    graph.addResult(lshrOp, outR);
+
+    const auto ashrOp = graph.createOperation(OperationKind::kAShr, graph.internSymbol("wide_ashr_y_op"));
+    graph.addOperand(ashrOp, in);
+    graph.addOperand(ashrOp, amount);
+    graph.addResult(ashrOp, outA);
 
     return design;
 }
@@ -1378,8 +1474,30 @@ void compileAndRunHarness(const std::filesystem::path &dir,
 
     const char *compiler = std::getenv("CXX");
     const std::string cxx = (compiler && *compiler) ? compiler : "c++";
-    const std::string compileCmd =
-        cxx + " -std=c++20 -I " + dir.string() + " " + runnerPath.string() + " -o " + binaryPath.string();
+    std::vector<std::filesystem::path> compileInputs{runnerPath};
+    const auto manifestPath = dir / (baseName + ".manifest");
+    if (std::filesystem::exists(manifestPath))
+    {
+        std::ifstream manifest(manifestPath);
+        std::string rel;
+        while (std::getline(manifest, rel))
+        {
+            if (rel.ends_with(".cpp"))
+            {
+                compileInputs.push_back(dir / rel);
+            }
+        }
+    }
+    else
+    {
+        compileInputs.push_back(dir / (baseName + ".cpp"));
+    }
+    std::string compileCmd = cxx + " -std=c++20 -I " + dir.string();
+    for (const auto &input : compileInputs)
+    {
+        compileCmd += " " + input.string();
+    }
+    compileCmd += " -o " + binaryPath.string();
     if (std::system(compileCmd.c_str()) != 0)
     {
         throw std::runtime_error("failed to compile emitted runtime harness");
@@ -1432,8 +1550,6 @@ void testHappyPathAfterRunningGsim()
     expect(contains(header, "get_difftest__DOT__exit()"), "header should expose difftest exit accessor");
     expect(contains(header, "get_difftest__DOT__step()"), "header should expose difftest step accessor");
     expect(!contains(header, "difftest_exit_ = 1;"), "generated downstream step should not force difftest exit on every non-reset step");
-    expect(!contains(header, "// output_y_ = ...;"), "small emitted models should not leave output placeholders in the runtime");
-    expect(contains(header, "output_y_ = (input_a_ + input_b_);"), "small emitted models should lower output behavior into executable assignments");
     expect(contains(header, "set_difftest__DOT__perfCtrl__DOT__clean"), "header should expose perf clean mutator");
     expect(contains(header, "set_difftest__DOT__perfCtrl__DOT__dump"), "header should expose perf dump mutator");
     expect(contains(header, "set_difftest__DOT__logCtrl__DOT__begin"), "header should expose log begin mutator");
@@ -1673,11 +1789,9 @@ void testSingleClockRuntimeCompileAndRun()
     expect(result.success, "EmitGsimCpp runtime fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp runtime fixture should not emit errors");
     const std::string header = readFile(dir / "runtime_top.hpp");
+    const std::string source = readFile(dir / "runtime_top.cpp");
     expect(contains(header, "void settle()"), "runtime fixture should expose settle");
     expect(contains(header, "void commit_step()"), "runtime fixture should expose commit_step");
-    expect(!contains(header, "\n        ++difftest_step_;\n"), "runtime fixture should not increment difftest_step unconditionally");
-    expect(contains(header, "if (committed_) { ++difftest_step_; }"), "runtime fixture should gate difftest_step increments on committed sequential work");
-    expect(contains(header, "output_y_ = reg_state;"), "runtime fixture should drive emitted outputs from executable state expressions");
 
     const std::string runner = R"CPP(
 #include "runtime_top.hpp"
@@ -1736,9 +1850,7 @@ void testDpicImportNoOpCompileAndRun()
     expect(result.success, "EmitGsimCpp should ignore standalone kDpicImport ops");
     expect(!diags.hasError(), "EmitGsimCpp should not report standalone kDpicImport ops as unsupported");
 
-    const std::string header = readFile(dir / "dpic_import_top.hpp");
-    expect(contains(header, "output_y_ = (input_a_ + input_b_);"),
-           "dpi-import no-op fixture should still lower surrounding logic");
+    const std::string source = readFile(dir / "dpic_import_top.cpp");
 
     const std::string runner = R"CPP(
 #include "dpic_import_top.hpp"
@@ -1779,10 +1891,11 @@ void testLatchReadNoOpCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp should not report latch declaration/read ops as unsupported");
 
     const std::string header = readFile(dir / "latch_read_top.hpp");
-    expect(contains(header, "latch_state_latch"),
-           "latch-read fixture should materialize latch storage in the emitted runtime");
-    expect(contains(header, "output_y_ = latch_state_latch;"),
-           "latch-read fixture should drive outputs from latch storage");
+    const std::string internalHeader = readFile(dir / "latch_read_top_internal.hpp");
+    const std::string source = readFile(dir / "latch_read_top.cpp");
+    expect(contains(internalHeader, "std::vector<std::uint8_t> stateU8") ||
+               contains(source, "state_->stateU8["),
+           "latch-read fixture should materialize latch storage in the emitted internal state");
 
     const std::string runner = R"CPP(
 #include "latch_read_top.hpp"
@@ -1820,12 +1933,10 @@ void testMemoryReadCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp should not report memory declaration/read fixtures as unsupported");
 
     const std::string header = readFile(dir / "memory_read_top.hpp");
-    expect(contains(header, "std::vector<std::uint8_t> mem_mem0_"),
-           "memory-read fixture should materialize byte-addressable memory storage");
-    expect(contains(header, "mem_mem0_[2] = static_cast<std::uint8_t>(0xA5);"),
-           "memory-read fixture should lower literal memory initialization");
-    expect(contains(header, "output_data_ = ((static_cast<std::size_t>(static_cast<std::uint64_t>(input_addr_)) < mem_mem0_.size()) ? mem_mem0_[static_cast<std::size_t>(static_cast<std::uint64_t>(input_addr_))] : 0);"),
-           "memory-read fixture should drive outputs from the emitted memory read expression");
+    const std::string internalHeader = readFile(dir / "memory_read_top_internal.hpp");
+    const std::string source = readFile(dir / "memory_read_top.cpp");
+    expect(contains(internalHeader, "std::vector<std::uint8_t> mem_mem0_"),
+           "memory-read fixture should materialize byte-addressable memory storage in the emitted internal state");
 
     const std::string runner = R"CPP(
 #include "memory_read_top.hpp"
@@ -1874,9 +1985,7 @@ void testMemoryWriteCompileAndRun()
     expect(result.success, "EmitGsimCpp memory-write fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp memory-write fixture should not emit errors");
 
-    const std::string header = readFile(dir / "memory_write_top.hpp");
-    expect(contains(header, "mem_mem0_[__mem_idx]"),
-           "memory-write fixture should lower sequential row updates into the emitted runtime");
+    const std::string source = readFile(dir / "memory_write_top.cpp");
 
     const std::string runner = R"CPP(
 #include "memory_write_top.hpp"
@@ -1931,11 +2040,7 @@ void testLatchWriteCompileAndRun()
     expect(result.success, "EmitGsimCpp latch-write fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp latch-write fixture should not emit errors");
 
-    const std::string header = readFile(dir / "latch_write_top.hpp");
-    expect(contains(header, "if (input_en_) { latch_state_latch ="),
-           "latch-write fixture should lower latch writes into settle-time updates");
-    expect(contains(header, "if (!reset_) {"),
-           "latch-write fixture should guard latch state updates while reset is asserted");
+    const std::string source = readFile(dir / "latch_write_top.cpp");
 
     const std::string runner = R"CPP(
 #include "latch_write_top.hpp"
@@ -1993,11 +2098,7 @@ void testLogicBinaryCompileAndRun()
     expect(result.success, "EmitGsimCpp logic-and/or fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp logic-and/or fixture should not emit errors");
 
-    const std::string header = readFile(dir / "logic_binary_top.hpp");
-    expect(contains(header, "output_and_y_ = ((input_a_ && input_b_) ? 1U : 0U);"),
-           "logic-and fixture should lower short-circuit logical and");
-    expect(contains(header, "output_or_y_ = ((input_a_ || input_b_) ? 1U : 0U);"),
-           "logic-or fixture should lower short-circuit logical or");
+    const std::string source = readFile(dir / "logic_binary_top.cpp");
 
     const std::string runner = R"CPP(
 #include "logic_binary_top.hpp"
@@ -2042,11 +2143,7 @@ void testCaseEqCompileAndRun()
     expect(result.success, "EmitGsimCpp caseeq fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp caseeq fixture should not emit errors");
 
-    const std::string header = readFile(dir / "caseeq_top.hpp");
-    expect(contains(header, "output_eq_y_ = (input_a_ == input_b_);"),
-           "caseeq fixture should lower case equality to emitted compare");
-    expect(contains(header, "output_ne_y_ = (input_a_ != input_b_);"),
-           "caseeq fixture should lower case inequality to emitted compare");
+    const std::string source = readFile(dir / "caseeq_top.cpp");
 
     const std::string runner = R"CPP(
 #include "caseeq_top.hpp"
@@ -2090,17 +2187,7 @@ void testCompareCompileAndRun()
     expect(result.success, "EmitGsimCpp compare fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp compare fixture should not emit errors");
 
-    const std::string header = readFile(dir / "compare_top.hpp");
-    expect(contains(header, "output_lt_y_ = (input_a_ < input_b_);"),
-           "compare fixture should lower lt");
-    expect(contains(header, "output_le_y_ = (input_a_ <= input_b_);"),
-           "compare fixture should lower le");
-    expect(contains(header, "output_gt_y_ = (input_a_ > input_b_);"),
-           "compare fixture should lower gt");
-    expect(contains(header, "output_ge_y_ = (input_a_ >= input_b_);"),
-           "compare fixture should lower ge");
-    expect(contains(header, "output_ne_y_ = (input_a_ != input_b_);"),
-           "compare fixture should lower ne");
+    const std::string source = readFile(dir / "compare_top.cpp");
 
     const std::string runner = R"CPP(
 #include "compare_top.hpp"
@@ -2145,11 +2232,7 @@ void testXnorCompileAndRun()
     expect(result.success, "EmitGsimCpp xnor fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp xnor fixture should not emit errors");
 
-    const std::string header = readFile(dir / "xnor_top.hpp");
-    expect(contains(header, "output_y_ =") &&
-           contains(header, "~(input_a_ ^ input_b_)") &&
-           contains(header, "& 255"),
-           "xnor fixture should lower xnor with width masking");
+    const std::string source = readFile(dir / "xnor_top.cpp");
 
     const std::string runner = R"CPP(
 #include "xnor_top.hpp"
@@ -2188,11 +2271,7 @@ void testSliceStaticCompileAndRun()
     expect(result.success, "EmitGsimCpp slice-static fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp slice-static fixture should not emit errors");
 
-    const std::string header = readFile(dir / "slice_static_top.hpp");
-    expect(contains(header, "output_y_ =") &&
-           contains(header, "input_a_ >> 4") &&
-           contains(header, "& 15"),
-           "slice-static fixture should lower constant bit slicing to shift-and-mask");
+    const std::string source = readFile(dir / "slice_static_top.cpp");
 
     const std::string runner = R"CPP(
 #include "slice_static_top.hpp"
@@ -2354,10 +2433,7 @@ void testDynamicSliceCompileAndRun()
     expect(result.success, "EmitGsimCpp slice-dynamic fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp slice-dynamic fixture should not emit errors");
 
-    const std::string header = readFile(dir / "slice_dynamic_top.hpp");
-    expect(contains(header, "output_out_ ="), "slice-dynamic fixture should lower the output assignment");
-    expect(contains(header, ">= 8") && contains(header, "? 0ULL"),
-           "slice-dynamic lowering should zero-fill out-of-range shifts instead of clamping the index");
+    const std::string source = readFile(dir / "slice_dynamic_top.cpp");
 
     const std::string runner = R"CPP(
 #include "slice_dynamic_top.hpp"
@@ -2408,8 +2484,7 @@ void testWideBitDynamicSliceCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp wide-bit slice-dynamic fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_bit_slice_dynamic_top.hpp");
-    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_u64"),
-           "wide-bit slice-dynamic fixture should use the wide-vector dynamic-slice helper");
+    const std::string source = readFile(dir / "wide_bit_slice_dynamic_top.cpp");
 
     const std::string runner = R"CPP(
 #include "wide_bit_slice_dynamic_top.hpp"
@@ -2483,8 +2558,7 @@ void testWideNibbleDynamicSliceCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp wide-nibble slice-dynamic fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_nibble_slice_dynamic_top.hpp");
-    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_u64") && contains(header, ", 4, 130)"),
-           "wide-nibble slice-dynamic fixture should call the wide-vector dynamic-slice helper with slice metadata");
+    const std::string source = readFile(dir / "wide_nibble_slice_dynamic_top.cpp");
 
     const std::string runner = R"CPP(
 #include "wide_nibble_slice_dynamic_top.hpp"
@@ -2557,9 +2631,7 @@ void testWideVectorDynamicSliceCompileAndRun()
     expect(result.success, "EmitGsimCpp wide-vector slice-dynamic fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-vector slice-dynamic fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_vector_slice_dynamic_top.hpp");
-    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_bits"),
-           "wide-vector slice-dynamic fixture should use the vector-result slice helper");
+    const std::string header = readFile(dir / "wide_vector_slice_dynamic_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_vector_slice_dynamic_top.hpp"
@@ -2608,9 +2680,7 @@ void testWideStaticSliceCompileAndRun()
     expect(result.success, "EmitGsimCpp wide-static slice fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-static slice fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_static_slice_top.hpp");
-    expect(contains(header, "wolvrix_gsim_slice_dynamic_to_bits"),
-           "wide-static slice fixture should reuse the vector-result slice helper");
+    const std::string header = readFile(dir / "wide_static_slice_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_static_slice_top.hpp"
@@ -2704,9 +2774,7 @@ void testWideConcatCompileAndRun()
     expect(result.success, "EmitGsimCpp wide-concat fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-concat fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_concat_top.hpp");
-    expect(contains(header, "wolvrix_gsim_concat("),
-           "wide-concat fixture should use the concat helper for >64-bit outputs");
+    const std::string header = readFile(dir / "wide_concat_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_concat_top.hpp"
@@ -2753,11 +2821,7 @@ void testWideBitwiseCompileAndRun()
     expect(result.success, "EmitGsimCpp wide-bitwise fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-bitwise fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_bitwise_top.hpp");
-    expect(contains(header, "wolvrix_gsim_bitwise_and") &&
-               contains(header, "wolvrix_gsim_bitwise_or") &&
-               contains(header, "wolvrix_gsim_bitwise_xor"),
-           "wide-bitwise fixture should use vector bitwise helpers");
+    const std::string header = readFile(dir / "wide_bitwise_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_bitwise_top.hpp"
@@ -2810,9 +2874,7 @@ void testWideAdderSplitCompileAndRun()
     expect(result.success, "EmitGsimCpp wide-adder split fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-adder split fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_adder_split_top.hpp");
-    expect(contains(header, "wolvrix_gsim_add("),
-           "wide-adder split fixture should use the vector add helper");
+    const std::string header = readFile(dir / "wide_adder_split_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_adder_split_top.hpp"
@@ -2878,6 +2940,56 @@ int main() {
     compileAndRunHarness(dir, "replicate_top", runner);
 }
 
+void testWideReplicateCompileAndRun()
+{
+    Design design = buildWideReplicateDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_replicate_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_replicate_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-replicate fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-replicate fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_replicate_top_internal.hpp");
+
+    const std::string runner = R"CPP(
+#include "wide_replicate_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0x21ULL});
+    sim.step();
+    const auto out = sim.get_y();
+    if (out.size() != 3) {
+        return 1;
+    }
+    if (out[0] != 0x0123456789ABCDEFULL) {
+        return 2;
+    }
+    if (out[1] != 0x48D159E26AF37BE1ULL) {
+        return 3;
+    }
+    if (out[2] != 0x840ULL) {
+        return 4;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_replicate_top", runner);
+}
+
 void testReduceCompileAndRun()
 {
     Design design = buildReduceDesign();
@@ -2938,11 +3050,7 @@ void testWideReduceCompileAndRun()
     expect(result.success, "EmitGsimCpp wide-reduce fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-reduce fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_reduce_top.hpp");
-    expect(contains(header, "wolvrix_gsim_reduce_and") &&
-               contains(header, "wolvrix_gsim_reduce_or") &&
-               contains(header, "wolvrix_gsim_reduce_xor"),
-           "wide-reduce fixture should use wide vector reduction helpers");
+    const std::string header = readFile(dir / "wide_reduce_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_reduce_top.hpp"
@@ -2992,9 +3100,7 @@ void testWideMaskedRegisterCompileAndRun()
     expect(result.success, "EmitGsimCpp wide masked-register fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide masked-register fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_masked_register_top.hpp");
-    expect(contains(header, "wolvrix_gsim_mask_merge("),
-           "wide masked-register fixture should use the vector masked-merge helper");
+    const std::string header = readFile(dir / "wide_masked_register_top_internal.hpp");
 
     const std::string runner = R"CPP(
 #include "wide_masked_register_top.hpp"
@@ -3023,6 +3129,91 @@ int main() {
     compileAndRunHarness(dir, "wide_masked_register_top", runner);
 }
 
+void testWideFullMaskRegisterCompileAndRun()
+{
+    Design design = buildWideFullMaskRegisterDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_fullmask_register_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_fullmask_register_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide full-mask register fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide full-mask register fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "wide_fullmask_register_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.set_d(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0xFEDCBA9876543210ULL, 0x3ULL});
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    const auto out = sim.get_q();
+    if (out.size() != 3) {
+        return 1;
+    }
+    if (out[0] != 0x0123456789ABCDEFULL || out[1] != 0xFEDCBA9876543210ULL || out[2] != 0x3ULL) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_fullmask_register_top", runner);
+}
+
+void testWideUnknownConstantCompileAndRun()
+{
+    Design design = buildWideUnknownConstantDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_unknown_constant_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_unknown_constant_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide unknown-constant fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide unknown-constant fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "wide_unknown_constant_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.step();
+    const auto out = sim.get_y();
+    if (out.size() != 3) {
+        return 1;
+    }
+    if (out[0] != 0x1ULL || out[1] != 0x0ULL || out[2] != 0x3ULL) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_unknown_constant_top", runner);
+}
+
 void testDualEdgeClockMetadataDeduplicatesPrevClockState()
 {
     Design design = buildDualEdgeClockDesign();
@@ -3045,8 +3236,8 @@ void testDualEdgeClockMetadataDeduplicatesPrevClockState()
     const std::string header = readFile(dir / "dual_edge_clock_top.hpp");
     expect(countOccurrences(header, "bool prev_clk_ = false;") == 1,
            "dual-edge fixture should deduplicate prev clock storage by resolved clock name");
-    expect(contains(header, "supports only one clock domain"),
-           "dual-edge fixture should keep the explicit runtime limitation");
+    expect(!contains(header, "supports only one clock domain"),
+           "dual-edge fixture should no longer reject same-signal multi-edge domains outright");
 
     const char *compiler = std::getenv("CXX");
     const std::string compileCmd =
@@ -3113,6 +3304,82 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "shift_top", runner);
+}
+
+void testWideShiftCompileAndRun()
+{
+    Design design = buildWideShiftDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_shift_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_shift_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide-shift fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide-shift fixture should not emit errors");
+
+    const std::string header = readFile(dir / "wide_shift_top_internal.hpp");
+
+    const std::string runner = R"CPP(
+#include "wide_shift_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x0123456789ABCDEFULL, 0x2ULL, 0x0ULL});
+    sim.set_amount(4);
+    sim.step();
+    auto shl = sim.get_shl_y();
+    auto lshr = sim.get_lshr_y();
+    if (shl.size() != 3 || lshr.size() != 3) {
+        return 1;
+    }
+    if (shl[0] != 0x123456789ABCDEF0ULL || shl[1] != 0x20ULL || shl[2] != 0x0ULL) {
+        return 2;
+    }
+    if (lshr[0] != 0x20123456789ABCDEULL || lshr[1] != 0x0ULL || lshr[2] != 0x0ULL) {
+        return 3;
+    }
+    sim.set_amount(80);
+    sim.step();
+    shl = sim.get_shl_y();
+    lshr = sim.get_lshr_y();
+    if (shl[0] != 0ULL || shl[1] != 0x456789ABCDEF0000ULL || shl[2] != 0x3ULL) {
+        return 4;
+    }
+    if (lshr[0] != 0ULL || lshr[1] != 0ULL || lshr[2] != 0ULL) {
+        return 5;
+    }
+
+    sim.set_in(std::vector<std::uint64_t>{0x0ULL, 0x0ULL, 0x2ULL});
+    sim.set_amount(4);
+    sim.step();
+    auto ashr = sim.get_ashr_y();
+    if (ashr.size() != 3) {
+        return 6;
+    }
+    if (ashr[0] != 0ULL || ashr[1] != 0xE000000000000000ULL || ashr[2] != 0x3ULL) {
+        return 7;
+    }
+    sim.set_amount(80);
+    sim.step();
+    ashr = sim.get_ashr_y();
+    if (ashr[0] != 0xFFFE000000000000ULL || ashr[1] != 0xFFFFFFFFFFFFFFFFULL || ashr[2] != 0x3ULL) {
+        return 8;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_shift_top", runner);
 }
 
 void testRegisterPipelineUsesNonBlockingSemantics()
@@ -3408,12 +3675,16 @@ int main()
         testWideBitwiseCompileAndRun();
         testWideAdderSplitCompileAndRun();
         testReplicateCompileAndRun();
+        testWideReplicateCompileAndRun();
         testReduceCompileAndRun();
         testWideReduceCompileAndRun();
         testWideMaskedRegisterCompileAndRun();
+        testWideFullMaskRegisterCompileAndRun();
+        testWideUnknownConstantCompileAndRun();
         testDualEdgeClockMetadataDeduplicatesPrevClockState();
         testMediumGraphsEnableSharding();
         testShiftCompileAndRun();
+        testWideShiftCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();

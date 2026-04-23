@@ -199,6 +199,7 @@ namespace
         return 0;
     }
 
+
     int test_true_loop_reported()
     {
         wolvrix::lib::grh::Design design;
