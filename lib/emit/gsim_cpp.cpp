@@ -62,6 +62,7 @@ namespace wolvrix::lib::emit
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             std::map<std::string, std::vector<std::string>> sequentialRegs;
+            std::map<std::string, std::map<std::string, std::vector<std::string>>> sequentialRegStmts;
             std::map<std::string, std::string> sequentialClockExprs;
 
             // Non-sharded combinational statements for small designs
@@ -217,6 +218,14 @@ namespace wolvrix::lib::emit
                 }
                 return "state_->" + storageName;
             }
+        };
+
+        struct SequentialChunkPlan
+        {
+            std::string domainKey;
+            std::string methodName;
+            std::vector<std::string> regNames;
+            std::vector<std::string> stmts;
         };
 
         // Convert Verilog-style constant to C++ constant
@@ -1455,31 +1464,32 @@ namespace wolvrix::lib::emit
                         }
                     }
 
-                    if (!regName.empty()) {
-                        auto &domainRegs = state.sequentialRegs[domainKey];
-                        if (std::find(domainRegs.begin(), domainRegs.end(), regName) == domainRegs.end()) {
-                            domainRegs.push_back(regName);
-                        }
-                        const std::string regExpr = state.persistentStorageExpr(regName);
-                        const auto regWidthIt = state.storageWidths.find(regName);
-                        const bool wideReg = regWidthIt != state.storageWidths.end() && regWidthIt->second > 64;
-                        if (mask != "0") {
-                            if (wideReg) {
-                                state.sequentialStmts[domainKey].push_back(
-                                    "        if (" + condition + ") { next_" + regName +
-                                    " = wolvrix_gsim_mask_merge(" + regExpr + ", " + nextValue + ", " + mask +
-                                    "); committed_ = true; }");
-                            } else {
-                                state.sequentialStmts[domainKey].push_back(
-                                    "        if (" + condition + ") { next_" + regName + " = (" + regExpr +
-                                    " & ~" + mask + ") | (" + nextValue + " & " + mask +
-                                    "); committed_ = true; }");
+                        if (!regName.empty()) {
+                            auto &domainRegs = state.sequentialRegs[domainKey];
+                            if (std::find(domainRegs.begin(), domainRegs.end(), regName) == domainRegs.end()) {
+                                domainRegs.push_back(regName);
                             }
-                        } else {
-                            state.sequentialStmts[domainKey].push_back(
-                                "        if (" + condition + ") { next_" + regName + " = " + nextValue + "; committed_ = true; }");
+                            const std::string regExpr = state.persistentStorageExpr(regName);
+                            const std::string nextRegExpr = "next_" + regName;
+                            const auto regWidthIt = state.storageWidths.find(regName);
+                            const bool wideReg = regWidthIt != state.storageWidths.end() && regWidthIt->second > 64;
+                            if (mask != "0") {
+                                if (wideReg) {
+                                    state.sequentialRegStmts[domainKey][regName].push_back(
+                                        "        if (" + condition + ") { " + nextRegExpr +
+                                        " = wolvrix_gsim_mask_merge(" + regExpr + ", " + nextValue + ", " + mask +
+                                        "); committed_ = true; }");
+                                } else {
+                                    state.sequentialRegStmts[domainKey][regName].push_back(
+                                        "        if (" + condition + ") { " + nextRegExpr + " = (" + regExpr +
+                                        " & ~" + mask + ") | (" + nextValue + " & " + mask +
+                                        "); committed_ = true; }");
+                                }
+                            } else {
+                                state.sequentialRegStmts[domainKey][regName].push_back(
+                                    "        if (" + condition + ") { " + nextRegExpr + " = " + nextValue + "; committed_ = true; }");
+                            }
                         }
-                    }
                     break;
                 }
 
@@ -1623,9 +1633,7 @@ namespace wolvrix::lib::emit
                         continue;
                     }
                     std::string type = getCppTypeForWidth(width);
-                    const std::string zeroInit = zeroInitializerForWidth(width);
                     const std::string regExpr = state.allocatePersistentStorage(regName, type, width);
-                    state.storageResetStmts.push_back(regExpr + " = " + zeroInit + ";");
                     state.storageWidths[regName] = width;
 
                     // Also create a mapping from the register's result ValueId to the register name
@@ -1673,9 +1681,7 @@ namespace wolvrix::lib::emit
                         }
                         continue;
                     }
-                    const std::string zeroInit = zeroInitializerForWidth(width);
                     const std::string latchExpr = state.allocatePersistentStorage(latchName, type, width);
-                    state.storageResetStmts.push_back(latchExpr + " = " + zeroInit + ";");
                     state.storageWidths[latchName] = width;
                     if (!op.results().empty()) {
                         state.valueVars[op.results()[0]] = latchExpr;
@@ -1717,7 +1723,6 @@ namespace wolvrix::lib::emit
                 const std::string initExpr =
                     storageType + "(" + std::to_string(memory.rows) + ", " + memory.zeroExpr + ")";
                 state.storageDecls.push_back(storageType + " " + memory.storageName + " = " + initExpr + ";");
-                state.storageResetStmts.push_back("state_->" + memory.storageName + " = " + initExpr + ";");
                 state.memories.emplace(sym, memory);
 
                 auto initKindsAttr = op.attr("initKind");
@@ -2246,6 +2251,76 @@ namespace wolvrix::lib::emit
             return std::make_pair(std::string(key.substr(0, pos)), std::string(key.substr(pos + 1)));
         }
 
+        std::vector<SequentialChunkPlan> buildSequentialChunkPlans(const CodegenState& state)
+        {
+            std::vector<SequentialChunkPlan> plans;
+            const std::size_t maxChunkBytes = static_cast<std::size_t>(std::max(32768, state.maxShardSize));
+            std::set<std::string> domains;
+            for (const auto& [domainKey, _] : state.sequentialRegStmts) {
+                domains.insert(domainKey);
+            }
+            for (const auto& [domainKey, _] : state.sequentialStmts) {
+                domains.insert(domainKey);
+            }
+            for (const auto& domainKey : domains) {
+                std::size_t chunkIndex = 0;
+                if (auto regIt = state.sequentialRegStmts.find(domainKey); regIt != state.sequentialRegStmts.end()) {
+                    SequentialChunkPlan current;
+                    current.domainKey = domainKey;
+                    std::size_t currentBytes = 0;
+                    auto flushCurrent = [&]() {
+                        if (current.regNames.empty() && current.stmts.empty()) {
+                            return;
+                        }
+                        current.methodName = "commit_chunk_" + sanitizeIdentifier(domainKey) + "_" + std::to_string(chunkIndex++);
+                        plans.push_back(current);
+                        current = SequentialChunkPlan{};
+                        current.domainKey = domainKey;
+                        currentBytes = 0;
+                    };
+                    for (const auto& [regName, stmts] : regIt->second) {
+                        std::size_t estimatedBytes = regName.size() * 2 + 64;
+                        for (const auto& stmt : stmts) {
+                            estimatedBytes += stmt.size() + 1;
+                        }
+                        if ((!current.regNames.empty() || !current.stmts.empty()) &&
+                            currentBytes + estimatedBytes > maxChunkBytes) {
+                            flushCurrent();
+                        }
+                        current.regNames.push_back(regName);
+                        current.stmts.insert(current.stmts.end(), stmts.begin(), stmts.end());
+                        currentBytes += estimatedBytes;
+                    }
+                    flushCurrent();
+                }
+                if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
+                    SequentialChunkPlan current;
+                    current.domainKey = domainKey;
+                    std::size_t currentBytes = 0;
+                    auto flushCurrent = [&]() {
+                        if (current.stmts.empty()) {
+                            return;
+                        }
+                        current.methodName = "commit_chunk_" + sanitizeIdentifier(domainKey) + "_" + std::to_string(chunkIndex++);
+                        plans.push_back(current);
+                        current = SequentialChunkPlan{};
+                        current.domainKey = domainKey;
+                        currentBytes = 0;
+                    };
+                    for (const auto& stmt : stmtIt->second) {
+                        const std::size_t estimatedBytes = stmt.size() + 1;
+                        if (!current.stmts.empty() && currentBytes + estimatedBytes > maxChunkBytes) {
+                            flushCurrent();
+                        }
+                        current.stmts.push_back(stmt);
+                        currentBytes += estimatedBytes;
+                    }
+                    flushCurrent();
+                }
+            }
+            return plans;
+        }
+
         void writeRuntimeHelpers(std::ostream &os)
         {
             os << "#include <algorithm>\n";
@@ -2655,6 +2730,7 @@ namespace wolvrix::lib::emit
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
                          const CodegenState& state,
+                         const std::vector<SequentialChunkPlan>& sequentialChunks,
                          bool emitMetadata)
         {
             const std::string ns = sanitizeIdentifier(target.scratchGraphSymbol);
@@ -2683,8 +2759,15 @@ namespace wolvrix::lib::emit
 
             // Input port setters
             std::set<std::string> sequentialClockInputs;
+            std::set<std::string> headerSequentialDomains;
             for (const auto &domain : state.sequentialStmts) {
-                const auto parsedDomain = parseSequentialDomain(domain.first);
+                headerSequentialDomains.insert(domain.first);
+            }
+            for (const auto &domain : state.sequentialRegStmts) {
+                headerSequentialDomains.insert(domain.first);
+            }
+            for (const auto &domainKey : headerSequentialDomains) {
+                const auto parsedDomain = parseSequentialDomain(domainKey);
                 if (!parsedDomain) {
                     continue;
                 }
@@ -2726,6 +2809,7 @@ namespace wolvrix::lib::emit
                 for (int i = 0; i < state.shardCount(); ++i) {
                     os << "    void sched_" << i << "();\n";
                 }
+                os << "    void replay_dirty_input_shards();\n";
                 os << "\n";
             }
             os << "    bool reset_ = false;\n";
@@ -2756,9 +2840,12 @@ namespace wolvrix::lib::emit
             os << "    std::unique_ptr<SSimTopState> state_;\n";
             os << "    std::unique_ptr<SSimTopEvalTemps> evalTemps_;\n";
             os << "    bool non_clock_inputs_dirty_ = true;\n";
+            for (const auto &chunk : sequentialChunks) {
+                os << "    void " << chunk.methodName << "(bool& committed_);\n";
+            }
             std::set<std::string> prevClockNames;
-            for (const auto &domain : state.sequentialStmts) {
-                const auto parsedDomain = parseSequentialDomain(domain.first);
+            for (const auto &domainKey : headerSequentialDomains) {
+                const auto parsedDomain = parseSequentialDomain(domainKey);
                 if (parsedDomain) {
                     const std::string prevClockName =
                         resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
@@ -2815,6 +2902,7 @@ namespace wolvrix::lib::emit
                          const EmitTarget &target,
                          const GsimScratchpadMetadata &metadata,
                          const CodegenState& state,
+                         const std::vector<SequentialChunkPlan>& sequentialChunks,
                          std::string_view headerFilename,
                          bool emitMetadata)
         {
@@ -2822,6 +2910,15 @@ namespace wolvrix::lib::emit
             const std::string structName = "GsimMetadata_" + ns;
             const std::string factoryName = "make_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
             const std::string validateName = "validate_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
+            std::map<std::string, std::vector<std::string>> sequentialChunkMethods;
+            std::set<std::string> sequentialDomains;
+            for (const auto &domain : state.sequentialStmts) {
+                sequentialDomains.insert(domain.first);
+            }
+            for (const auto &chunk : sequentialChunks) {
+                sequentialChunkMethods[chunk.domainKey].push_back(chunk.methodName);
+                sequentialDomains.insert(chunk.domainKey);
+            }
 
             std::string internalHeader = std::filesystem::path(std::string(headerFilename)).stem().string() + "_internal.hpp";
             os << "#include \"" << internalHeader << "\"\n\n";
@@ -2917,14 +3014,14 @@ namespace wolvrix::lib::emit
                 os << "    output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
             }
             os << "    non_clock_inputs_dirty_ = true;\n";
-            {
-                std::set<std::string> resetClockNames;
-                for (const auto &domain : state.sequentialStmts) {
-                    const auto parsedDomain = parseSequentialDomain(domain.first);
-                    if (parsedDomain) {
-                        const std::string resetClock =
-                            resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                        if (resetClockNames.insert(resetClock).second) {
+                    {
+                        std::set<std::string> resetClockNames;
+                        for (const auto &domainKey : sequentialDomains) {
+                            const auto parsedDomain = parseSequentialDomain(domainKey);
+                            if (parsedDomain) {
+                                const std::string resetClock =
+                                    resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                                if (resetClockNames.insert(resetClock).second) {
                             os << "    prev_" << resetClock << "_ = false;\n";
                         }
                     }
@@ -2957,14 +3054,22 @@ namespace wolvrix::lib::emit
             os << "    non_clock_inputs_dirty_ = false;\n";
             os << "}\n\n";
 
+            if (state.enableSharding && state.shardCount() > 0) {
+                os << "void SSimTop::replay_dirty_input_shards() {\n";
+                for (int i = 0; i < state.shardCount(); ++i) {
+                    os << "    sched_" << i << "();\n";
+                }
+                os << "}\n\n";
+            }
+
             os << "void SSimTop::commit_step() {\n";
             os << "    bool committed_ = false;\n";
-            if (!state.sequentialStmts.empty()) {
+            if (!sequentialDomains.empty()) {
                 std::vector<std::pair<std::string, std::string>> domainClockExprs;
-                domainClockExprs.reserve(state.sequentialStmts.size());
+                domainClockExprs.reserve(sequentialDomains.size());
                 bool domainMetadataOk = true;
-                for (const auto &domain : state.sequentialStmts) {
-                    const auto parsedDomain = parseSequentialDomain(domain.first);
+                for (const auto &domainKey : sequentialDomains) {
+                    const auto parsedDomain = parseSequentialDomain(domainKey);
                     if (!parsedDomain) {
                         domainMetadataOk = false;
                         break;
@@ -2977,13 +3082,13 @@ namespace wolvrix::lib::emit
                     std::string resolvedClock =
                         resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                     std::string currClockExpr;
-                    auto exprIt = state.sequentialClockExprs.find(domain.first);
+                    auto exprIt = state.sequentialClockExprs.find(domainKey);
                     if (exprIt != state.sequentialClockExprs.end()) {
                         currClockExpr = exprIt->second;
                     } else {
                         currClockExpr = "input_" + resolvedClock + "_";
                     }
-                    domainClockExprs.emplace_back(domain.first, currClockExpr);
+                    domainClockExprs.emplace_back(domainKey, currClockExpr);
                 }
                 if (!domainMetadataOk) {
                     os << "    throw std::runtime_error(\"GSIM emitted runtime encountered unsupported clock-domain metadata\");\n";
@@ -3008,13 +3113,13 @@ namespace wolvrix::lib::emit
                     os << "        difftest_exit_ = 0;\n";
                     os << "        return;\n";
                     os << "    }\n";
-                    for (const auto &domain : state.sequentialStmts) {
-                        const auto parsedDomain = parseSequentialDomain(domain.first);
+                    for (const auto &domainKey : sequentialDomains) {
+                        const auto parsedDomain = parseSequentialDomain(domainKey);
                         const std::string edge = parsedDomain->first;
                         std::string resolvedClock =
                             resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                         std::string currClockExpr;
-                        auto exprIt = state.sequentialClockExprs.find(domain.first);
+                        auto exprIt = state.sequentialClockExprs.find(domainKey);
                         if (exprIt != state.sequentialClockExprs.end()) {
                             currClockExpr = exprIt->second;
                         } else {
@@ -3027,25 +3132,18 @@ namespace wolvrix::lib::emit
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
                             os << "        if (non_clock_inputs_dirty_) {\n";
-                            for (int i = 0; i < state.shardCount(); ++i) {
-                                os << "            sched_" << i << "();\n";
-                            }
+                            os << "            replay_dirty_input_shards();\n";
                             os << "        }\n";
                         }
-                        auto regIt = state.sequentialRegs.find(domain.first);
-                        if (regIt != state.sequentialRegs.end()) {
-                            for (const auto &regName : regIt->second) {
-                                os << "        auto next_" << regName << " = " << state.persistentStorageExpr(regName) << ";\n";
+                        if (auto chunkIt = sequentialChunkMethods.find(domainKey); chunkIt != sequentialChunkMethods.end()) {
+                            for (const auto &methodName : chunkIt->second) {
+                                os << "        " << methodName << "(committed_);\n";
                             }
-                        }
-                        for (const auto& stmt : domain.second) {
-                            std::string s = stmt;
-                            if (s.rfind("        ", 0) == 0) s.erase(0, 8);
-                            os << "        " << s << "\n";
-                        }
-                        if (regIt != state.sequentialRegs.end()) {
-                            for (const auto &regName : regIt->second) {
-                                os << "        " << state.persistentStorageExpr(regName) << " = next_" << regName << ";\n";
+                        } else if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
+                            for (const auto& stmt : stmtIt->second) {
+                                std::string s = stmt;
+                                if (s.rfind("        ", 0) == 0) s.erase(0, 8);
+                                os << "        " << s << "\n";
                             }
                         }
                         os << "    }\n";
@@ -3272,6 +3370,27 @@ namespace wolvrix::lib::emit
             os << "} // namespace wolvrix::gsim\n";
         }
 
+        void writeSequentialChunkSource(std::ostream &os,
+                                        const CodegenState& state,
+                                        const SequentialChunkPlan& chunk,
+                                        std::string_view internalHeaderFilename)
+        {
+            os << "#include \"" << internalHeaderFilename << "\"\n\n";
+            os << "void SSimTop::" << chunk.methodName << "(bool& committed_) {\n";
+            for (const auto &regName : chunk.regNames) {
+                os << "    auto next_" << regName << " = " << state.persistentStorageExpr(regName) << ";\n";
+            }
+            for (const auto &stmt : chunk.stmts) {
+                std::string s = stmt;
+                if (s.rfind("        ", 0) == 0) s.erase(0, 8);
+                os << "    " << s << "\n";
+            }
+            for (const auto &regName : chunk.regNames) {
+                os << "    " << state.persistentStorageExpr(regName) << " = next_" << regName << ";\n";
+            }
+            os << "}\n";
+        }
+
         void writeInternalHeader(std::ostream &os,
                                  const CodegenState& state,
                                  std::string_view publicHeaderFilename)
@@ -3425,6 +3544,8 @@ namespace wolvrix::lib::emit
             return result;
         }
 
+        const auto sequentialChunks = buildSequentialChunkPlans(state);
+
         auto header = openOutputFile(headerPath);
         auto internalHeader = openOutputFile(internalHeaderPath);
         auto source = openOutputFile(sourcePath);
@@ -3434,12 +3555,25 @@ namespace wolvrix::lib::emit
             return result;
         }
 
-        writeHeader(*header, *target, *metadata, state, emitMetadata);
+        writeHeader(*header, *target, *metadata, state, sequentialChunks, emitMetadata);
         writeInternalHeader(*internalHeader, state, headerPath.filename().string());
-        writeSource(*source, *target, *metadata, state, headerPath.filename().string(), emitMetadata);
+        writeSource(*source, *target, *metadata, state, sequentialChunks, headerPath.filename().string(), emitMetadata);
 
         std::vector<std::string> manifestEntries;
         manifestEntries.push_back(sourcePath.filename().string());
+
+        for (const auto &chunk : sequentialChunks) {
+            std::string chunkFileName = baseName + "_" + chunk.methodName + ".cpp";
+            std::filesystem::path chunkPath = outputDir / chunkFileName;
+            auto chunkFile = openOutputFile(chunkPath);
+            if (!chunkFile) {
+                result.success = false;
+                return result;
+            }
+            writeSequentialChunkSource(*chunkFile, state, chunk, internalHeaderPath.filename().string());
+            result.artifacts.push_back(chunkPath.string());
+            manifestEntries.push_back(chunkFileName);
+        }
 
         // Write out all shard files if sharding is enabled and there are any
         if (state.enableSharding && !state.shardStreams.empty()) {

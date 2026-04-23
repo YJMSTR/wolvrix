@@ -1526,7 +1526,7 @@ void testHappyPathAfterRunningGsim()
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp happy path should succeed");
     expect(!diags.hasError(), "EmitGsimCpp happy path should not emit errors");
-    expect(result.artifacts.size() == 3, "EmitGsimCpp should report header, source, and manifest artifacts");
+    expect(result.artifacts.size() >= 3, "EmitGsimCpp should report header, source, manifest, and any auxiliary implementation artifacts");
 
     const std::filesystem::path headerPath = dir / "top_metadata.hpp";
     const std::filesystem::path sourcePath = dir / "top_metadata.cpp";
@@ -1794,6 +1794,10 @@ void testSingleClockRuntimeCompileAndRun()
     expect(contains(header, "void commit_step()"), "runtime fixture should expose commit_step");
     expect(contains(header, "bool non_clock_inputs_dirty_ = true;"),
            "runtime fixture should track non-clock input dirtiness");
+    expect(contains(source, "*state_ = SSimTopState();"),
+           "runtime fixture should reset pooled state via SSimTopState value reset");
+    expect(!contains(source, "state_->stateU8[0] = 0;"),
+           "runtime fixture should not redundantly zero pooled register storage after SSimTopState reset");
 
     const std::string runner = R"CPP(
 #include "runtime_top.hpp"
