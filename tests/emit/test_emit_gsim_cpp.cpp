@@ -1171,6 +1171,39 @@ Design buildMediumShardedDesign()
     return design;
 }
 
+Design buildSelectiveReplayShardedDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    auto inputCurrent = makeValue(graph, "in", 1, false);
+    graph.bindInputPort("in", inputCurrent);
+
+    for (int i = 0; i < 16; ++i)
+    {
+        const auto next = makeValue(graph, "input_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("input_not_" + std::to_string(i)));
+        graph.addOperand(op, inputCurrent);
+        graph.addResult(op, next);
+        inputCurrent = next;
+    }
+    graph.bindOutputPort("input_out", inputCurrent);
+
+    const auto constSeed = makeConstant(graph, "const_seed", "const_seed_op", 1, "1'b1");
+    auto constCurrent = constSeed;
+    for (int i = 0; i < 176; ++i)
+    {
+        const auto next = makeValue(graph, "const_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("const_not_" + std::to_string(i)));
+        graph.addOperand(op, constCurrent);
+        graph.addResult(op, next);
+        constCurrent = next;
+    }
+    graph.bindOutputPort("const_out", constCurrent);
+    return design;
+}
+
 Design buildShiftDesign()
 {
     Design design;
@@ -2638,7 +2671,6 @@ void testWideVectorDynamicSliceCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp wide-vector slice-dynamic fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_vector_slice_dynamic_top_internal.hpp");
-
     const std::string runner = R"CPP(
 #include "wide_vector_slice_dynamic_top.hpp"
 #include <cstdint>
@@ -2828,6 +2860,18 @@ void testWideBitwiseCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp wide-bitwise fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_bitwise_top_internal.hpp");
+    expect(header.find("inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_and(\n"
+                       "    const std::vector<std::uint64_t>& lhs,\n"
+                       "    const std::vector<std::uint64_t>& rhs)") != std::string::npos,
+           "wide-bitwise fixture should emit vector/vector AND overload");
+    expect(header.find("inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_or(\n"
+                       "    const std::vector<std::uint64_t>& lhs,\n"
+                       "    const std::vector<std::uint64_t>& rhs)") != std::string::npos,
+           "wide-bitwise fixture should emit vector/vector OR overload");
+    expect(header.find("inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_xor(\n"
+                       "    const std::vector<std::uint64_t>& lhs,\n"
+                       "    const std::vector<std::uint64_t>& rhs)") != std::string::npos,
+           "wide-bitwise fixture should emit vector/vector XOR overload");
 
     const std::string runner = R"CPP(
 #include "wide_bitwise_top.hpp"
@@ -3153,6 +3197,29 @@ void testWideFullMaskRegisterCompileAndRun()
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp wide full-mask register fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide full-mask register fixture should not emit errors");
+    bool sawOptimizedWideWriteback = false;
+    const auto manifestPath = dir / "wide_fullmask_register_top.manifest";
+    if (std::filesystem::exists(manifestPath))
+    {
+        std::ifstream manifest(manifestPath);
+        std::string rel;
+        while (std::getline(manifest, rel))
+        {
+            if (!rel.ends_with(".cpp"))
+            {
+                continue;
+            }
+            const std::string text = readFile(dir / rel);
+            if (text.find("std::move(next_") != std::string::npos ||
+                text.find("state_->stateVec[") != std::string::npos)
+            {
+                sawOptimizedWideWriteback = true;
+                break;
+            }
+        }
+    }
+    expect(sawOptimizedWideWriteback,
+           "EmitGsimCpp wide full-mask register fixture should optimize wide next-state writeback");
 
     const std::string runner = R"CPP(
 #include "wide_fullmask_register_top.hpp"
@@ -3273,6 +3340,59 @@ void testMediumGraphsEnableSharding()
     expect(!diags.hasError(), "EmitGsimCpp medium sharded fixture should not emit diagnostics");
     expect(std::filesystem::exists(dir / "medium_sharded_top_sched_0.cpp"),
            "medium-size graphs should emit at least one sched shard once sharding is enabled");
+    const std::string source = readFile(dir / "medium_sharded_top.cpp");
+    expect(contains(source, "void SSimTop::replay_dirty_input_shards() {"),
+           "medium-size sharded fixture should emit replay_dirty_input_shards helper");
+}
+
+void testReplayDirtyInputShardsSkipsInputIndependentShards()
+{
+    Design design = buildSelectiveReplayShardedDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "selective_replay_sharded_emit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("selective_replay_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp selective-replay fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp selective-replay fixture should not emit diagnostics");
+
+    const std::string source = readFile(dir / "selective_replay_top.cpp");
+    const std::string marker = "void SSimTop::replay_dirty_input_shards() {";
+    const auto markerPos = source.find(marker);
+    expect(markerPos != std::string::npos,
+           "selective-replay fixture should emit replay_dirty_input_shards helper");
+    const auto endPos = source.find("}\n\nvoid SSimTop::commit_step()", markerPos);
+    expect(endPos != std::string::npos,
+           "selective-replay fixture should place replay helper before commit_step");
+    const std::string replayBody = source.substr(markerPos, endPos - markerPos);
+
+    std::size_t shardCount = 0;
+    while (std::filesystem::exists(dir / ("selective_replay_top_sched_" + std::to_string(shardCount) + ".cpp")))
+    {
+        ++shardCount;
+    }
+    expect(shardCount > 1, "selective-replay fixture should emit multiple sched shards");
+
+    std::size_t replayCalls = 0;
+    std::size_t searchPos = 0;
+    while ((searchPos = replayBody.find("sched_", searchPos)) != std::string::npos)
+    {
+        ++replayCalls;
+        searchPos += 6;
+    }
+
+    expect(replayCalls > 0, "selective-replay fixture should replay at least one shard");
+    expect(replayCalls < shardCount,
+           "selective-replay fixture should skip shards that never depend on dirty non-clock inputs");
 }
 
 void testShiftCompileAndRun()
@@ -3402,11 +3522,13 @@ void testRegisterPipelineUsesNonBlockingSemantics()
     options.outputDir = dir.string();
     options.outputFilename = std::string("pipeline_top");
     options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp pipeline fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp pipeline fixture should not emit errors");
 
+    const std::string source = readFile(dir / "pipeline_top.cpp");
     const std::string runner = R"CPP(
 #include "pipeline_top.hpp"
 #include <array>
@@ -3689,6 +3811,7 @@ int main()
         testWideUnknownConstantCompileAndRun();
         testDualEdgeClockMetadataDeduplicatesPrevClockState();
         testMediumGraphsEnableSharding();
+        testReplayDirtyInputShardsSkipsInputIndependentShards();
         testShiftCompileAndRun();
         testWideShiftCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
