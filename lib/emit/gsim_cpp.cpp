@@ -691,7 +691,7 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " + " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "((" + getOperandExpr(0) + ") + (" + getOperandExpr(1) + "))");
                     }
                     break;
                 }
@@ -708,13 +708,13 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " - " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "((" + getOperandExpr(0) + ") - (" + getOperandExpr(1) + "))");
                     }
                     break;
                 }
 
                 case OperationKind::kMul: {
-                    setResultExpr(0, "(" + getOperandExpr(0) + " * " + getOperandExpr(1) + ")");
+                    setResultExpr(0, "((" + getOperandExpr(0) + ") * (" + getOperandExpr(1) + "))");
                     break;
                 }
 
@@ -736,7 +736,7 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " & " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "((" + getOperandExpr(0) + ") & (" + getOperandExpr(1) + "))");
                     }
                     break;
                 }
@@ -754,7 +754,7 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " | " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "((" + getOperandExpr(0) + ") | (" + getOperandExpr(1) + "))");
                     }
                     break;
                 }
@@ -772,7 +772,7 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "((" + getOperandExpr(0) + ") ^ (" + getOperandExpr(1) + "))");
                     }
                     break;
                 }
@@ -781,7 +781,7 @@ namespace wolvrix::lib::emit
                     if (!op.results().empty())
                     {
                         const auto resultValue = graph.getValue(op.results()[0]);
-                        setResultExpr(0, maskExprForWidth("(~(" + getOperandExpr(0) + " ^ " + getOperandExpr(1) + "))",
+                        setResultExpr(0, maskExprForWidth("(~((" + getOperandExpr(0) + ") ^ (" + getOperandExpr(1) + ")))",
                                                           resultValue.width()));
                     }
                     break;
@@ -796,7 +796,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(lhsWidth) + ", " + getOperandExpr(1) + ", " +
                                           std::to_string(rhsWidth) + ", false) == 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") == (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -810,7 +810,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(lhsWidth) + ", " + getOperandExpr(1) + ", " +
                                           std::to_string(rhsWidth) + ", false) == 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " == " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") == (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -824,7 +824,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(lhsWidth) + ", " + getOperandExpr(1) + ", " +
                                           std::to_string(rhsWidth) + ", false) != 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") != (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -841,7 +841,7 @@ namespace wolvrix::lib::emit
                     {
                         setResultExpr(
                             0,
-                            "((" + getOperandExpr(0) + " == " + generateMask(operandWidth) + ") ? 1U : 0U)");
+                            "(((" + getOperandExpr(0) + ") == " + generateMask(operandWidth) + ") ? 1U : 0U)");
                     }
                     break;
                 }
@@ -856,7 +856,7 @@ namespace wolvrix::lib::emit
                     }
                     else
                     {
-                        setResultExpr(0, "((" + getOperandExpr(0) + " != 0) ? 1U : 0U)");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") != 0) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -890,7 +890,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(rhsWidth) + ", " + (signedCompare ? "true" : "false") +
                                           ") < 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " < " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") < (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -906,7 +906,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(rhsWidth) + ", " + (signedCompare ? "true" : "false") +
                                           ") <= 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " <= " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") <= (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -922,7 +922,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(rhsWidth) + ", " + (signedCompare ? "true" : "false") +
                                           ") > 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " > " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") > (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -938,7 +938,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(rhsWidth) + ", " + (signedCompare ? "true" : "false") +
                                           ") >= 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " >= " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") >= (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -952,7 +952,7 @@ namespace wolvrix::lib::emit
                                           std::to_string(lhsWidth) + ", " + getOperandExpr(1) + ", " +
                                           std::to_string(rhsWidth) + ", false) != 0 ? 1U : 0U)");
                     } else {
-                        setResultExpr(0, "(" + getOperandExpr(0) + " != " + getOperandExpr(1) + ")");
+                        setResultExpr(0, "(((" + getOperandExpr(0) + ") != (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     }
                     break;
                 }
@@ -982,12 +982,12 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kLogicAnd: {
-                    setResultExpr(0, "((" + getOperandExpr(0) + " && " + getOperandExpr(1) + ") ? 1U : 0U)");
+                    setResultExpr(0, "(((" + getOperandExpr(0) + ") && (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     break;
                 }
 
                 case OperationKind::kLogicOr: {
-                    setResultExpr(0, "((" + getOperandExpr(0) + " || " + getOperandExpr(1) + ") ? 1U : 0U)");
+                    setResultExpr(0, "(((" + getOperandExpr(0) + ") || (" + getOperandExpr(1) + ")) ? 1U : 0U)");
                     break;
                 }
 
@@ -1194,7 +1194,7 @@ namespace wolvrix::lib::emit
 
                     const std::string slicedExpr =
                         "((" + indexExpr + " >= " + std::to_string(operandWidth) + ") ? 0ULL : ((" +
-                        getOperandExpr(0) + " >> " + indexExpr + ") & " +
+                        "(" + getOperandExpr(0) + ") >> " + indexExpr + ") & " +
                         generateMask(static_cast<int32_t>(*sliceWidth)) + "))";
                     setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(*sliceWidth)));
                     break;
@@ -1245,7 +1245,7 @@ namespace wolvrix::lib::emit
                     }
 
                     const std::string slicedExpr =
-                        "((" + getOperandExpr(0) + " >> " + std::to_string(*sliceStart) + ") & " +
+                        "(((" + getOperandExpr(0) + ") >> " + std::to_string(*sliceStart) + ") & " +
                         generateMask(static_cast<int32_t>(sliceWidth)) + ")";
                     setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(sliceWidth)));
                     break;
@@ -1300,7 +1300,7 @@ namespace wolvrix::lib::emit
                         } else {
                             setResultExpr(
                                 0,
-                                maskExprForWidth("(" + getOperandExpr(0) + " << " + getOperandExpr(1) + ")",
+                                maskExprForWidth("((" + getOperandExpr(0) + ") << (" + getOperandExpr(1) + "))",
                                                  resultWidth));
                         }
                     }
@@ -1316,7 +1316,7 @@ namespace wolvrix::lib::emit
                                           "wolvrix_gsim_shift_right_bits(" + getOperandExpr(0) + ", " +
                                               getOperandExpr(1) + ", " + std::to_string(resultWidth) + ")");
                         } else {
-                            setResultExpr(0, "(" + getOperandExpr(0) + " >> " + getOperandExpr(1) + ")");
+                            setResultExpr(0, "((" + getOperandExpr(0) + ") >> (" + getOperandExpr(1) + "))");
                         }
                     }
                     break;
@@ -1514,8 +1514,8 @@ namespace wolvrix::lib::emit
                                 "); }");
                         } else {
                             state.latchStmts.push_back(
-                                "        if (" + condition + ") { " + latchExpr + " = (" + latchExpr +
-                                " & ~" + mask + ") | (" + nextValue + " & " + mask + "); }");
+                                "        if (" + condition + ") { " + latchExpr + " = ((" + latchExpr +
+                                ") & ~(" + mask + ")) | ((" + nextValue + ") & (" + mask + ")); }");
                         }
                     } else {
                         state.latchStmts.push_back(
@@ -1600,9 +1600,9 @@ namespace wolvrix::lib::emit
                                         "); " + nextRegExpr + "_updated_ = true; committed_ = true; }");
                                 } else {
                                     state.sequentialRegStmts[domainKey][regName].push_back(
-                                        "        if (" + condition + ") { " + nextRegExpr + " = (" + regExpr +
-                                        " & ~" + mask + ") | (" + nextValue + " & " + mask +
-                                        "); committed_ = true; }");
+                                        "        if (" + condition + ") { " + nextRegExpr + " = ((" + regExpr +
+                                        ") & ~(" + mask + ")) | ((" + nextValue + ") & (" + mask +
+                                        ")); committed_ = true; }");
                                 }
                             } else {
                                 state.sequentialRegStmts[domainKey][regName].push_back(
@@ -3277,8 +3277,12 @@ namespace wolvrix::lib::emit
 
             os << "void SSimTop::commit_step() {\n";
             os << "    bool committed_ = false;\n";
+            if (state.enableSharding && state.shardCount() > 0) {
+                os << "    bool dirty_replayed_ = false;\n";
+            }
             if (state.tempU8Count > 0) {
                 os << "    const auto* tempU8_data_ = evalTemps_->tempU8;\n";
+                os << "    (void)tempU8_data_;\n";
             }
             auto commitStepClockExpr = [&](std::string expr) {
                 if (state.tempU8Count > 0) {
@@ -3341,6 +3345,18 @@ namespace wolvrix::lib::emit
                     os << "        difftest_exit_ = 0;\n";
                     os << "        return;\n";
                     os << "    }\n";
+                    os << "    if (non_clock_inputs_dirty_) {\n";
+                    if (state.enableSharding && state.shardCount() > 0) {
+                        os << "        dirty_replayed_ = true;\n";
+                        os << "        replay_dirty_input_shards();\n";
+                    } else {
+                        if (!state.outputPorts.empty()) {
+                            os << "        settle();\n";
+                        } else {
+                            os << "        non_clock_inputs_dirty_ = false;\n";
+                        }
+                    }
+                    os << "    }\n";
                     for (const auto &domainKey : sequentialDomains) {
                         const auto parsedDomain = parseSequentialDomain(domainKey);
                         const std::string edge = parsedDomain->first;
@@ -3361,6 +3377,7 @@ namespace wolvrix::lib::emit
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
                             os << "        if (non_clock_inputs_dirty_) {\n";
+                            os << "            dirty_replayed_ = true;\n";
                             os << "            replay_dirty_input_shards();\n";
                             os << "        }\n";
                         }
@@ -3411,7 +3428,11 @@ namespace wolvrix::lib::emit
                 os << "        return;\n";
                 os << "    }\n";
             }
-            os << "    if (committed_ || non_clock_inputs_dirty_) {\n";
+            if (state.enableSharding && state.shardCount() > 0) {
+                os << "    if (committed_ || non_clock_inputs_dirty_ || dirty_replayed_) {\n";
+            } else {
+                os << "    if (committed_ || non_clock_inputs_dirty_) {\n";
+            }
             os << "        settle();\n";
             os << "    }\n";
             os << "    if (committed_) { ++difftest_step_; }\n";

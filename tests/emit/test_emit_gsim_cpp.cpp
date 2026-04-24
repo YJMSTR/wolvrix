@@ -1171,6 +1171,34 @@ Design buildMediumShardedDesign()
     return design;
 }
 
+Design buildShardedNoCommitInputOutputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    auto current = makeValue(graph, "a", 1, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", current);
+    graph.bindInputPort("clk", clk);
+
+    for (int i = 0; i < 140; ++i)
+    {
+        const auto next = makeValue(graph, "dirty_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("dirty_not_" + std::to_string(i)));
+        graph.addOperand(op, current);
+        graph.addResult(op, next);
+        current = next;
+    }
+    graph.bindOutputPort("y", current);
+
+    (void)makeRegister(graph, "state_storage", "state_reg", 1, "state");
+    const auto zeroCond = makeConstant(graph, "zero_cond", "zero_cond_const", 1, "1'b0");
+    const auto oneMask = makeConstant(graph, "one_mask", "one_mask_const", 1, "1'b1");
+    makeRegisterWrite(graph, "state_write", zeroCond, current, oneMask, clk, "state");
+    return design;
+}
+
 Design buildSelectiveReplayShardedDesign()
 {
     Design design;
@@ -3345,6 +3373,61 @@ void testMediumGraphsEnableSharding()
            "medium-size sharded fixture should emit replay_dirty_input_shards helper");
 }
 
+void testDirtyReplayEdgeWithoutCommitRefreshesOutputs()
+{
+    Design design = buildShardedNoCommitInputOutputDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dirty_replay_no_commit_refresh";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dirty_replay_no_commit_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp dirty-replay no-commit fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp dirty-replay no-commit fixture should not emit errors");
+
+    const std::string source = readFile(dir / "dirty_replay_no_commit_top.cpp");
+    expect(contains(source, "bool dirty_replayed_ = false;"),
+           "sharded commit_step should track edge-local dirty replay");
+    expect(contains(source, "committed_ || non_clock_inputs_dirty_ || dirty_replayed_"),
+           "sharded commit_step should settle after dirty replay even when no commit happens");
+
+    const std::string runner = R"CPP(
+#include "dirty_replay_no_commit_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0);
+    sim.set_clk(0);
+    sim.set_reset(0);
+    sim.settle();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+    sim.set_a(1);
+    sim.set_clk(1);
+    sim.commit_step();
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 2;
+    }
+    if (sim.get_y() != 1) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dirty_replay_no_commit_top", runner);
+}
+
 void testReplayDirtyInputShardsSkipsInputIndependentShards()
 {
     Design design = buildSelectiveReplayShardedDesign();
@@ -3811,6 +3894,7 @@ int main()
         testWideUnknownConstantCompileAndRun();
         testDualEdgeClockMetadataDeduplicatesPrevClockState();
         testMediumGraphsEnableSharding();
+        testDirtyReplayEdgeWithoutCommitRefreshesOutputs();
         testReplayDirtyInputShardsSkipsInputIndependentShards();
         testShiftCompileAndRun();
         testWideShiftCompileAndRun();

@@ -17,6 +17,33 @@ namespace
         return 1;
     }
 
+    bool hasCombLoopWarning(const PassDiagnostics &diags)
+    {
+        for (const auto &msg : diags.messages())
+        {
+            if (msg.passName == "comb-loop-elim" &&
+                msg.message.find("comb loop detected") != std::string::npos)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::size_t countOpKind(const wolvrix::lib::grh::Graph &graph,
+                            wolvrix::lib::grh::OperationKind kind)
+    {
+        std::size_t count = 0;
+        for (const auto &opId : graph.operations())
+        {
+            if (graph.getOperation(opId).kind() == kind)
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     wolvrix::lib::grh::ValueId makeValue(wolvrix::lib::grh::Graph &graph,
                                          const std::string &name,
                                          int32_t width)
@@ -359,6 +386,91 @@ namespace
         return 0;
     }
 
+
+    int test_add_concat_static_slice_carry_coupled_loop_reported()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_static_add_carry_loop");
+
+        auto s = makeValue(graph, "s", 4);
+        auto one = makeConst(graph, "one4", "one4_op", 4, "4'd1");
+        auto sum = makeValue(graph, "s_sum", 4);
+        makeBinary(graph, wolvrix::lib::grh::OperationKind::kAdd, s, one, sum, "s_add_one");
+
+        auto msb = makeValue(graph, "msb", 1);
+        auto lsb = makeValue(graph, "lsb", 3);
+        makeSliceStatic(graph, sum, msb, 3, 3, "sum_msb_slice");
+        makeSliceStatic(graph, sum, lsb, 0, 2, "sum_lsb_slice");
+
+        auto next = makeValue(graph, "s_next", 4);
+        makeConcat(graph, "s_next_concat", {msb, lsb}, next);
+        makeAssign(graph, next, s, "s_assign");
+
+        CombLoopElimOptions options;
+        options.fixFalseLoops = false;
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>(options));
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during static add/concat/slice run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError()) return fail("Expected pass to succeed for static add/concat/slice carry-coupled loop");
+        if (res.changed) return fail("Expected static carry-coupled add loop not to be rewritten as a false loop");
+        if (!hasCombLoopWarning(diags)) return fail("Expected comb-loop warning for static carry-coupled add loop");
+        if (countOpKind(graph, wolvrix::lib::grh::OperationKind::kAdd) == 0) return fail("Expected kAdd to remain present");
+        if (countOpKind(graph, wolvrix::lib::grh::OperationKind::kConcat) == 0) return fail("Expected kConcat to remain present");
+        if (countOpKind(graph, wolvrix::lib::grh::OperationKind::kSliceStatic) == 0) return fail("Expected kSliceStatic to remain present");
+        return 0;
+    }
+
+    int test_add_concat_dynamic_slice_carry_coupled_loop_reported()
+    {
+        wolvrix::lib::grh::Design design;
+        wolvrix::lib::grh::Graph &graph = design.createGraph("g_dynamic_add_carry_loop");
+
+        auto s = makeValue(graph, "s", 4);
+        auto one = makeConst(graph, "one4", "one4_op", 4, "4'd1");
+        auto sum = makeValue(graph, "s_sum", 4);
+        makeBinary(graph, wolvrix::lib::grh::OperationKind::kAdd, s, one, sum, "s_add_one");
+
+        auto idx0 = makeConst(graph, "idx0", "idx0_op", 2, "2'd0");
+        auto msb = makeValue(graph, "msb", 1);
+        auto lsbDyn = makeValue(graph, "lsb_dyn", 3);
+        makeSliceStatic(graph, sum, msb, 3, 3, "sum_msb_slice");
+        makeSliceDynamic(graph, sum, idx0, lsbDyn, 3, "sum_lsb_dyn_slice");
+
+        auto next = makeValue(graph, "s_next", 4);
+        makeConcat(graph, "s_next_concat", {msb, lsbDyn}, next);
+        makeAssign(graph, next, s, "s_assign");
+
+        CombLoopElimOptions options;
+        options.fixFalseLoops = false;
+        PassManager manager;
+        manager.addPass(std::make_unique<CombLoopElimPass>(options));
+        PassDiagnostics diags;
+        PassManagerResult res{};
+        try
+        {
+            res = manager.run(design, diags);
+        }
+        catch (const std::exception &ex)
+        {
+            return fail(std::string("Exception during dynamic add/concat/slice run: ") + ex.what());
+        }
+        if (!res.success || diags.hasError()) return fail("Expected pass to succeed for dynamic add/concat/slice carry-coupled loop");
+        if (res.changed) return fail("Expected dynamic carry-coupled add loop not to be rewritten as a false loop");
+        if (!hasCombLoopWarning(diags)) return fail("Expected comb-loop warning for dynamic carry-coupled add loop");
+        if (countOpKind(graph, wolvrix::lib::grh::OperationKind::kSliceDynamic) == 0) return fail("Expected kSliceDynamic to be exercised");
+        if (countOpKind(graph, wolvrix::lib::grh::OperationKind::kAdd) == 0) return fail("Expected kAdd to remain present");
+        return 0;
+    }
+
 } // namespace
 
 int main()
@@ -368,6 +480,14 @@ int main()
         return rc;
     }
     if (int rc = test_dynamic_slice_false_loop_fixed(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_add_concat_static_slice_carry_coupled_loop_reported(); rc != 0)
+    {
+        return rc;
+    }
+    if (int rc = test_add_concat_dynamic_slice_carry_coupled_loop_reported(); rc != 0)
     {
         return rc;
     }
