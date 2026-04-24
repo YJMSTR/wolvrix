@@ -3375,10 +3375,12 @@ namespace wolvrix::lib::emit
                                                          ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
                                                          : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                         os << "    if (" << edgeExpr << ") {\n";
-                        // Dirty non-clock inputs are refreshed once before edge handling.
-                        // Sequential domains sample old state in the same step, so replaying
-                        // input-dependent schedule shards after each domain commit is redundant
-                        // and can dominate XiangShan runtime when many gated domains fire.
+                        if (state.enableSharding && state.shardCount() > 0) {
+                            os << "        if (non_clock_inputs_dirty_) {\n";
+                            os << "            dirty_replayed_ = true;\n";
+                            os << "            replay_dirty_input_shards();\n";
+                            os << "        }\n";
+                        }
                         if (auto chunkIt = sequentialChunkMethods.find(domainKey); chunkIt != sequentialChunkMethods.end()) {
                             os << "        bool domain_committed_ = false;\n";
                             for (const auto &methodName : chunkIt->second) {
@@ -3386,6 +3388,9 @@ namespace wolvrix::lib::emit
                             }
                             os << "        if (domain_committed_) {\n";
                             os << "            committed_ = true;\n";
+                            if (state.enableSharding && state.shardCount() > 0) {
+                                os << "            non_clock_inputs_dirty_ = true;\n";
+                            }
                             os << "        }\n";
                         } else if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
                             os << "        const bool committed_before_domain_ = committed_;\n";
@@ -3393,6 +3398,11 @@ namespace wolvrix::lib::emit
                                 std::string s = stmt;
                                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
                                 os << "        " << s << "\n";
+                            }
+                            if (state.enableSharding && state.shardCount() > 0) {
+                                os << "        if (committed_ && !committed_before_domain_) {\n";
+                                os << "            non_clock_inputs_dirty_ = true;\n";
+                                os << "        }\n";
                             }
                         }
                         os << "    }\n";
