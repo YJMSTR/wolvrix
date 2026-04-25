@@ -62,7 +62,6 @@ namespace wolvrix::lib::emit
 
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialStmts;
-            std::map<std::string, std::vector<std::string>> sequentialRegs;
             std::map<std::string, std::map<std::string, std::vector<std::string>>> sequentialRegStmts;
             std::map<std::string, std::string> sequentialClockExprs;
 
@@ -82,8 +81,10 @@ namespace wolvrix::lib::emit
             // Memory declarations/read lowering support
             std::unordered_map<std::string, MemoryInfo> memories;
 
-            // Sharding support: output streams for different shards
-            std::vector<std::unique_ptr<std::ostringstream>> shardStreams;
+            // Sharding support: generated text buffers for different shards.
+            // Plain strings avoid ostringstream formatting overhead and the final
+            // full-buffer str() copy when writing XiangShan-scale shard files.
+            std::vector<std::string> shardBuffers;
             std::vector<bool> shardNeedsDirtyReplay;
             int currentShard = 0;
             int maxShardSize = 2097152; // 2MB per behavior shard
@@ -112,23 +113,24 @@ namespace wolvrix::lib::emit
             int lastEmittedShard = -1;
             std::unordered_map<std::string, int> activitySourceFirstShard;
 
-            // Helper to get next available shard stream
-            std::ostringstream* getCurrentShardStream() {
+            // Helper to get next available shard buffer.
+            std::string* getCurrentShardBuffer() {
                 if (!enableSharding) {
-                    // For small designs, don't enable sharding
-                    if (shardStreams.empty()) {
-                        shardStreams.push_back(std::make_unique<std::ostringstream>());
+                    // For small designs, don't enable sharding.
+                    if (shardBuffers.empty()) {
+                        shardBuffers.emplace_back();
                     }
-                    return shardStreams[0].get();
+                    return &shardBuffers[0];
                 }
 
-                if (shardStreams.empty() || currentShard >= static_cast<int>(shardStreams.size())) {
-                    shardStreams.push_back(std::make_unique<std::ostringstream>());
+                if (shardBuffers.empty() || currentShard >= static_cast<int>(shardBuffers.size())) {
+                    shardBuffers.emplace_back();
+                    shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
                     shardNeedsDirtyReplay.push_back(false);
-                    currentShard = static_cast<int>(shardStreams.size()) - 1;
+                    currentShard = static_cast<int>(shardBuffers.size()) - 1;
                     currentShardSize = 0;
                 }
-                return shardStreams[currentShard].get();
+                return &shardBuffers[currentShard];
             }
 
             // Helper to create a new shard when current one gets too large
@@ -140,8 +142,9 @@ namespace wolvrix::lib::emit
                 if (currentShardSize + estimatedSize > maxShardSize) {
                     currentShard++;
                     currentShardSize = 0;
-                    if (currentShard >= static_cast<int>(shardStreams.size())) {
-                        shardStreams.push_back(std::make_unique<std::ostringstream>());
+                    if (currentShard >= static_cast<int>(shardBuffers.size())) {
+                        shardBuffers.emplace_back();
+                        shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
                         shardNeedsDirtyReplay.push_back(false);
                     }
                 }
@@ -155,32 +158,34 @@ namespace wolvrix::lib::emit
                     return it->second;
                 }
 
+                std::string ref;
                 if (cppType == "std::uint8_t")
                 {
-                    valueVars[valueId] = "evalTemps_->tempU8[" + std::to_string(tempU8Count++) + "]";
+                    ref = "evalTemps_->tempU8[" + std::to_string(tempU8Count++) + "]";
                 }
                 else if (cppType == "std::uint16_t")
                 {
-                    valueVars[valueId] = "evalTemps_->tempU16[" + std::to_string(tempU16Count++) + "]";
+                    ref = "evalTemps_->tempU16[" + std::to_string(tempU16Count++) + "]";
                 }
                 else if (cppType == "std::uint32_t")
                 {
-                    valueVars[valueId] = "evalTemps_->tempU32[" + std::to_string(tempU32Count++) + "]";
+                    ref = "evalTemps_->tempU32[" + std::to_string(tempU32Count++) + "]";
                 }
                 else if (cppType == "std::uint64_t")
                 {
-                    valueVars[valueId] = "evalTemps_->tempU64[" + std::to_string(tempU64Count++) + "]";
+                    ref = "evalTemps_->tempU64[" + std::to_string(tempU64Count++) + "]";
                 }
                 else
                 {
-                    valueVars[valueId] = "evalTemps_->tempVec[" + std::to_string(tempVecWidths.size()) + "]";
+                    ref = "evalTemps_->tempVec[" + std::to_string(tempVecWidths.size()) + "]";
                     tempVecWidths.push_back(width);
                 }
-                return valueVars[valueId];
+                auto [insertedIt, inserted] = valueVars.emplace(valueId, std::move(ref));
+                (void)inserted;
+                return insertedIt->second;
             }
 
-            void emitShardStatement(const std::string& stmt) {
-                ensureShardSpace(static_cast<int>(stmt.length()));
+            void markCurrentShardActivity() {
                 if (currentShard >= 0 && currentShard < static_cast<int>(shardNeedsDirtyReplay.size()) &&
                     currentOpDependsOnDirtyInput)
                 {
@@ -195,8 +200,27 @@ namespace wolvrix::lib::emit
                         }
                     }
                 }
-                *getCurrentShardStream() << stmt << "\n";
+            }
+
+            void emitShardStatement(const std::string& stmt) {
+                ensureShardSpace(static_cast<int>(stmt.length()));
+                markCurrentShardActivity();
+                std::string* shard = getCurrentShardBuffer();
+                shard->append(stmt);
+                shard->push_back('\n');
                 currentShardSize += static_cast<int>(stmt.length());
+            }
+
+            void emitShardAssignment(const std::string& lhs, const std::string& rhs) {
+                const int estimatedSize = static_cast<int>(lhs.length() + rhs.length() + 4U);
+                ensureShardSpace(estimatedSize);
+                markCurrentShardActivity();
+                std::string* shard = getCurrentShardBuffer();
+                shard->append(lhs);
+                shard->append(" = ");
+                shard->append(rhs);
+                shard->append(";\n");
+                currentShardSize += estimatedSize;
             }
 
             void setResult(const wolvrix::lib::grh::ValueId& valueId,
@@ -210,7 +234,7 @@ namespace wolvrix::lib::emit
                 }
 
                 const std::string resultRef = materializeResultRef(valueId, cppType, width);
-                emitShardStatement(resultRef + " = " + expr + ";");
+                emitShardAssignment(resultRef, expr);
             }
 
             void setCurrentActivity(std::vector<std::string> directSources, int firstShard) {
@@ -225,7 +249,7 @@ namespace wolvrix::lib::emit
             }
 
             int shardCount() const {
-                return static_cast<int>(shardStreams.size());
+                return static_cast<int>(shardBuffers.size());
             }
 
             std::string allocatePersistentStorage(const std::string& storageName,
@@ -616,17 +640,33 @@ namespace wolvrix::lib::emit
             const auto opId = op.id();
             const auto operands = op.operands();
             const auto results = op.results();
+
+            // `lowerOperation` is called once per topo op; XiangShan-scale emit
+            // calls operand/result width and expression helpers millions of times.
+            // Cache the immutable per-op facts locally so each switch arm does not
+            // repeat Graph value lookups and valueVars hash probes.
+            std::vector<int32_t> operandWidths;
+            operandWidths.reserve(operands.size());
+            for (const auto operand : operands) {
+                operandWidths.push_back(graph.getValue(operand).width());
+            }
+            std::vector<int32_t> resultWidths;
+            resultWidths.reserve(results.size());
+            for (const auto result : results) {
+                resultWidths.push_back(graph.getValue(result).width());
+            }
+
             auto getOperandWidth = [&](std::size_t idx) -> int32_t {
-                if (idx >= operands.size()) {
+                if (idx >= operandWidths.size()) {
                     return 0;
                 }
-                return graph.getValue(operands[idx]).width();
+                return operandWidths[idx];
             };
             auto getResultWidth = [&](std::size_t idx) -> int32_t {
-                if (idx >= results.size()) {
+                if (idx >= resultWidths.size()) {
                     return 0;
                 }
-                return graph.getValue(results[idx]).width();
+                return resultWidths[idx];
             };
             bool opDependsOnDirtyInput = false;
             std::vector<std::string> directActivitySources;
@@ -684,24 +724,38 @@ namespace wolvrix::lib::emit
                 state.setCurrentActivity({}, -1);
             }
 
-            // Helper to get operand variable name (now returns var name from valueVars)
-            auto getOperandExpr = [&](size_t idx) -> std::string {
+            // Helper to get operand variable name (now returns var name from valueVars).
+            // Cache per operand because lowering often references the same operand
+            // expression repeatedly while building one emitted C++ statement.
+            std::vector<std::string> operandExprCache(operands.size());
+            std::vector<std::uint8_t> operandExprCached(operands.size(), 0);
+            auto getOperandExpr = [&](size_t idx) -> const std::string& {
+                static const std::string zero = "0";
                 if (idx >= operands.size()) {
-                    return "0";
+                    return zero;
                 }
-                auto it = state.valueVars.find(operands[idx]);
-                if (it != state.valueVars.end()) {
-                    return it->second;
+                if (operandExprCached[idx] == 0) {
+                    if (auto it = state.valueVars.find(operands[idx]); it != state.valueVars.end()) {
+                        operandExprCache[idx] = it->second;
+                    } else {
+                        operandExprCache[idx] = zeroInitializerForWidth(operandWidths[idx]);
+                    }
+                    operandExprCached[idx] = 1;
                 }
-                const auto operandValue = graph.getValue(operands[idx]);
-                return zeroInitializerForWidth(operandValue.width());
+                return operandExprCache[idx];
             };
 
             // Helper to set result: materialize expression as variable and write to current shard
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < results.size()) {
                     const auto resultValue = graph.getValue(results[idx]);
-                    state.valueDependsOnDirtyInput[results[idx]] = opDependsOnDirtyInput;
+                    // Absence in valueDependsOnDirtyInput means false.  Do not insert
+                    // the overwhelmingly common non-dirty entries: XiangShan-scale
+                    // emit otherwise pays millions of hash insertions and stores a
+                    // near-op-count boolean map during write_gsim_cpp.
+                    if (opDependsOnDirtyInput) {
+                        state.valueDependsOnDirtyInput.emplace(results[idx], true);
+                    }
                     state.setResult(results[idx], expr, getCppTypeForWidth(resultValue.width()), resultValue.width());
                     if (state.enableActivityWatermark) {
                         int resultFirstShard = state.currentOpActivityFirstShard;
@@ -1188,11 +1242,11 @@ namespace wolvrix::lib::emit
 
                         std::uint64_t bitOffset = 0;
                         for (std::size_t i = operands.size(); i-- > 0;) {
-                            const auto value = graph.getValue(operands[i]);
+                            const auto width = static_cast<std::uint64_t>(getOperandWidth(i));
                             state.emitShardStatement("wolvrix_gsim_store_bits(" + resultRef + ", " +
                                                      std::to_string(bitOffset) + "ULL, " + getOperandExpr(i) +
-                                                     ", " + std::to_string(value.width()) + ");");
-                            bitOffset += static_cast<std::uint64_t>(value.width());
+                                                     ", " + std::to_string(width) + ");");
+                            bitOffset += width;
                         }
                         break;
                     }
@@ -1206,9 +1260,9 @@ namespace wolvrix::lib::emit
                         std::vector<std::string> terms;
                         terms.reserve(operands.size());
                         for (std::size_t i = operands.size(); i-- > 0;) {
-                            const auto value = graph.getValue(operands[i]);
-                            terms.push_back(scalarConcatTerm(i, 0, bitOffset, static_cast<std::uint64_t>(value.width())));
-                            bitOffset += static_cast<std::uint64_t>(value.width());
+                            const auto width = static_cast<std::uint64_t>(getOperandWidth(i));
+                            terms.push_back(scalarConcatTerm(i, 0, bitOffset, width));
+                            bitOffset += width;
                         }
                         constexpr std::size_t termsPerStatement = 12;
                         for (std::size_t termIndex = 0; termIndex < terms.size(); termIndex += termsPerStatement) {
@@ -1682,28 +1736,25 @@ namespace wolvrix::lib::emit
                     }
 
                         if (!regName.empty()) {
-                            auto &domainRegs = state.sequentialRegs[domainKey];
-                            if (std::find(domainRegs.begin(), domainRegs.end(), regName) == domainRegs.end()) {
-                                domainRegs.push_back(regName);
-                            }
+                            auto &regStmts = state.sequentialRegStmts[domainKey][regName];
                             const std::string regExpr = state.persistentStorageExpr(regName);
                             const std::string nextRegExpr = "next_" + regName;
                             const auto regWidthIt = state.storageWidths.find(regName);
                             const bool wideReg = regWidthIt != state.storageWidths.end() && regWidthIt->second > 64;
                             if (mask != "0") {
                                 if (wideReg) {
-                                    state.sequentialRegStmts[domainKey][regName].push_back(
+                                    regStmts.push_back(
                                         "        if (" + condition + ") { " + nextRegExpr +
                                         " = wolvrix_gsim_mask_merge(" + regExpr + ", " + nextValue + ", " + mask +
                                         "); " + nextRegExpr + "_updated_ = true; committed_ = true; }");
                                 } else {
-                                    state.sequentialRegStmts[domainKey][regName].push_back(
+                                    regStmts.push_back(
                                         "        if (" + condition + ") { " + nextRegExpr + " = ((" + regExpr +
                                         ") & ~(" + mask + ")) | ((" + nextValue + ") & (" + mask +
                                         ")); committed_ = true; }");
                                 }
                             } else {
-                                state.sequentialRegStmts[domainKey][regName].push_back(
+                                regStmts.push_back(
                                     "        if (" + condition + ") { " + nextRegExpr + " = " + nextValue + "; committed_ = true; }");
                             }
                         }
@@ -4240,8 +4291,8 @@ namespace wolvrix::lib::emit
         }
 
         // Write out all shard files if sharding is enabled and there are any
-        if (state.enableSharding && !state.shardStreams.empty()) {
-            for (size_t i = 0; i < state.shardStreams.size(); ++i) {
+        if (state.enableSharding && !state.shardBuffers.empty()) {
+            for (size_t i = 0; i < state.shardBuffers.size(); ++i) {
                 std::string shardFileName = baseName + "_sched_" + std::to_string(i) + ".cpp";
                 std::filesystem::path shardPath = outputDir / shardFileName;
 
@@ -4249,7 +4300,7 @@ namespace wolvrix::lib::emit
                 if (shardFile) {
                     *shardFile << "#include \"" << internalHeaderPath.filename().string() << "\"\n\n";
                     *shardFile << "void SSimTop::sched_" << i << "() {\n";
-                    *shardFile << state.shardStreams[i]->str();
+                    *shardFile << state.shardBuffers[i];
                     *shardFile << "}\n";
                     result.artifacts.push_back(shardPath.string());
                     manifestEntries.push_back(shardFileName);
