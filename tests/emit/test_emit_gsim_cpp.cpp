@@ -1315,7 +1315,21 @@ Design buildThreeStageRegisterPipelineDesign()
     const auto stage1Read = makeRegisterRead(graph, "stage1_read", "stage1_read_op", 1, "stage1");
     const auto stage2Read = makeRegisterRead(graph, "stage2_read", "stage2_read_op", 1, "stage2");
     const auto stage3Read = makeRegisterRead(graph, "stage3_read", "stage3_read_op", 1, "stage3");
-    graph.bindOutputPort("q", stage3Read);
+
+    // Keep an even number of inversions so q preserves stage3 while forcing
+    // the state-read dependent path to span multiple behavior shards.  The
+    // activity-watermark regression below can then prove changed state does
+    // not invalidate the entire combinational schedule.
+    auto qCurrent = stage3Read;
+    for (int i = 0; i < 160; ++i)
+    {
+        const auto next = makeValue(graph, "stage3_q_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("stage3_q_not_" + std::to_string(i)));
+        graph.addOperand(op, qCurrent);
+        graph.addResult(op, next);
+        qCurrent = next;
+    }
+    graph.bindOutputPort("q", qCurrent);
 
     const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
     const auto mask = makeConstant(graph, "mask", "mask_const", 1, "1'b1");
@@ -3617,12 +3631,24 @@ void testRegisterPipelineUsesNonBlockingSemantics()
     options.outputFilename = std::string("pipeline_top");
     options.topOverrides = {"top"};
     options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp pipeline fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp pipeline fixture should not emit errors");
 
-    const std::string source = readFile(dir / "pipeline_top.cpp");
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "kTouchedStateFirstShards"),
+           "activity watermark should activate only shards touched by changed register state");
+    expect(contains(generatedSources, "activate_shards(kTouchedStateFirstShards"),
+           "activity watermark should use compact touched-state activation tables");
     const std::string runner = R"CPP(
 #include "pipeline_top.hpp"
 #include <array>

@@ -3559,10 +3559,30 @@ namespace wolvrix::lib::emit
                     os << "        difftest_exit_ = 0;\n";
                     os << "        return;\n";
                     os << "    }\n";
+                    os << "    bool sequential_edge_pending_ = false;\n";
+                    for (const auto &domainState : domainClockExprs) {
+                        const auto parsedDomain = parseSequentialDomain(domainState.first);
+                        const std::string edge = parsedDomain->first;
+                        const std::string resolvedClock =
+                            resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                        const std::string prevClock = "prev_" + resolvedClock + "_";
+                        const std::string edgeExpr = edge == "posedge"
+                                                         ? "(!" + prevClock + " && static_cast<bool>(" + domainState.second + "))"
+                                                         : "(" + prevClock + " && !static_cast<bool>(" + domainState.second + "))";
+                        os << "    if (" << edgeExpr << ") { sequential_edge_pending_ = true; }\n";
+                    }
                     os << "    if (non_clock_inputs_dirty_) {\n";
                     if (state.enableSharding && state.shardCount() > 0) {
                         os << "        dirty_replayed_ = true;\n";
-                        os << "        replay_dirty_input_shards();\n";
+                        os << "        if (sequential_edge_pending_) {\n";
+                        if (!state.outputPorts.empty()) {
+                            os << "            settle();\n";
+                        } else {
+                            os << "            non_clock_inputs_dirty_ = false;\n";
+                        }
+                        os << "        } else {\n";
+                        os << "            replay_dirty_input_shards();\n";
+                        os << "        }\n";
                     } else {
                         if (!state.outputPorts.empty()) {
                             os << "        settle();\n";
@@ -4032,10 +4052,26 @@ namespace wolvrix::lib::emit
             if (!chunk.regNames.empty()) {
                 os << "    if (chunk_updated_) {\n";
                 if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                    // Clocked state changes currently invalidate the full combinational schedule.
-                    // The watermark is still useful for external non-clock inputs, while avoiding
-                    // a suffix replay heuristic that regressed long clocked XiangShan runs.
-                    os << "        activate_all_shards();\n";
+                    std::set<int> firstShards;
+                    for (const auto &regName : chunk.regNames) {
+                        if (const auto shardIt = state.activitySourceFirstShard.find(regName);
+                            shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
+                            firstShards.insert(shardIt->second);
+                        }
+                    }
+                    if (!firstShards.empty()) {
+                        os << "        static constexpr std::uint32_t kTouchedStateFirstShards[] = {";
+                        bool first = true;
+                        for (int firstShard : firstShards) {
+                            os << (first ? "" : ", ") << firstShard << "U";
+                            first = false;
+                        }
+                        os << "};\n";
+                        os << "        activate_shards(kTouchedStateFirstShards, "
+                           << firstShards.size() << "U);\n";
+                    } else {
+                        os << "        activate_all_shards();\n";
+                    }
                 }
                 for (const auto &regName : chunk.regNames) {
                     const auto regStmtIt = chunk.regStmts.find(regName);
@@ -4242,6 +4278,15 @@ namespace wolvrix::lib::emit
             }
             auto op = target->graph->getOperation(opId);
             lowerOperation(*target->graph, op, *metadata, state, diagnostics());
+        }
+
+        // Sequential commit chunks can depend on constants and register-read temps
+        // materialized in the first behavior shard.  Dirty-input replay must refresh
+        // that base shard before a later clock edge, otherwise a low-phase input
+        // step can clear the dirty flag while leaving commit conditions/RHS temps
+        // at reset defaults.
+        if (state.enableSharding && (!state.sequentialStmts.empty() || !state.sequentialRegStmts.empty()) && !state.shardNeedsDirtyReplay.empty()) {
+            state.shardNeedsDirtyReplay.front() = true;
         }
 
         // Check for unsupported operations
