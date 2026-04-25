@@ -1232,6 +1232,58 @@ Design buildSelectiveReplayShardedDesign()
     return design;
 }
 
+
+Design buildConvergentActiveReplayDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    auto aCurrent = makeValue(graph, "a", 1, false);
+    auto bCurrent = makeValue(graph, "b", 1, false);
+    graph.bindInputPort("a", aCurrent);
+    graph.bindInputPort("b", bCurrent);
+
+    // Emit the B-only chain first so a later A-only source activation has to
+    // prove it can skip earlier independent shards before reaching the shared
+    // convergent fanout.
+    for (int i = 0; i < 60; ++i)
+    {
+        const auto next = makeValue(graph, "b_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("b_not_" + std::to_string(i)));
+        graph.addOperand(op, bCurrent);
+        graph.addResult(op, next);
+        bCurrent = next;
+    }
+
+    for (int i = 0; i < 60; ++i)
+    {
+        const auto next = makeValue(graph, "a_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("a_not_" + std::to_string(i)));
+        graph.addOperand(op, aCurrent);
+        graph.addResult(op, next);
+        aCurrent = next;
+    }
+
+    auto sharedCurrent = makeValue(graph, "shared_xor", 1, false);
+    const auto xorOp = graph.createOperation(OperationKind::kXor, graph.internSymbol("shared_xor_op"));
+    graph.addOperand(xorOp, aCurrent);
+    graph.addOperand(xorOp, bCurrent);
+    graph.addResult(xorOp, sharedCurrent);
+
+    for (int i = 0; i < 12; ++i)
+    {
+        const auto next = makeValue(graph, "shared_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("shared_not_" + std::to_string(i)));
+        graph.addOperand(op, sharedCurrent);
+        graph.addResult(op, next);
+        sharedCurrent = next;
+    }
+
+    graph.bindOutputPort("y", sharedCurrent);
+    return design;
+}
+
 Design buildShiftDesign()
 {
     Design design;
@@ -1580,6 +1632,31 @@ void compileAndRunHarness(const std::filesystem::path &dir,
     if (std::system(binaryPath.string().c_str()) != 0)
     {
         throw std::runtime_error("emitted runtime harness execution failed");
+    }
+}
+
+
+void instrumentSchedCounters(const std::filesystem::path &dir,
+                             const std::string &baseName,
+                             std::size_t shardCount)
+{
+    for (std::size_t i = 0; i < shardCount; ++i)
+    {
+        const auto path = dir / (baseName + "_sched_" + std::to_string(i) + ".cpp");
+        std::string text = readFile(path);
+        expect(!text.empty(), "instrumented sched shard should exist");
+        const std::string signature = "void SSimTop::sched_" + std::to_string(i) + "() {\n";
+        const std::string replacement = "extern int wolvrix_test_sched_counts[];\n" + signature +
+                                        "++wolvrix_test_sched_counts[" + std::to_string(i) + "];\n";
+        const auto pos = text.find(signature);
+        expect(pos != std::string::npos, "instrumented sched shard should contain its function signature");
+        text.replace(pos, signature.size(), replacement);
+        std::ofstream out(path);
+        if (!out.is_open())
+        {
+            throw std::runtime_error("failed to rewrite instrumented sched shard");
+        }
+        out << text;
     }
 }
 
@@ -3507,6 +3584,110 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "settle should enqueue shard successors from generated fanout metadata");
 }
 
+
+void testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout()
+{
+    Design design = buildConvergentActiveReplayDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "active_worklist_convergent_runtime";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("active_worklist_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "64";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp convergent active-worklist fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp convergent active-worklist fixture should not emit diagnostics");
+
+    std::size_t shardCount = 0;
+    while (std::filesystem::exists(dir / ("active_worklist_top_sched_" + std::to_string(shardCount) + ".cpp")))
+    {
+        ++shardCount;
+    }
+    expect(shardCount > 4, "convergent active-worklist fixture should emit enough shards to prove branch selectivity");
+
+    const std::string source = readFile(dir / "active_worklist_top.cpp");
+    expect(contains(source, "switch (active_shard_)"),
+           "active-worklist fixture should use switch dispatch instead of a linear active-shard scan");
+    expect(contains(source, "kShardSuccessors"),
+           "active-worklist fixture should emit successor fanout for convergent dependencies");
+
+    instrumentSchedCounters(dir, "active_worklist_top", shardCount);
+
+    const std::string runner = std::string(R"CPP(
+#include "active_worklist_top.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+int wolvrix_test_sched_counts[)CPP") + std::to_string(shardCount) + R"CPP(] = {};
+
+static void clear_counts() {
+    std::fill(std::begin(wolvrix_test_sched_counts), std::end(wolvrix_test_sched_counts), 0);
+}
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0);
+    sim.set_b(0);
+    sim.settle();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+
+    clear_counts();
+    sim.set_a(1);
+    sim.settle();
+    if (sim.get_y() != 1) {
+        return 2;
+    }
+    int counts_after_a[)CPP" + std::to_string(shardCount) + R"CPP(] = {};
+    for (std::size_t i = 0; i < )CPP" + std::to_string(shardCount) + R"CPP(; ++i) {
+        counts_after_a[i] = wolvrix_test_sched_counts[i];
+    }
+
+    clear_counts();
+    sim.set_b(1);
+    sim.settle();
+    if (sim.get_y() != 0) {
+        return 3;
+    }
+
+    bool a_changed_executed_any = false;
+    bool b_changed_executed_any = false;
+    bool b_only_shard_skipped_by_a = false;
+    bool shared_downstream_executed_by_both = false;
+    for (std::size_t i = 0; i < )CPP" + std::to_string(shardCount) + R"CPP(; ++i) {
+        const bool ran_for_a = counts_after_a[i] != 0;
+        const bool ran_for_b = wolvrix_test_sched_counts[i] != 0;
+        a_changed_executed_any = a_changed_executed_any || ran_for_a;
+        b_changed_executed_any = b_changed_executed_any || ran_for_b;
+        b_only_shard_skipped_by_a = b_only_shard_skipped_by_a || (!ran_for_a && ran_for_b);
+        shared_downstream_executed_by_both = shared_downstream_executed_by_both || (ran_for_a && ran_for_b);
+    }
+    if (!a_changed_executed_any || !b_changed_executed_any) {
+        return 4;
+    }
+    if (!b_only_shard_skipped_by_a) {
+        return 5;
+    }
+    if (!shared_downstream_executed_by_both) {
+        return 6;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "active_worklist_top", runner);
+}
+
 void testShiftCompileAndRun()
 {
     Design design = buildShiftDesign();
@@ -3937,6 +4118,7 @@ int main()
         testMediumGraphsEnableSharding();
         testDirtyReplayEdgeWithoutCommitRefreshesOutputs();
         testReplayDirtyInputShardsSkipsInputIndependentShards();
+        testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout();
         testShiftCompileAndRun();
         testWideShiftCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
