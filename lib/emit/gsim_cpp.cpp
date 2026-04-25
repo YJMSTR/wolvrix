@@ -3490,8 +3490,9 @@ namespace wolvrix::lib::emit
                     os << "    std::size_t active_cursor_ = 0;\n";
                     os << "    while (active_cursor_ < active_shard_queue_.size()) {\n";
                     os << "        const std::uint32_t active_shard_ = active_shard_queue_[active_cursor_++];\n";
+                    os << "        switch (active_shard_) {\n";
                     for (int i = 0; i < state.shardCount(); ++i) {
-                        os << "        if (active_shard_ == " << i << "U) { sched_" << i << "();";
+                        os << "        case " << i << "U: { sched_" << i << "();";
                         const auto& succ = (i < static_cast<int>(state.shardSuccessors.size())) ? state.shardSuccessors[static_cast<std::size_t>(i)] : std::set<int>{};
                         if (!succ.empty()) {
                             os << " static constexpr std::uint32_t kShardSuccessors" << i << "[] = {";
@@ -3502,8 +3503,10 @@ namespace wolvrix::lib::emit
                             }
                             os << "}; activate_shards(kShardSuccessors" << i << ", " << succ.size() << "U);";
                         }
-                        os << " }\n";
+                        os << " break; }\n";
                     }
+                    os << "        default: break;\n";
+                    os << "        }\n";
                     os << "    }\n";
                     os << "    active_shard_queue_.clear();\n";
                     os << "    std::fill(active_shards_.begin(), active_shards_.end(), 0);\n";
