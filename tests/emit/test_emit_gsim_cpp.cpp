@@ -3388,6 +3388,7 @@ void testDirtyReplayEdgeWithoutCommitRefreshesOutputs()
     options.outputFilename = std::string("dirty_replay_no_commit_top");
     options.topOverrides = {"top"};
     options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp dirty-replay no-commit fixture should succeed");
@@ -3398,6 +3399,8 @@ void testDirtyReplayEdgeWithoutCommitRefreshesOutputs()
            "sharded commit_step should track edge-local dirty replay");
     expect(contains(source, "committed_ || non_clock_inputs_dirty_ || dirty_replayed_"),
            "sharded commit_step should settle after dirty replay even when no commit happens");
+    expect(contains(source, "if (non_clock_inputs_dirty_ && !dirty_replayed_)"),
+           "sharded commit_step should not replay dirty shards between domains within one edge snapshot");
 
     const std::string runner = R"CPP(
 #include "dirty_replay_no_commit_top.hpp"
@@ -3443,6 +3446,7 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     options.outputFilename = std::string("selective_replay_top");
     options.topOverrides = {"top"};
     options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp selective-replay fixture should succeed");
@@ -3476,6 +3480,13 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     expect(replayCalls > 0, "selective-replay fixture should replay at least one shard");
     expect(replayCalls < shardCount,
            "selective-replay fixture should skip shards that never depend on dirty non-clock inputs");
+    const std::string header = readFile(dir / "selective_replay_top.hpp");
+    expect(contains(header, "std::uint32_t first_active_shard_"),
+           "sharded runtime should carry a coarse active-shard watermark");
+    expect(contains(source, "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count)"),
+           "sharded runtime should expose compact active-shard activation helper");
+    expect(contains(source, "if (first_active_shard <="),
+           "settle should gate sched shards by activity watermark instead of always replaying every shard");
 }
 
 void testShiftCompileAndRun()
