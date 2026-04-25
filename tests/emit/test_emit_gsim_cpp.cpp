@@ -3495,12 +3495,16 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     expect(replayCalls < shardCount,
            "selective-replay fixture should skip shards that never depend on dirty non-clock inputs");
     const std::string header = readFile(dir / "selective_replay_top.hpp");
-    expect(contains(header, "std::uint32_t first_active_shard_"),
-           "sharded runtime should carry a coarse active-shard watermark");
+    expect(contains(header, "std::vector<std::uint8_t> active_shards_"),
+           "sharded runtime should carry active-shard worklist bits");
+    expect(contains(header, "std::vector<std::uint32_t> active_shard_queue_"),
+           "sharded runtime should carry an active-shard worklist queue");
     expect(contains(source, "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count)"),
            "sharded runtime should expose compact active-shard activation helper");
-    expect(contains(source, "if (first_active_shard <="),
-           "settle should gate sched shards by activity watermark instead of always replaying every shard");
+    expect(contains(source, "while (active_cursor_ < active_shard_queue_.size())"),
+           "settle should drain the active-shard worklist instead of always replaying every shard");
+    expect(contains(source, "kShardSuccessors"),
+           "settle should enqueue shard successors from generated fanout metadata");
 }
 
 void testShiftCompileAndRun()

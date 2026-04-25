@@ -108,10 +108,13 @@ namespace wolvrix::lib::emit
             // transitive source sets that are too expensive for multi-million-op graphs.
             std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> inputActivitySourceNames;
             std::unordered_map<wolvrix::lib::grh::ValueId, int, wolvrix::lib::grh::ValueIdHash> valueActivityFirstShard;
+            std::unordered_map<wolvrix::lib::grh::ValueId, int, wolvrix::lib::grh::ValueIdHash> valueProducerShard;
+            std::vector<std::set<int>> shardSuccessors;
             std::vector<std::string> currentOpDirectActivitySources;
             int currentOpActivityFirstShard = -1;
             int lastEmittedShard = -1;
             std::unordered_map<std::string, int> activitySourceFirstShard;
+            std::unordered_map<std::string, std::set<int>> activitySourceHeadShards;
 
             // Helper to get next available shard buffer.
             std::string* getCurrentShardBuffer() {
@@ -127,6 +130,7 @@ namespace wolvrix::lib::emit
                     shardBuffers.emplace_back();
                     shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
                     shardNeedsDirtyReplay.push_back(false);
+                    shardSuccessors.emplace_back();
                     currentShard = static_cast<int>(shardBuffers.size()) - 1;
                     currentShardSize = 0;
                 }
@@ -146,6 +150,7 @@ namespace wolvrix::lib::emit
                         shardBuffers.emplace_back();
                         shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
                         shardNeedsDirtyReplay.push_back(false);
+                        shardSuccessors.emplace_back();
                     }
                 }
             }
@@ -198,6 +203,7 @@ namespace wolvrix::lib::emit
                         if (!inserted && currentShard < it->second) {
                             it->second = currentShard;
                         }
+                        activitySourceHeadShards[source].insert(currentShard);
                     }
                 }
             }
@@ -679,6 +685,7 @@ namespace wolvrix::lib::emit
                     opActivityFirstShard = shard;
                 }
             };
+            std::set<int> opDependencyProducerShards;
             for (const auto operand : operands)
             {
                 if (state.dirtyReplayRootInputs.count(operand) > 0)
@@ -714,6 +721,11 @@ namespace wolvrix::lib::emit
                         shardIt != state.valueActivityFirstShard.end())
                     {
                         mergeFirstShard(shardIt->second);
+                    }
+                    if (const auto producerIt = state.valueProducerShard.find(operand);
+                        producerIt != state.valueProducerShard.end() && producerIt->second >= 0)
+                    {
+                        opDependencyProducerShards.insert(producerIt->second);
                     }
                 }
             }
@@ -757,6 +769,16 @@ namespace wolvrix::lib::emit
                         state.valueDependsOnDirtyInput.emplace(results[idx], true);
                     }
                     state.setResult(results[idx], expr, getCppTypeForWidth(resultValue.width()), resultValue.width());
+                    const int resultProducerShard = state.enableSharding ? state.lastEmittedShard : -1;
+                    if (resultProducerShard >= 0) {
+                        state.valueProducerShard[results[idx]] = resultProducerShard;
+                        for (const int dependencyShard : opDependencyProducerShards) {
+                            if (dependencyShard >= 0 && dependencyShard != resultProducerShard &&
+                                dependencyShard < static_cast<int>(state.shardSuccessors.size())) {
+                                state.shardSuccessors[static_cast<std::size_t>(dependencyShard)].insert(resultProducerShard);
+                            }
+                        }
+                    }
                     if (state.enableActivityWatermark) {
                         int resultFirstShard = state.currentOpActivityFirstShard;
                         if (!state.currentOpDirectActivitySources.empty() && state.lastEmittedShard >= 0 &&
@@ -3099,6 +3121,18 @@ namespace wolvrix::lib::emit
                 if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
                     return;
                 }
+                if (const auto headsIt = state.activitySourceHeadShards.find(sourceKey);
+                    headsIt != state.activitySourceHeadShards.end() && !headsIt->second.empty()) {
+                    os << " static constexpr std::uint32_t kActivityHeads_" << sanitizeIdentifier(sourceKey) << "[] = {";
+                    bool first = true;
+                    for (int shard : headsIt->second) {
+                        os << (first ? "" : ", ") << shard << "U";
+                        first = false;
+                    }
+                    os << "}; activate_shards(kActivityHeads_" << sanitizeIdentifier(sourceKey) << ", "
+                       << headsIt->second.size() << "U);";
+                    return;
+                }
                 const auto shardIt = state.activitySourceFirstShard.find(sourceKey);
                 if (shardIt == state.activitySourceFirstShard.end() || shardIt->second < 0) {
                     return;
@@ -3173,6 +3207,7 @@ namespace wolvrix::lib::emit
                 if (state.enableActivityWatermark) {
                     os << "    void activate_all_shards();\n";
                     os << "    void activate_shards(const std::uint32_t* indices, std::size_t count);\n";
+                    os << "    void activate_shard(std::uint32_t shard);\n";
                     os << "    void activate_shard_range(std::uint32_t firstShard);\n";
                 }
                 os << "\n";
@@ -3206,7 +3241,8 @@ namespace wolvrix::lib::emit
             os << "    SSimTopEvalTemps* evalTemps_;\n";
             os << "    bool non_clock_inputs_dirty_ = true;\n";
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                os << "    std::uint32_t first_active_shard_ = " << state.shardCount() << "U;\n";
+                os << "    std::vector<std::uint8_t> active_shards_;\n";
+                os << "    std::vector<std::uint32_t> active_shard_queue_;\n";
             }
             for (const auto &chunk : sequentialChunks) {
                 os << "    void " << chunk.methodName << "(bool& committed_);\n";
@@ -3390,22 +3426,31 @@ namespace wolvrix::lib::emit
             }
             os << " }\n\n";
 
-            if (state.enableSharding && state.shardCount() > 0) {
-                os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()) { reset(); }\n";
+            if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
+                os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()), ";
+                os << "active_shards_(" << state.shardCount() << "U, 0), active_shard_queue_() { reset(); }\n";
             } else {
                 os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()) { reset(); }\n";
             }
             os << "SSimTop::~SSimTop() { delete evalTemps_; delete state_; }\n\n";
             os << "void SSimTop::set_reset(unsigned reset) { reset_ = reset; }\n\n";
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                os << "void SSimTop::activate_all_shards() { first_active_shard_ = 0; }\n\n";
+                os << "void SSimTop::activate_all_shards() {\n";
+                os << "    active_shard_queue_.clear();\n";
+                os << "    std::fill(active_shards_.begin(), active_shards_.end(), 0);\n";
+                os << "    for (std::uint32_t i = 0; i < " << state.shardCount() << "U; ++i) { activate_shard(i); }\n";
+                os << "}\n\n";
                 os << "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count) {\n";
-                os << "    for (std::size_t i = 0; i < count; ++i) {\n";
-                os << "        activate_shard_range(indices[i]);\n";
-                os << "    }\n";
+                os << "    for (std::size_t i = 0; i < count; ++i) { activate_shard(indices[i]); }\n";
+                os << "}\n\n";
+                os << "void SSimTop::activate_shard(std::uint32_t shard) {\n";
+                os << "    if (shard >= active_shards_.size()) { return; }\n";
+                os << "    if (active_shards_[shard] != 0) { return; }\n";
+                os << "    active_shards_[shard] = 1;\n";
+                os << "    active_shard_queue_.push_back(shard);\n";
                 os << "}\n\n";
                 os << "void SSimTop::activate_shard_range(std::uint32_t firstShard) {\n";
-                os << "    if (firstShard < first_active_shard_) { first_active_shard_ = firstShard; }\n";
+                os << "    for (std::uint32_t i = firstShard; i < " << state.shardCount() << "U; ++i) { activate_shard(i); }\n";
                 os << "}\n\n";
             }
             os << "void SSimTop::reset() {\n";
@@ -3442,11 +3487,26 @@ namespace wolvrix::lib::emit
             os << "void SSimTop::settle() {\n";
             if (state.enableSharding && state.shardCount() > 0) {
                 if (state.enableActivityWatermark) {
-                    os << "    const std::uint32_t first_active_shard = first_active_shard_;\n";
-                    os << "    first_active_shard_ = " << state.shardCount() << "U;\n";
+                    os << "    std::size_t active_cursor_ = 0;\n";
+                    os << "    while (active_cursor_ < active_shard_queue_.size()) {\n";
+                    os << "        const std::uint32_t active_shard_ = active_shard_queue_[active_cursor_++];\n";
                     for (int i = 0; i < state.shardCount(); ++i) {
-                        os << "    if (first_active_shard <= " << i << "U) { sched_" << i << "(); }\n";
+                        os << "        if (active_shard_ == " << i << "U) { sched_" << i << "();";
+                        const auto& succ = (i < static_cast<int>(state.shardSuccessors.size())) ? state.shardSuccessors[static_cast<std::size_t>(i)] : std::set<int>{};
+                        if (!succ.empty()) {
+                            os << " static constexpr std::uint32_t kShardSuccessors" << i << "[] = {";
+                            bool first = true;
+                            for (int successor : succ) {
+                                os << (first ? "" : ", ") << successor << "U";
+                                first = false;
+                            }
+                            os << "}; activate_shards(kShardSuccessors" << i << ", " << succ.size() << "U);";
+                        }
+                        os << " }\n";
                     }
+                    os << "    }\n";
+                    os << "    active_shard_queue_.clear();\n";
+                    os << "    std::fill(active_shards_.begin(), active_shards_.end(), 0);\n";
                 } else {
                     for (int i = 0; i < state.shardCount(); ++i) {
                         os << "    sched_" << i << "();\n";
@@ -3483,7 +3543,7 @@ namespace wolvrix::lib::emit
                     }
                 }
                 if (state.enableActivityWatermark) {
-                    os << "    first_active_shard_ = " << state.shardCount() << "U;\n";
+                    os << "    if (active_shard_queue_.empty()) { activate_all_shards(); }\n";
                 }
                 os << "    non_clock_inputs_dirty_ = false;\n";
                 os << "}\n\n";
@@ -4054,6 +4114,11 @@ namespace wolvrix::lib::emit
                 if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                     std::set<int> firstShards;
                     for (const auto &regName : chunk.regNames) {
+                        if (const auto headsIt = state.activitySourceHeadShards.find(regName);
+                            headsIt != state.activitySourceHeadShards.end()) {
+                            firstShards.insert(headsIt->second.begin(), headsIt->second.end());
+                            continue;
+                        }
                         if (const auto shardIt = state.activitySourceFirstShard.find(regName);
                             shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
                             firstShards.insert(shardIt->second);
@@ -4218,6 +4283,7 @@ namespace wolvrix::lib::emit
         state.valueDependsOnDirtyInput.reserve(reserveOps);
         if (state.enableActivityWatermark) {
             state.valueActivityFirstShard.reserve(reserveOps / 4U + 1024U);
+            state.valueProducerShard.reserve(reserveOps / 4U + 1024U);
             state.inputActivitySourceNames.reserve(target->graph->inputPorts().size());
         }
 
