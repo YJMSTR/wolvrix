@@ -400,6 +400,48 @@ Design buildDpicImportNoOpDesign()
     return design;
 }
 
+
+Design buildDpicCallDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 8, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("clk", clk);
+
+    const auto outY = makeValue(graph, "y", 8, false);
+    graph.bindOutputPort("y", outY);
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_y"));
+    graph.addOperand(assign, inA);
+    graph.addResult(assign, outY);
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"byte"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, inA);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
 Design buildLatchReadNoOpDesign()
 {
     Design design;
@@ -2083,6 +2125,74 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "dpic_import_top", runner);
+}
+
+
+void testDpicCallCompileAndRun()
+{
+    Design design = buildDpicCallDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_call_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_call_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower input-only kDpicCall ops");
+    expect(!diags.hasError(), "EmitGsimCpp should not report input-only kDpicCall ops as unsupported");
+
+    const std::string source = readFile(dir / "dpic_call_top.cpp");
+    expect(contains(source, "#include \"difftest-dpic.h\""), "dpic call source should include the generated DPI-C header");
+    const std::string commitChunk = readFile(dir / "dpic_call_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(commitChunk, "dpi_capture(static_cast<std::uint8_t>"), "dpic call source should invoke the imported function");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void dpi_capture(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_call_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(7);
+    sim.set_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 7) {
+        return 2;
+    }
+    if (sim.get_difftest__DOT__step() != 1) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_call_top", runner);
 }
 
 void testLatchReadNoOpCompileAndRun()
@@ -4143,6 +4253,7 @@ int main()
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
         testDpicImportNoOpCompileAndRun();
+        testDpicCallCompileAndRun();
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
         testMemoryReadCompileAndRun();

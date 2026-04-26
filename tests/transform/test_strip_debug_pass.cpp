@@ -452,6 +452,79 @@ int runInstancePathSharedTopTest()
     return 0;
 }
 
+
+int runKeepDpicPrefixTest()
+{
+    wolvrix::lib::grh::Design design;
+    auto &graph = design.createGraph("top");
+
+    auto makeValue = [&](const std::string &name) {
+        wolvrix::lib::grh::SymbolId sym = graph.internSymbol(name);
+        return graph.createValue(sym, 1, false);
+    };
+
+    wolvrix::lib::grh::ValueId inDpi = makeValue("in_dpi");
+    wolvrix::lib::grh::ValueId clk = makeValue("clock");
+    graph.bindInputPort("in_dpi", inDpi);
+    graph.bindInputPort("clock", clk);
+
+    auto keepImport = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, graph.internSymbol("v_difftest_TrapEvent"));
+    graph.setAttr(keepImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(keepImport, "argsDirection", std::vector<std::string>{"input"});
+    auto keepCall = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall, graph.internSymbol("keep_call"));
+    graph.addOperand(keepCall, inDpi);
+    graph.addOperand(keepCall, inDpi);
+    graph.addOperand(keepCall, clk);
+    graph.setAttr(keepCall, "targetImportSymbol", std::string("v_difftest_TrapEvent"));
+    graph.setAttr(keepCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(keepCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(keepCall, "eventEdge", std::vector<std::string>{"posedge"});
+
+    auto stripImport = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicImport, graph.internSymbol("xs_assert_v2"));
+    graph.setAttr(stripImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(stripImport, "argsDirection", std::vector<std::string>{"input"});
+    auto stripCall = graph.createOperation(wolvrix::lib::grh::OperationKind::kDpicCall, graph.internSymbol("strip_call"));
+    graph.addOperand(stripCall, inDpi);
+    graph.addOperand(stripCall, inDpi);
+    graph.addOperand(stripCall, clk);
+    graph.setAttr(stripCall, "targetImportSymbol", std::string("xs_assert_v2"));
+    graph.setAttr(stripCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(stripCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(stripCall, "eventEdge", std::vector<std::string>{"posedge"});
+
+    design.markAsTop("top");
+    StripDebugOptions options;
+    options.path = "top";
+    options.keepDpicImportPrefixes = {"v_difftest_"};
+    PassManager manager;
+    manager.addPass(std::make_unique<StripDebugPass>(options));
+    PassDiagnostics diags;
+    const auto res = manager.run(design, diags);
+    if (!res.success || diags.hasError())
+    {
+        return fail("Expected strip-debug keep-dpic-prefix to succeed");
+    }
+    auto *logic = design.findGraph("top_logic_part");
+    auto *debug = design.findGraph("top_debug_part");
+    if (!logic || !debug)
+    {
+        return fail("Expected split graphs in keep-dpic-prefix test");
+    }
+    if (!logic->findOperation("keep_call").valid() || !logic->findOperation("v_difftest_TrapEvent").valid())
+    {
+        return fail("Expected kept v_difftest DPI import/call to remain in logic_part");
+    }
+    if (logic->findOperation("strip_call").valid() || logic->findOperation("xs_assert_v2").valid())
+    {
+        return fail("Expected non-kept DPI import/call to be stripped from logic_part");
+    }
+    if (!debug->findOperation("strip_call").valid() || !debug->findOperation("xs_assert_v2").valid())
+    {
+        return fail("Expected non-kept DPI import/call to move into debug_part");
+    }
+    return 0;
+}
+
 int main()
 {
     if (int rc = runBasicTest())
@@ -459,6 +532,10 @@ int main()
         return rc;
     }
     if (int rc = runImportRenameTest())
+    {
+        return rc;
+    }
+    if (int rc = runKeepDpicPrefixTest())
     {
         return rc;
     }

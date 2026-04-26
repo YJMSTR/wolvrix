@@ -141,6 +141,18 @@ namespace wolvrix::lib::transform
             }
         }
 
+        bool hasAnyPrefix(std::string_view text, const std::vector<std::string> &prefixes)
+        {
+            for (const auto &prefix : prefixes)
+            {
+                if (!prefix.empty() && text.starts_with(prefix))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         std::optional<std::string> getAttrString(const Operation &op, std::string_view key)
         {
             auto attr = op.attr(key);
@@ -592,6 +604,14 @@ namespace wolvrix::lib::transform
                 if (!isStripKind(op.kind()))
                 {
                     continue;
+                }
+                if (op.kind() == OperationKind::kDpicCall)
+                {
+                    auto importSym = getAttrString(op, "targetImportSymbol");
+                    if (importSym && hasAnyPrefix(*importSym, options_.keepDpicImportPrefixes))
+                    {
+                        continue;
+                    }
                 }
                 if (plan.stripSet.insert(opId).second)
                 {

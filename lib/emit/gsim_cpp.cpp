@@ -36,6 +36,14 @@ namespace wolvrix::lib::emit
             std::int32_t width = 0;
         };
 
+        struct DpicImportInfo
+        {
+            std::string symbol;
+            std::vector<std::string> argNames;
+            std::vector<std::string> argDirs;
+            std::vector<int64_t> argWidths;
+        };
+
         // Code generation state for lowering GRH operations to C++
         struct CodegenState
         {
@@ -77,6 +85,10 @@ namespace wolvrix::lib::emit
 
             // Track unsupported operations for error reporting
             std::vector<std::string> unsupportedOps;
+
+            // DPI-C imports/calls used by terminal-capable XiangShan difftest.
+            std::map<std::string, DpicImportInfo> dpicImports;
+            bool emitsDpicCalls = false;
 
             // Memory declarations/read lowering support
             std::unordered_map<std::string, MemoryInfo> memories;
@@ -422,6 +434,24 @@ namespace wolvrix::lib::emit
                 return expr;
             }
             return "static_cast<" + getCppTypeForWidth(width) + ">(" + expr + ")";
+        }
+
+
+        std::string dpicCastExpr(const std::string &expr, int64_t width)
+        {
+            if (width <= 8)
+            {
+                return "static_cast<std::uint8_t>(" + expr + ")";
+            }
+            if (width <= 16)
+            {
+                return "static_cast<std::uint16_t>(" + expr + ")";
+            }
+            if (width <= 32)
+            {
+                return "static_cast<std::uint32_t>(" + expr + ")";
+            }
+            return "static_cast<std::uint64_t>(" + expr + ")";
         }
 
         bool isZeroLiteralText(std::string_view text)
@@ -1783,13 +1813,133 @@ namespace wolvrix::lib::emit
                     break;
                 }
 
-                case OperationKind::kDpicImport:
+                case OperationKind::kDpicImport: {
+                    DpicImportInfo importInfo;
+                    importInfo.symbol = op.symbolText().empty() ? std::string{} : std::string(op.symbolText());
+                    if (auto namesAttr = op.attr("argsName")) {
+                        if (auto *names = std::get_if<std::vector<std::string>>(&*namesAttr)) {
+                            importInfo.argNames = *names;
+                        }
+                    }
+                    if (auto dirsAttr = op.attr("argsDirection")) {
+                        if (auto *dirs = std::get_if<std::vector<std::string>>(&*dirsAttr)) {
+                            importInfo.argDirs = *dirs;
+                        }
+                    }
+                    if (auto widthsAttr = op.attr("argsWidth")) {
+                        if (auto *widths = std::get_if<std::vector<int64_t>>(&*widthsAttr)) {
+                            importInfo.argWidths = *widths;
+                        }
+                    }
+                    if (!importInfo.symbol.empty()) {
+                        state.dpicImports[importInfo.symbol] = std::move(importInfo);
+                    }
+                    break;
+                }
+
+                case OperationKind::kDpicCall: {
+                    if (operands.empty()) {
+                        break;
+                    }
+                    auto targetAttr = op.attr("targetImportSymbol");
+                    auto inNamesAttr = op.attr("inArgName");
+                    const auto *target = targetAttr ? std::get_if<std::string>(&*targetAttr) : nullptr;
+                    const auto *inNames = inNamesAttr ? std::get_if<std::vector<std::string>>(&*inNamesAttr) : nullptr;
+                    if (target == nullptr || target->empty() || inNames == nullptr) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kDpicCall-metadata (" + opName + ")");
+                        break;
+                    }
+
+                    const auto importIt = state.dpicImports.find(*target);
+                    if (importIt == state.dpicImports.end()) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kDpicCall-import (" + opName + ")");
+                        break;
+                    }
+                    const DpicImportInfo &importInfo = importIt->second;
+                    if (importInfo.argNames.size() != importInfo.argDirs.size()) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kDpicCall-signature (" + opName + ")");
+                        break;
+                    }
+                    const std::size_t formalCount = importInfo.argNames.size();
+                    if (importInfo.argWidths.size() < formalCount) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kDpicCall-widths (" + opName + ")");
+                        break;
+                    }
+
+                    auto eventEdgeAttr = op.attr("eventEdge");
+                    const auto *eventEdges = eventEdgeAttr ? std::get_if<std::vector<std::string>>(&*eventEdgeAttr) : nullptr;
+                    const std::size_t eventCount = eventEdges != nullptr && !eventEdges->empty() ? eventEdges->size() : 1U;
+                    if (operands.size() < 1U + eventCount) {
+                        std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                        state.unsupportedOps.push_back("kDpicCall-operands (" + opName + ")");
+                        break;
+                    }
+                    const std::size_t eventStart = operands.size() - eventCount;
+                    const std::string condition = getOperandExpr(0);
+
+                    const auto eventValue = graph.getValue(operands[eventStart]);
+                    const std::string clockSymbol = eventValue.symbolText().empty() ? "clock" : std::string(eventValue.symbolText());
+                    const std::string eventEdge = eventEdges != nullptr && !eventEdges->empty() && !(*eventEdges)[0].empty()
+                                                    ? (*eventEdges)[0]
+                                                    : std::string("posedge");
+                    const std::string domainKey = eventEdge + ":" + clockSymbol;
+                    const std::string clockExpr = getOperandExpr(eventStart);
+                    if (clockExpr != "0" && !clockExpr.empty()) {
+                        state.sequentialClockExprs.try_emplace(domainKey, clockExpr);
+                    }
+
+                    std::vector<std::string> args;
+                    args.reserve(formalCount);
+                    bool callOk = true;
+                    for (std::size_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+                        if (importInfo.argDirs[formalIndex] != "input") {
+                            std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                            state.unsupportedOps.push_back("kDpicCall-noninput (" + opName + ")");
+                            callOk = false;
+                            break;
+                        }
+                        const auto nameIt = std::find(inNames->begin(), inNames->end(), importInfo.argNames[formalIndex]);
+                        if (nameIt == inNames->end()) {
+                            std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                            state.unsupportedOps.push_back("kDpicCall-arg (" + opName + ")");
+                            callOk = false;
+                            break;
+                        }
+                        const std::size_t inputIndex = static_cast<std::size_t>(std::distance(inNames->begin(), nameIt));
+                        const std::size_t operandIndex = 1U + inputIndex;
+                        if (operandIndex >= eventStart) {
+                            std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                            state.unsupportedOps.push_back("kDpicCall-arg-index (" + opName + ")");
+                            callOk = false;
+                            break;
+                        }
+                        args.push_back(dpicCastExpr(getOperandExpr(operandIndex), importInfo.argWidths[formalIndex]));
+                    }
+                    if (!callOk) {
+                        break;
+                    }
+
+                    std::string stmt = "        if (" + condition + ") { " + *target + "(";
+                    for (std::size_t i = 0; i < args.size(); ++i) {
+                        if (i != 0) {
+                            stmt += ", ";
+                        }
+                        stmt += args[i];
+                    }
+                    stmt += "); committed_ = true; }";
+                    state.emitsDpicCalls = true;
+                    state.sequentialStmts[domainKey].push_back(std::move(stmt));
+                    break;
+                }
+
                 case OperationKind::kSystemTask:
                 case OperationKind::kSystemFunction: {
-                    // DPI imports are declarations with no operands/results, so GSIM can
-                    // safely ignore them at emit time until call lowering support exists.
-                    // System tasks/functions are debug/diagnostic constructs and likewise
-                    // do not generate simulation logic in the emitted C++ runtime.
+                    // System tasks/functions are debug/diagnostic constructs and do not
+                    // generate simulation logic in the emitted C++ runtime.
                     break;
                 }
 
@@ -3329,6 +3479,10 @@ namespace wolvrix::lib::emit
             std::string internalHeader = std::filesystem::path(std::string(headerFilename)).stem().string() + "_internal.hpp";
             os << "#include \"" << internalHeader << "\"\n\n";
             os << "#include <algorithm>\n";
+            if (state.emitsDpicCalls) {
+                os << "#include <cstring>\n";
+                os << "#include \"difftest-dpic.h\"\n";
+            }
             os << "#include <set>\n\n";
             auto emitPoolCtor = [&](std::string_view ctorName,
                                     std::size_t u8Count,
@@ -3942,7 +4096,12 @@ namespace wolvrix::lib::emit
                                         const SequentialChunkPlan& chunk,
                                         std::string_view internalHeaderFilename)
         {
-            os << "#include \"" << internalHeaderFilename << "\"\n\n";
+            os << "#include \"" << internalHeaderFilename << "\"\n";
+            if (state.emitsDpicCalls) {
+                os << "#include <cstring>\n";
+                os << "#include \"difftest-dpic.h\"\n";
+            }
+            os << "\n";
             os << "void SSimTop::" << chunk.methodName << "(bool& committed_) {\n";
             if (!chunk.regNames.empty()) {
                 os << "    bool chunk_updated_ = false;\n";

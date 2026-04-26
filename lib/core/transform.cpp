@@ -1262,6 +1262,20 @@ namespace wolvrix::lib::transform
                 {
                     options.path = std::string(arg.substr(std::string_view("-path=").size()));
                 }
+                else if (arg == "-keep-dpic-prefix")
+                {
+                    if (i + 1 >= args.size())
+                    {
+                        error = "-keep-dpic-prefix expects a value";
+                        return nullptr;
+                    }
+                    options.keepDpicImportPrefixes.push_back(std::string(args[++i]));
+                }
+                else if (arg.starts_with("-keep-dpic-prefix="))
+                {
+                    options.keepDpicImportPrefixes.push_back(
+                        std::string(arg.substr(std::string_view("-keep-dpic-prefix=").size())));
+                }
                 else
                 {
                     error = "unknown strip-debug option";

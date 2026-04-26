@@ -3,12 +3,16 @@
 
 #include "core/transform.hpp"
 
+#include <string>
+#include <vector>
+
 namespace wolvrix::lib::transform
 {
 
     struct StripDebugOptions
     {
         std::string path;
+        std::vector<std::string> keepDpicImportPrefixes;
     };
 
     class StripDebugPass : public Pass
