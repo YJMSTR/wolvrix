@@ -3186,9 +3186,7 @@ namespace wolvrix::lib::emit
             os << "    std::uint64_t get_difftest__DOT__exit() const { ";
             os << (hasOutputPort("difftest_exit") ? "return get_difftest_exit();" : "return difftest_exit_;");
             os << " }\n";
-            os << "    std::uint64_t get_difftest__DOT__step() const { ";
-            os << (hasOutputPort("difftest_step") ? "return get_difftest_step();" : "return difftest_step_;");
-            os << " }\n";
+            os << "    std::uint64_t get_difftest__DOT__step() const { return difftest_step_; }\n";
             os << "    void set_difftest__DOT__perfCtrl__DOT__clean(unsigned clean) { ";
             os << (hasInputPort("difftest_perfCtrl_clean") ? "set_difftest_perfCtrl_clean(static_cast<std::uint8_t>(clean));" : "perf_clean_ = clean;");
             os << " }\n";

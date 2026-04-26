@@ -1769,8 +1769,8 @@ void testDifftestCompatibilityAccessorsUseTopLevelPorts()
            "top-level difftest_step port accessor should read emitted output port storage");
     expect(contains(header, "get_difftest__DOT__exit() const { return get_difftest_exit(); }"),
            "downstream compatibility difftest exit accessor should forward to top-level output port");
-    expect(contains(header, "get_difftest__DOT__step() const { return get_difftest_step(); }"),
-           "downstream compatibility difftest step accessor should forward to top-level output port");
+    expect(contains(header, "get_difftest__DOT__step() const { return difftest_step_; }"),
+           "downstream compatibility difftest step accessor should keep the no-diff progress counter fallback");
 }
 
 void testFailureWithoutPriorMetadata()
