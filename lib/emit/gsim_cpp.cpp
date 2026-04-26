@@ -2013,13 +2013,25 @@ namespace wolvrix::lib::emit
                         const std::string condName = "dpic_cond_" + std::to_string(callSite) + "_";
                         const std::string seenName = "dpic_seen_" + std::to_string(callSite) + "_";
                         const std::string hitsName = "dpic_hits_" + std::to_string(callSite) + "_";
+                        const std::string missesName = "dpic_misses_" + std::to_string(callSite) + "_";
+                        const bool traceFalseSamples = true;
                         stmt = "        { const bool " + condName + " = static_cast<bool>(" + condition + "); ";
                         stmt += "static bool " + seenName + " = false; static unsigned " + hitsName + " = 0; ";
+                        if (traceFalseSamples) {
+                            stmt += "static unsigned " + missesName + " = 0; ";
+                        }
                         stmt += "if (!" + seenName + ") { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " first_cond=\" << " + condName;
                         for (std::size_t i = 0; i < args.size(); ++i) {
                             stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                         }
                         stmt += " << \"\\n\"; " + seenName + " = true; } ";
+                        if (traceFalseSamples) {
+                            stmt += "if (!" + condName + ") { ++" + missesName + "; if (" + missesName + " <= 16U || (" + missesName + " % 1024U) == 0U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " miss=\" << " + missesName;
+                            for (std::size_t i = 0; i < args.size(); ++i) {
+                                stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
+                            }
+                            stmt += " << \"\\n\"; } } ";
+                        }
                         stmt += "if (" + condName + ") { ++" + hitsName + "; if (" + hitsName + " <= 16U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " hit=\" << " + hitsName;
                         for (std::size_t i = 0; i < args.size(); ++i) {
                             stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";

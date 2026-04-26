@@ -2283,6 +2283,7 @@ void testDpicCallCompileAndRun()
     expect(contains(commitChunk, "dpi_capture(static_cast<std::uint8_t>"), "dpic call source should invoke the imported function");
     expect(contains(commitChunk, "[wolvrix-gsim-dpic]"), "dpic trace mode should emit per-site diagnostics");
     expect(contains(commitChunk, "first_cond"), "dpic trace mode should log the first observed condition");
+    expect(contains(commitChunk, "miss="), "dpic trace mode should sample repeated false conditions");
 
     std::ofstream stub(dir / "difftest-dpic.h");
     if (!stub.is_open()) {
