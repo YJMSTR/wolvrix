@@ -294,6 +294,32 @@ Design buildSingleGraphDesign()
     return design;
 }
 
+Design buildDifftestTopPortDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto exitIn = makeValue(graph, "exit_in", 64, false);
+    const auto stepIn = makeValue(graph, "step_in", 64, false);
+    const auto exitOut = makeValue(graph, "difftest_exit", 64, false);
+    const auto stepOut = makeValue(graph, "difftest_step", 64, false);
+    graph.bindInputPort("exit_in", exitIn);
+    graph.bindInputPort("step_in", stepIn);
+    graph.bindOutputPort("difftest_exit", exitOut);
+    graph.bindOutputPort("difftest_step", stepOut);
+
+    const auto assignExit = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_difftest_exit"));
+    graph.addOperand(assignExit, exitIn);
+    graph.addResult(assignExit, exitOut);
+
+    const auto assignStep = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_difftest_step"));
+    graph.addOperand(assignStep, stepIn);
+    graph.addResult(assignStep, stepOut);
+
+    return design;
+}
+
 Design buildStatefulOutputDesign()
 {
     Design design;
@@ -1715,6 +1741,36 @@ void testHappyPathAfterRunningGsim()
     expect(contains(source, "metadata.hypergraph_edge_sinks = {"), "source should serialize hypergraph sink metadata");
     expect(contains(source, "bool validate_top_metadata"), "source should emit validation helper");
     expect(contains(manifest, "top_metadata.cpp"), "manifest should list the canonical main source");
+}
+
+void testDifftestCompatibilityAccessorsUseTopLevelPorts()
+{
+    Design design = buildDifftestTopPortDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "difftest_ports";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("difftest_ports");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should emit difftest port fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not error on difftest port fixture");
+
+    const std::string header = readFile(dir / "difftest_ports.hpp");
+    expect(contains(header, "std::uint64_t get_difftest_exit() const { return output_difftest_exit_; }"),
+           "top-level difftest_exit port accessor should read emitted output port storage");
+    expect(contains(header, "std::uint64_t get_difftest_step() const { return output_difftest_step_; }"),
+           "top-level difftest_step port accessor should read emitted output port storage");
+    expect(contains(header, "get_difftest__DOT__exit() const { return get_difftest_exit(); }"),
+           "downstream compatibility difftest exit accessor should forward to top-level output port");
+    expect(contains(header, "get_difftest__DOT__step() const { return get_difftest_step(); }"),
+           "downstream compatibility difftest step accessor should forward to top-level output port");
 }
 
 void testFailureWithoutPriorMetadata()
@@ -4077,6 +4133,7 @@ int main()
     try
     {
         testHappyPathAfterRunningGsim();
+        testDifftestCompatibilityAccessorsUseTopLevelPorts();
         testFailureWithoutPriorMetadata();
         testFailureOnPlaceholderContract();
         testFailureOnNamespacePathMismatch();
