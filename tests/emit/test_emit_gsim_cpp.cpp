@@ -342,6 +342,23 @@ Design buildStatefulOutputDesign()
     return design;
 }
 
+Design buildResetPortForwardingDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto reset = makeValue(graph, "reset", 1, false);
+    const auto outY = makeValue(graph, "y", 1, false);
+    graph.bindInputPort("reset", reset);
+    graph.bindOutputPort("y", outY);
+
+    const auto assign = graph.createOperation(OperationKind::kAssign, graph.internSymbol("assign_reset_to_y"));
+    graph.addOperand(assign, reset);
+    graph.addResult(assign, outY);
+    return design;
+}
+
 Design buildConcatDesign()
 {
     Design design;
@@ -431,6 +448,47 @@ Design buildDpicCallDesign()
     const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture"));
     graph.addOperand(dpiCall, one);
     graph.addOperand(dpiCall, inA);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
+Design buildDpicPostSequentialSettleDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "pc_storage", "pc_reg", 8, "pc");
+    const auto pcRead = makeRegisterRead(graph, "pc_read", "pc_read_op", 8, "pc");
+    graph.bindOutputPort("pc", pcRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto nextPc = makeConstant(graph, "next_pc", "next_pc_const", 8, "8'h2a");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "pc_write", one, nextPc, mask, clk, "pc");
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"byte"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture_pc"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, pcRead);
     graph.addOperand(dpiCall, clk);
     graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
     graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
@@ -940,9 +998,11 @@ Design buildWideBitwiseDesign()
     const auto outAnd = makeValue(graph, "and_y", 100, false);
     const auto outOr = makeValue(graph, "or_y", 100, false);
     const auto outXor = makeValue(graph, "xor_y", 100, false);
+    const auto outNot = makeValue(graph, "not_y", 100, false);
     graph.bindOutputPort("and_y", outAnd);
     graph.bindOutputPort("or_y", outOr);
     graph.bindOutputPort("xor_y", outXor);
+    graph.bindOutputPort("not_y", outNot);
 
     const auto andOp = graph.createOperation(OperationKind::kAnd, graph.internSymbol("wide_and_y"));
     graph.addOperand(andOp, a);
@@ -958,6 +1018,25 @@ Design buildWideBitwiseDesign()
     graph.addOperand(xorOp, a);
     graph.addOperand(xorOp, b);
     graph.addResult(xorOp, outXor);
+
+    const auto notOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("wide_not_y"));
+    graph.addOperand(notOp, a);
+    graph.addResult(notOp, outNot);
+
+    // Keep this fixture above the sharding threshold so it covers the XiangShan
+    // hot path that lowers wide bitwise operations directly into materialized
+    // temp storage instead of returning heap-backed vectors by value.
+    ValueId prev = a;
+    for (int i = 0; i < 130; ++i)
+    {
+        const auto filler = makeValue(graph, "wide_bitwise_filler_" + std::to_string(i), 100, false);
+        const auto fillerOp = graph.createOperation(OperationKind::kXor,
+                                                    graph.internSymbol("wide_bitwise_filler_op_" + std::to_string(i)));
+        graph.addOperand(fillerOp, prev);
+        graph.addOperand(fillerOp, b);
+        graph.addResult(fillerOp, filler);
+        prev = filler;
+    }
 
     return design;
 }
@@ -2087,6 +2166,56 @@ int main() {
     compileAndRunHarness(dir, "runtime_top", runner);
 }
 
+void testResetCompatibilitySetterDrivesTopLevelResetPort()
+{
+    Design design = buildResetPortForwardingDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "reset_port_forwarding";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reset_port_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp reset-port fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp reset-port fixture should not emit errors");
+
+    const std::string header = readFile(dir / "reset_port_top.hpp");
+    const std::string source = readFile(dir / "reset_port_top.cpp");
+    expect(contains(header, "void set_reset(unsigned reset)"),
+           "compatibility reset API should remain available");
+    expect(!contains(header, "void set_reset(std::uint8_t value)"),
+           "top-level reset input should be served by the compatibility reset API without an ambiguous overload");
+    expect(contains(source, "void SSimTop::set_reset(unsigned reset) { const auto value = static_cast<std::uint8_t>(reset);"),
+           "compatibility reset API should forward to the top-level reset port when present");
+
+    const std::string runner = R"CPP(
+#include "reset_port_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_reset(1);
+    sim.settle();
+    if (sim.get_y() != 1) {
+        return 1;
+    }
+    sim.set_reset(0);
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "reset_port_top", runner);
+}
+
 void testDpicImportNoOpCompileAndRun()
 {
     Design design = buildDpicImportNoOpDesign();
@@ -2142,6 +2271,7 @@ void testDpicCallCompileAndRun()
     options.outputDir = dir.string();
     options.outputFilename = std::string("dpic_call_top");
     options.topOverrides = {"top"};
+    options.attributes["dpic_trace"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp should lower input-only kDpicCall ops");
@@ -2151,6 +2281,8 @@ void testDpicCallCompileAndRun()
     expect(contains(source, "#include \"difftest-dpic.h\""), "dpic call source should include the generated DPI-C header");
     const std::string commitChunk = readFile(dir / "dpic_call_top_commit_chunk_posedge_clk_0.cpp");
     expect(contains(commitChunk, "dpi_capture(static_cast<std::uint8_t>"), "dpic call source should invoke the imported function");
+    expect(contains(commitChunk, "[wolvrix-gsim-dpic]"), "dpic trace mode should emit per-site diagnostics");
+    expect(contains(commitChunk, "first_cond"), "dpic trace mode should log the first observed condition");
 
     std::ofstream stub(dir / "difftest-dpic.h");
     if (!stub.is_open()) {
@@ -2193,6 +2325,73 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "dpic_call_top", runner);
+}
+
+void testDpicSamplesPostSequentialSettleState()
+{
+    Design design = buildDpicPostSequentialSettleDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_post_seq_settle_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_post_seq_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp DPIC post-sequential fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp DPIC post-sequential fixture should not emit errors");
+
+    const std::string source = readFile(dir / "dpic_post_seq_top.cpp");
+    expect(contains(source, "domain_reg_committed_"), "commit_step should separate register chunks from DPIC chunks");
+    expect(contains(source, "post_commit_settled_"), "commit_step should avoid redundant final settle after pre-DPIC settle");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void dpi_capture(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_post_seq_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 0x2a) {
+        return 2;
+    }
+    if (sim.get_pc() != 0x2a) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_post_seq_top", runner);
 }
 
 void testLatchReadNoOpCompileAndRun()
@@ -3051,9 +3250,9 @@ void testWideVectorPortsInitializeAndCompile()
     expect(!diags.hasError(), "EmitGsimCpp wide-vector fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_vector_top.hpp");
-    expect(contains(header, "std::vector<std::uint64_t> input_a_ = std::vector<std::uint64_t>(2, 0ULL)"),
+    expect(contains(header, "std::vector<std::uint64_t> input_a_ = std::vector<std::uint64_t>(2U, 0ULL)"),
            "wide-vector fixture should size vector inputs to their emitted word count");
-    expect(contains(header, "std::vector<std::uint64_t> output_y_ = std::vector<std::uint64_t>(2, 0ULL)"),
+    expect(contains(header, "std::vector<std::uint64_t> output_y_ = std::vector<std::uint64_t>(2U, 0ULL)"),
            "wide-vector fixture should size vector outputs to their emitted word count");
 
     const std::string runner = R"CPP(
@@ -3139,24 +3338,41 @@ void testWideBitwiseCompileAndRun()
     options.outputDir = dir.string();
     options.outputFilename = std::string("wide_bitwise_top");
     options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "256";
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp wide-bitwise fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide-bitwise fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_bitwise_top_internal.hpp");
-    expect(header.find("inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_and(\n"
-                       "    const std::vector<std::uint64_t>& lhs,\n"
-                       "    const std::vector<std::uint64_t>& rhs)") != std::string::npos,
-           "wide-bitwise fixture should emit vector/vector AND overload");
-    expect(header.find("inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_or(\n"
-                       "    const std::vector<std::uint64_t>& lhs,\n"
-                       "    const std::vector<std::uint64_t>& rhs)") != std::string::npos,
-           "wide-bitwise fixture should emit vector/vector OR overload");
-    expect(header.find("inline std::vector<std::uint64_t> wolvrix_gsim_bitwise_xor(\n"
-                       "    const std::vector<std::uint64_t>& lhs,\n"
-                       "    const std::vector<std::uint64_t>& rhs)") != std::string::npos,
-           "wide-bitwise fixture should emit vector/vector XOR overload");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_and_into"),
+           "wide-bitwise fixture should emit allocation-free AND helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_or_into"),
+           "wide-bitwise fixture should emit allocation-free OR helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_xor_into"),
+           "wide-bitwise fixture should emit allocation-free XOR helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_not_into"),
+           "wide-bitwise fixture should emit allocation-free NOT helper");
+    std::string source;
+    for (std::size_t i = 0;; ++i)
+    {
+        const auto shardPath = dir / ("wide_bitwise_top_sched_" + std::to_string(i) + ".cpp");
+        if (!std::filesystem::exists(shardPath))
+        {
+            break;
+        }
+        source += readFile(shardPath);
+    }
+    expect(!source.empty(), "wide-bitwise fixture should emit sharded sched files");
+    expect(contains(source, "wolvrix_gsim_bitwise_and_into("),
+           "sharded wide-bitwise fixture should lower AND into existing storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_or_into("),
+           "sharded wide-bitwise fixture should lower OR into existing storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_xor_into("),
+           "sharded wide-bitwise fixture should lower XOR into existing storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_not_into("),
+           "sharded wide-bitwise fixture should lower NOT into existing storage");
 
     const std::string runner = R"CPP(
 #include "wide_bitwise_top.hpp"
@@ -3171,7 +3387,8 @@ int main() {
     const auto andY = sim.get_and_y();
     const auto orY = sim.get_or_y();
     const auto xorY = sim.get_xor_y();
-    if (andY.size() != 2 || orY.size() != 2 || xorY.size() != 2) {
+    const auto notY = sim.get_not_y();
+    if (andY.size() != 2 || orY.size() != 2 || xorY.size() != 2 || notY.size() != 2) {
         return 1;
     }
     if (andY[0] != 0x000F000F000F000FULL || andY[1] != 0x3ULL) {
@@ -3182,6 +3399,9 @@ int main() {
     }
     if (xorY[0] != 0x0FF00FF00FF00FF0ULL || xorY[1] != 0xCULL) {
         return 4;
+    }
+    if (notY[0] != 0xFF00FF00FF00FF00ULL || notY[1] != 0xFFFFFFFF0ULL) {
+        return 5;
     }
     return 0;
 }
@@ -3738,16 +3958,20 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     expect(replayCalls < shardCount,
            "selective-replay fixture should skip shards that never depend on dirty non-clock inputs");
     const std::string header = readFile(dir / "selective_replay_top.hpp");
-    expect(contains(header, "std::vector<std::uint8_t> active_shards_"),
-           "sharded runtime should carry active-shard worklist bits");
-    expect(contains(header, "std::vector<std::uint32_t> active_shard_queue_"),
-           "sharded runtime should carry an active-shard worklist queue");
+    expect(contains(header, "std::vector<std::uint64_t> active_shard_words_"),
+           "sharded runtime should carry packed active-shard worklist words");
+    expect(contains(header, "std::vector<std::uint32_t> active_word_queue_"),
+           "sharded runtime should carry an active-word worklist queue");
     expect(contains(source, "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count)"),
            "sharded runtime should expose compact active-shard activation helper");
-    expect(contains(source, "while (active_cursor_ < active_shard_queue_.size())"),
-           "settle should drain the active-shard worklist instead of always replaying every shard");
+    expect(contains(source, "while (active_cursor_ < active_word_queue_.size())"),
+           "settle should drain the active-word worklist instead of always replaying every shard");
     expect(contains(source, "kShardSuccessors"),
            "settle should enqueue shard successors from generated fanout metadata");
+    expect(contains(source, "successor_shard_ / 64U == active_word_"),
+           "settle should use a grhsim-style local same-word successor fast path");
+    expect(contains(source, "active_bits_ |= (UINT64_C(1) << (successor_shard_ % 64U))"),
+           "same-word successor activation should stay in the local active-word bitmap");
 }
 
 
@@ -4252,8 +4476,10 @@ int main()
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
+        testResetCompatibilitySetterDrivesTopLevelResetPort();
         testDpicImportNoOpCompileAndRun();
         testDpicCallCompileAndRun();
+        testDpicSamplesPostSequentialSettleState();
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
         testMemoryReadCompileAndRun();

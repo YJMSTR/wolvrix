@@ -89,6 +89,10 @@ namespace wolvrix::lib::emit
             // DPI-C imports/calls used by terminal-capable XiangShan difftest.
             std::map<std::string, DpicImportInfo> dpicImports;
             bool emitsDpicCalls = false;
+            bool enableDpicTrace = false;
+            std::size_t dpicTraceCallSite = 0;
+            std::set<int> dpicPreSettleShards;
+            int dpicGlobalWarmupSteps = 0;
 
             // Memory declarations/read lowering support
             std::unordered_map<std::string, MemoryInfo> memories;
@@ -266,6 +270,20 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            void markDpicPreSettleValue(const wolvrix::lib::grh::ValueId& valueId) {
+                if (!enableSharding || !enableActivityWatermark) {
+                    return;
+                }
+                if (const auto firstIt = valueActivityFirstShard.find(valueId);
+                    firstIt != valueActivityFirstShard.end() && firstIt->second >= 0) {
+                    dpicPreSettleShards.insert(firstIt->second);
+                }
+                if (const auto producerIt = valueProducerShard.find(valueId);
+                    producerIt != valueProducerShard.end() && producerIt->second >= 0) {
+                    dpicPreSettleShards.insert(producerIt->second);
+                }
+            }
+
             int shardCount() const {
                 return static_cast<int>(shardBuffers.size());
             }
@@ -422,7 +440,7 @@ namespace wolvrix::lib::emit
             if (width > 64)
             {
                 const auto chunkCount = static_cast<int32_t>((width + 63) / 64);
-                return "std::vector<std::uint64_t>(" + std::to_string(chunkCount) + ", 0ULL)";
+                return "wolvrix_gsim_zero_bits(" + std::to_string(chunkCount) + "U)";
             }
             return zeroInitializerForType(getCppTypeForWidth(width));
         }
@@ -787,36 +805,53 @@ namespace wolvrix::lib::emit
                 return operandExprCache[idx];
             };
 
+            auto recordResultMetadata = [&](size_t idx) {
+                if (idx >= results.size()) {
+                    return;
+                }
+                // Absence in valueDependsOnDirtyInput means false.  Do not insert
+                // the overwhelmingly common non-dirty entries: XiangShan-scale
+                // emit otherwise pays millions of hash insertions and stores a
+                // near-op-count boolean map during write_gsim_cpp.
+                if (opDependsOnDirtyInput) {
+                    state.valueDependsOnDirtyInput.emplace(results[idx], true);
+                }
+                const int resultProducerShard = state.enableSharding ? state.lastEmittedShard : -1;
+                if (resultProducerShard >= 0) {
+                    state.valueProducerShard[results[idx]] = resultProducerShard;
+                    for (const int dependencyShard : opDependencyProducerShards) {
+                        if (dependencyShard >= 0 && dependencyShard != resultProducerShard &&
+                            dependencyShard < static_cast<int>(state.shardSuccessors.size())) {
+                            state.shardSuccessors[static_cast<std::size_t>(dependencyShard)].insert(resultProducerShard);
+                        }
+                    }
+                }
+                if (state.enableActivityWatermark) {
+                    int resultFirstShard = state.currentOpActivityFirstShard;
+                    if (!state.currentOpDirectActivitySources.empty() && state.lastEmittedShard >= 0 &&
+                        (resultFirstShard < 0 || state.lastEmittedShard < resultFirstShard)) {
+                        resultFirstShard = state.lastEmittedShard;
+                    }
+                    state.setValueActivityFirstShard(results[idx], resultFirstShard);
+                }
+            };
+
             // Helper to set result: materialize expression as variable and write to current shard
             auto setResultExpr = [&](size_t idx, const std::string& expr) {
                 if (idx < results.size()) {
                     const auto resultValue = graph.getValue(results[idx]);
-                    // Absence in valueDependsOnDirtyInput means false.  Do not insert
-                    // the overwhelmingly common non-dirty entries: XiangShan-scale
-                    // emit otherwise pays millions of hash insertions and stores a
-                    // near-op-count boolean map during write_gsim_cpp.
-                    if (opDependsOnDirtyInput) {
-                        state.valueDependsOnDirtyInput.emplace(results[idx], true);
-                    }
                     state.setResult(results[idx], expr, getCppTypeForWidth(resultValue.width()), resultValue.width());
-                    const int resultProducerShard = state.enableSharding ? state.lastEmittedShard : -1;
-                    if (resultProducerShard >= 0) {
-                        state.valueProducerShard[results[idx]] = resultProducerShard;
-                        for (const int dependencyShard : opDependencyProducerShards) {
-                            if (dependencyShard >= 0 && dependencyShard != resultProducerShard &&
-                                dependencyShard < static_cast<int>(state.shardSuccessors.size())) {
-                                state.shardSuccessors[static_cast<std::size_t>(dependencyShard)].insert(resultProducerShard);
-                            }
-                        }
-                    }
-                    if (state.enableActivityWatermark) {
-                        int resultFirstShard = state.currentOpActivityFirstShard;
-                        if (!state.currentOpDirectActivitySources.empty() && state.lastEmittedShard >= 0 &&
-                            (resultFirstShard < 0 || state.lastEmittedShard < resultFirstShard)) {
-                            resultFirstShard = state.lastEmittedShard;
-                        }
-                        state.setValueActivityFirstShard(results[idx], resultFirstShard);
-                    }
+                    recordResultMetadata(idx);
+                }
+            };
+
+            auto setWideResultStatement = [&](size_t idx, const auto& buildStatement) {
+                if (idx < results.size()) {
+                    const auto resultValue = graph.getValue(results[idx]);
+                    const std::string resultRef = state.materializeResultRef(
+                        results[idx], getCppTypeForWidth(resultValue.width()), resultValue.width());
+                    state.emitShardStatement(buildStatement(resultRef));
+                    recordResultMetadata(idx);
                 }
             };
 
@@ -883,8 +918,15 @@ namespace wolvrix::lib::emit
                                                                   : getResultWidth(0);
                     if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
                     {
-                        setResultExpr(0,
-                                      "wolvrix_gsim_add(" + getOperandExpr(0) + ", " + getOperandExpr(1) + ")");
+                        if (state.enableSharding) {
+                            setWideResultStatement(0, [&](const std::string& resultRef) {
+                                return "wolvrix_gsim_add_into(" + resultRef + ", " + getOperandExpr(0) + ", " +
+                                       getOperandExpr(1) + ", " + std::to_string(resultWidth) + "U);";
+                            });
+                        } else {
+                            setResultExpr(0,
+                                          "wolvrix_gsim_add(" + getOperandExpr(0) + ", " + getOperandExpr(1) + ")");
+                        }
                     }
                     else
                     {
@@ -900,8 +942,15 @@ namespace wolvrix::lib::emit
                                                                   : getResultWidth(0);
                     if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
                     {
-                        setResultExpr(0,
-                                      "wolvrix_gsim_sub(" + getOperandExpr(0) + ", " + getOperandExpr(1) + ")");
+                        if (state.enableSharding) {
+                            setWideResultStatement(0, [&](const std::string& resultRef) {
+                                return "wolvrix_gsim_sub_into(" + resultRef + ", " + getOperandExpr(0) + ", " +
+                                       getOperandExpr(1) + ", " + std::to_string(resultWidth) + "U);";
+                            });
+                        } else {
+                            setResultExpr(0,
+                                          "wolvrix_gsim_sub(" + getOperandExpr(0) + ", " + getOperandExpr(1) + ")");
+                        }
                     }
                     else
                     {
@@ -927,9 +976,17 @@ namespace wolvrix::lib::emit
                                                                   : getResultWidth(0);
                     if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
                     {
-                        setResultExpr(0,
-                                      "wolvrix_gsim_bitwise_and(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
-                                          ")");
+                        if (state.enableSharding) {
+                            setWideResultStatement(0, [&](const std::string& resultRef) {
+                                return "wolvrix_gsim_bitwise_and_into(" + resultRef + ", " +
+                                       getOperandExpr(0) + ", " + getOperandExpr(1) + ", " +
+                                       std::to_string(resultWidth) + "U);";
+                            });
+                        } else {
+                            setResultExpr(0,
+                                          "wolvrix_gsim_bitwise_and(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                              ")");
+                        }
                     }
                     else
                     {
@@ -945,9 +1002,17 @@ namespace wolvrix::lib::emit
                                                                   : getResultWidth(0);
                     if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
                     {
-                        setResultExpr(0,
-                                      "wolvrix_gsim_bitwise_or(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
-                                          ")");
+                        if (state.enableSharding) {
+                            setWideResultStatement(0, [&](const std::string& resultRef) {
+                                return "wolvrix_gsim_bitwise_or_into(" + resultRef + ", " +
+                                       getOperandExpr(0) + ", " + getOperandExpr(1) + ", " +
+                                       std::to_string(resultWidth) + "U);";
+                            });
+                        } else {
+                            setResultExpr(0,
+                                          "wolvrix_gsim_bitwise_or(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                              ")");
+                        }
                     }
                     else
                     {
@@ -963,9 +1028,17 @@ namespace wolvrix::lib::emit
                                                                   : getResultWidth(0);
                     if (lhsWidth > 64 || rhsWidth > 64 || resultWidth > 64)
                     {
-                        setResultExpr(0,
-                                      "wolvrix_gsim_bitwise_xor(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
-                                          ")");
+                        if (state.enableSharding) {
+                            setWideResultStatement(0, [&](const std::string& resultRef) {
+                                return "wolvrix_gsim_bitwise_xor_into(" + resultRef + ", " +
+                                       getOperandExpr(0) + ", " + getOperandExpr(1) + ", " +
+                                       std::to_string(resultWidth) + "U);";
+                            });
+                        } else {
+                            setResultExpr(0,
+                                          "wolvrix_gsim_bitwise_xor(" + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                              ")");
+                        }
                     }
                     else
                     {
@@ -1160,10 +1233,17 @@ namespace wolvrix::lib::emit
                         const auto resultValue = graph.getValue(results[0]);
                         if (resultValue.width() > 64)
                         {
-                            setResultExpr(
-                                0,
-                                "wolvrix_gsim_bitwise_not(" + getOperandExpr(0) + ", " +
-                                    std::to_string(resultValue.width()) + ")");
+                            if (state.enableSharding) {
+                                setWideResultStatement(0, [&](const std::string& resultRef) {
+                                    return "wolvrix_gsim_bitwise_not_into(" + resultRef + ", " +
+                                           getOperandExpr(0) + ", " + std::to_string(resultValue.width()) + "U);";
+                                });
+                            } else {
+                                setResultExpr(
+                                    0,
+                                    "wolvrix_gsim_bitwise_not(" + getOperandExpr(0) + ", " +
+                                        std::to_string(resultValue.width()) + ")");
+                            }
                         }
                         else
                         {
@@ -1922,8 +2002,32 @@ namespace wolvrix::lib::emit
                     if (!callOk) {
                         break;
                     }
+                    state.markDpicPreSettleValue(operands[0]);
+                    for (std::size_t operandIndex = 1U; operandIndex < eventStart; ++operandIndex) {
+                        state.markDpicPreSettleValue(operands[operandIndex]);
+                    }
 
-                    std::string stmt = "        if (" + condition + ") { " + *target + "(";
+                    std::string stmt;
+                    if (state.enableDpicTrace) {
+                        const std::size_t callSite = state.dpicTraceCallSite++;
+                        const std::string condName = "dpic_cond_" + std::to_string(callSite) + "_";
+                        const std::string seenName = "dpic_seen_" + std::to_string(callSite) + "_";
+                        const std::string hitsName = "dpic_hits_" + std::to_string(callSite) + "_";
+                        stmt = "        { const bool " + condName + " = static_cast<bool>(" + condition + "); ";
+                        stmt += "static bool " + seenName + " = false; static unsigned " + hitsName + " = 0; ";
+                        stmt += "if (!" + seenName + ") { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " first_cond=\" << " + condName;
+                        for (std::size_t i = 0; i < args.size(); ++i) {
+                            stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
+                        }
+                        stmt += " << \"\\n\"; " + seenName + " = true; } ";
+                        stmt += "if (" + condName + ") { ++" + hitsName + "; if (" + hitsName + " <= 16U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " hit=\" << " + hitsName;
+                        for (std::size_t i = 0; i < args.size(); ++i) {
+                            stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
+                        }
+                        stmt += " << \"\\n\"; } " + *target + "(";
+                    } else {
+                        stmt = "        if (" + condition + ") { " + *target + "(";
+                    }
                     for (std::size_t i = 0; i < args.size(); ++i) {
                         if (i != 0) {
                             stmt += ", ";
@@ -1931,6 +2035,9 @@ namespace wolvrix::lib::emit
                         stmt += args[i];
                     }
                     stmt += "); committed_ = true; }";
+                    if (state.enableDpicTrace) {
+                        stmt += " }";
+                    }
                     state.emitsDpicCalls = true;
                     state.sequentialStmts[domainKey].push_back(std::move(stmt));
                     break;
@@ -2775,6 +2882,27 @@ namespace wolvrix::lib::emit
             os << "inline std::uint64_t wolvrix_gsim_low_mask(std::uint32_t width) {\n";
             os << "    return width >= 64U ? ~0ULL : ((1ULL << width) - 1ULL);\n";
             os << "}\n";
+            os << "inline const std::vector<std::uint64_t>& wolvrix_gsim_zero_bits(std::size_t wordCount) {\n";
+            os << "    static const std::vector<std::uint64_t> empty;\n";
+            os << "    static const std::vector<std::uint64_t> one(1U, 0ULL);\n";
+            os << "    static const std::vector<std::uint64_t> two(2U, 0ULL);\n";
+            os << "    static const std::vector<std::uint64_t> three(3U, 0ULL);\n";
+            os << "    static const std::vector<std::uint64_t> four(4U, 0ULL);\n";
+            os << "    static const std::vector<std::uint64_t> eight(8U, 0ULL);\n";
+            os << "    switch (wordCount) {\n";
+            os << "    case 0U: return empty;\n";
+            os << "    case 1U: return one;\n";
+            os << "    case 2U: return two;\n";
+            os << "    case 3U: return three;\n";
+            os << "    case 4U: return four;\n";
+            os << "    case 8U: return eight;\n";
+            os << "    default: {\n";
+            os << "        static thread_local std::vector<std::uint64_t> scratch;\n";
+            os << "        scratch.assign(wordCount, 0ULL);\n";
+            os << "        return scratch;\n";
+            os << "    }\n";
+            os << "    }\n";
+            os << "}\n";
             os << "inline std::uint64_t wolvrix_gsim_load_shifted_word(\n";
             os << "    const std::vector<std::uint64_t>& value,\n";
             os << "    std::uint64_t bitIndex) {\n";
@@ -2894,6 +3022,49 @@ namespace wolvrix::lib::emit
             os << "    }\n";
             os << "}\n";
             os << "template <typename T>\n";
+            os << "inline std::uint64_t wolvrix_gsim_word_at(const T& value, std::size_t index) {\n";
+            os << "    if constexpr (std::is_integral_v<T> || std::is_enum_v<T>) {\n";
+            os << "        return index == 0U ? static_cast<std::uint64_t>(value) : 0ULL;\n";
+            os << "    } else {\n";
+            os << "        return index < value.size() ? value[index] : 0ULL;\n";
+            os << "    }\n";
+            os << "}\n";
+            os << "template <typename L, typename R, typename Op>\n";
+            os << "inline void wolvrix_gsim_bitwise_into(\n";
+            os << "    std::vector<std::uint64_t>& out,\n";
+            os << "    const L& lhs,\n";
+            os << "    const R& rhs,\n";
+            os << "    std::uint32_t width,\n";
+            os << "    Op op) {\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    if (out.size() != wordCount) { out.assign(wordCount, 0ULL); }\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        out[i] = op(wolvrix_gsim_word_at(lhs, i), wolvrix_gsim_word_at(rhs, i));\n";
+            os << "    }\n";
+            os << "    if ((width % 64U) != 0U && !out.empty()) {\n";
+            os << "        out.back() &= wolvrix_gsim_low_mask(width % 64U);\n";
+            os << "    }\n";
+            os << "}\n";
+            os << "template <typename L, typename R>\n";
+            os << "inline void wolvrix_gsim_bitwise_and_into(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint32_t width) {\n";
+            os << "    wolvrix_gsim_bitwise_into(out, lhs, rhs, width, [](std::uint64_t a, std::uint64_t b) { return a & b; });\n";
+            os << "}\n";
+            os << "template <typename L, typename R>\n";
+            os << "inline void wolvrix_gsim_bitwise_or_into(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint32_t width) {\n";
+            os << "    wolvrix_gsim_bitwise_into(out, lhs, rhs, width, [](std::uint64_t a, std::uint64_t b) { return a | b; });\n";
+            os << "}\n";
+            os << "template <typename L, typename R>\n";
+            os << "inline void wolvrix_gsim_bitwise_xor_into(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint32_t width) {\n";
+            os << "    wolvrix_gsim_bitwise_into(out, lhs, rhs, width, [](std::uint64_t a, std::uint64_t b) { return a ^ b; });\n";
+            os << "}\n";
+            os << "template <typename T>\n";
+            os << "inline void wolvrix_gsim_bitwise_not_into(std::vector<std::uint64_t>& out, const T& value, std::uint32_t width) {\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    if (out.size() != wordCount) { out.assign(wordCount, 0ULL); }\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) { out[i] = ~wolvrix_gsim_word_at(value, i); }\n";
+            os << "    if ((width % 64U) != 0U && !out.empty()) { out.back() &= wolvrix_gsim_low_mask(width % 64U); }\n";
+            os << "}\n";
+            os << "template <typename T>\n";
             os << "inline std::vector<std::uint64_t> wolvrix_gsim_to_bits(const T& value, std::uint32_t width) {\n";
             os << "    std::vector<std::uint64_t> result((width + 63U) / 64U, 0ULL);\n";
             os << "    wolvrix_gsim_store_bits(result, 0ULL, value, width);\n";
@@ -2997,6 +3168,36 @@ namespace wolvrix::lib::emit
             os << "        result.back() &= ((1ULL << (width % 64U)) - 1ULL);\n";
             os << "    }\n";
             os << "    return result;\n";
+            os << "}\n";
+            os << "template <typename L, typename R>\n";
+            os << "inline void wolvrix_gsim_add_into(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint32_t width) {\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    if (out.size() != wordCount) { out.assign(wordCount, 0ULL); }\n";
+            os << "    std::uint64_t carry = 0ULL;\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t lhsWord = wolvrix_gsim_word_at(lhs, i);\n";
+            os << "        const std::uint64_t rhsWord = wolvrix_gsim_word_at(rhs, i);\n";
+            os << "        const std::uint64_t partial = lhsWord + carry;\n";
+            os << "        const std::uint64_t sum = partial + rhsWord;\n";
+            os << "        carry = (partial < lhsWord || sum < partial) ? 1ULL : 0ULL;\n";
+            os << "        out[i] = sum;\n";
+            os << "    }\n";
+            os << "    if ((width % 64U) != 0U && !out.empty()) { out.back() &= wolvrix_gsim_low_mask(width % 64U); }\n";
+            os << "}\n";
+            os << "template <typename L, typename R>\n";
+            os << "inline void wolvrix_gsim_sub_into(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint32_t width) {\n";
+            os << "    const auto wordCount = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    if (out.size() != wordCount) { out.assign(wordCount, 0ULL); }\n";
+            os << "    std::uint64_t borrow = 0ULL;\n";
+            os << "    for (std::size_t i = 0; i < wordCount; ++i) {\n";
+            os << "        const std::uint64_t lhsWord = wolvrix_gsim_word_at(lhs, i);\n";
+            os << "        const std::uint64_t rhsWord = wolvrix_gsim_word_at(rhs, i);\n";
+            os << "        const std::uint64_t rhsPlusBorrow = rhsWord + borrow;\n";
+            os << "        const std::uint64_t nextBorrow = (rhsPlusBorrow < rhsWord || lhsWord < rhsPlusBorrow) ? 1ULL : 0ULL;\n";
+            os << "        out[i] = lhsWord - rhsPlusBorrow;\n";
+            os << "        borrow = nextBorrow;\n";
+            os << "    }\n";
+            os << "    if ((width % 64U) != 0U && !out.empty()) { out.back() &= wolvrix_gsim_low_mask(width % 64U); }\n";
             os << "}\n";
             os << "inline std::vector<std::uint64_t> wolvrix_gsim_add(\n";
             os << "    const std::vector<std::uint64_t>& lhs,\n";
@@ -3260,6 +3461,16 @@ namespace wolvrix::lib::emit
             for (const auto &domain : state.sequentialRegStmts) {
                 headerSequentialDomains.insert(domain.first);
             }
+            auto prevClockStateNameForDomain = [&](const std::string& domainKey) -> std::string {
+                const auto parsedDomain = parseSequentialDomain(domainKey);
+                if (!parsedDomain) {
+                    return sanitizeIdentifier(domainKey);
+                }
+                if (state.sequentialClockExprs.find(domainKey) != state.sequentialClockExprs.end()) {
+                    return sanitizeIdentifier(parsedDomain->second);
+                }
+                return resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+            };
             for (const auto &domainKey : headerSequentialDomains) {
                 const auto parsedDomain = parseSequentialDomain(domainKey);
                 if (!parsedDomain) {
@@ -3290,16 +3501,16 @@ namespace wolvrix::lib::emit
                 os << " activate_shard_range(" << shardIt->second << "U);";
             };
             for (const auto& [name, type] : state.inputPorts) {
-                std::string methodName = "set_" + sanitizeIdentifier(name);
-                if (sequentialClockInputs.count(name) > 0) {
-                    os << "    void " << methodName << "(" << type << " value) { input_" << sanitizeIdentifier(name) << "_ = value; }\n";
-                } else {
-                    os << "    void " << methodName << "(" << type << " value) { if (!(input_"
-                       << sanitizeIdentifier(name) << "_ == value)) { input_" << sanitizeIdentifier(name)
-                       << "_ = value; non_clock_inputs_dirty_ = true;";
-                    emitActivateSourceInline("input_" + sanitizeIdentifier(name));
-                    os << " } }\n";
+                const std::string sanitizedName = sanitizeIdentifier(name);
+                if (sanitizedName == "reset") {
+                    continue;
                 }
+                std::string methodName = "set_" + sanitizedName;
+                os << "    void " << methodName << "(" << type << " value) { if (!(input_"
+                   << sanitizedName << "_ == value)) { input_" << sanitizedName
+                   << "_ = value; non_clock_inputs_dirty_ = true;";
+                emitActivateSourceInline("input_" + sanitizedName);
+                os << " } }\n";
             }
             if (!state.inputPorts.empty()) os << "\n";
 
@@ -3366,18 +3577,28 @@ namespace wolvrix::lib::emit
             }
             os << "    bool reset_ = false;\n";
 
+            auto publicHeaderZeroInitializerForWidth = [](int32_t width) {
+                if (width > 64) {
+                    const auto chunkCount = static_cast<int32_t>((width + 63) / 64);
+                    return "std::vector<std::uint64_t>(" + std::to_string(chunkCount) + "U, 0ULL)";
+                }
+                return zeroInitializerForType(getCppTypeForWidth(width));
+            };
+
             // Input port storage
             for (const auto& [name, type] : state.inputPorts) {
                 const auto widthIt = state.inputPortWidths.find(name);
                 const int32_t width = widthIt != state.inputPortWidths.end() ? widthIt->second : 0;
-                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
+                os << "    " << type << " input_" << sanitizeIdentifier(name) << "_ = "
+                   << publicHeaderZeroInitializerForWidth(width) << ";\n";
             }
 
             // Output port storage
             for (const auto& [name, type] : state.outputPorts) {
                 const auto widthIt = state.outputPortWidths.find(name);
                 const int32_t width = widthIt != state.outputPortWidths.end() ? widthIt->second : 0;
-                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
+                os << "    " << type << " output_" << sanitizeIdentifier(name) << "_ = "
+                   << publicHeaderZeroInitializerForWidth(width) << ";\n";
             }
 
             // Persistent design state lives behind state_ in the internal header.
@@ -3385,6 +3606,10 @@ namespace wolvrix::lib::emit
             // Difftest state (for compatibility)
             os << "    std::uint64_t difftest_exit_ = 0;\n";
             os << "    std::uint64_t difftest_step_ = 0;\n";
+            if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
+                state.dpicGlobalWarmupSteps > 0) {
+                os << "    std::uint64_t gsim_pre_dpic_steps_ = 0;\n";
+            }
             os << "    unsigned perf_clean_ = 0;\n";
             os << "    unsigned perf_dump_ = 0;\n";
             os << "    std::uint64_t log_begin_ = 0;\n";
@@ -3393,8 +3618,9 @@ namespace wolvrix::lib::emit
             os << "    SSimTopEvalTemps* evalTemps_;\n";
             os << "    bool non_clock_inputs_dirty_ = true;\n";
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                os << "    std::vector<std::uint8_t> active_shards_;\n";
-                os << "    std::vector<std::uint32_t> active_shard_queue_;\n";
+                os << "    std::vector<std::uint64_t> active_shard_words_;\n";
+                os << "    std::vector<std::uint8_t> active_word_queued_;\n";
+                os << "    std::vector<std::uint32_t> active_word_queue_;\n";
             }
             for (const auto &chunk : sequentialChunks) {
                 os << "    void " << chunk.methodName << "(bool& committed_);\n";
@@ -3403,8 +3629,7 @@ namespace wolvrix::lib::emit
             for (const auto &domainKey : headerSequentialDomains) {
                 const auto parsedDomain = parseSequentialDomain(domainKey);
                 if (parsedDomain) {
-                    const std::string prevClockName =
-                        resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                    const std::string prevClockName = prevClockStateNameForDomain(domainKey);
                     if (prevClockNames.insert(prevClockName).second) {
                         os << "    bool prev_" << prevClockName << "_ = false;\n";
                     }
@@ -3466,21 +3691,40 @@ namespace wolvrix::lib::emit
             const std::string structName = "GsimMetadata_" + ns;
             const std::string factoryName = "make_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
             const std::string validateName = "validate_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
-            std::map<std::string, std::vector<std::string>> sequentialChunkMethods;
+            std::map<std::string, std::vector<std::string>> sequentialRegChunkMethods;
+            std::map<std::string, std::vector<std::string>> sequentialStmtChunkMethods;
             std::set<std::string> sequentialDomains;
             for (const auto &domain : state.sequentialStmts) {
                 sequentialDomains.insert(domain.first);
             }
             for (const auto &chunk : sequentialChunks) {
-                sequentialChunkMethods[chunk.domainKey].push_back(chunk.methodName);
+                if (chunk.regNames.empty() && !chunk.stmts.empty()) {
+                    sequentialStmtChunkMethods[chunk.domainKey].push_back(chunk.methodName);
+                } else {
+                    sequentialRegChunkMethods[chunk.domainKey].push_back(chunk.methodName);
+                }
                 sequentialDomains.insert(chunk.domainKey);
             }
+
+            auto prevClockStateNameForDomain = [&](const std::string& domainKey) -> std::string {
+                const auto parsedDomain = parseSequentialDomain(domainKey);
+                if (!parsedDomain) {
+                    return sanitizeIdentifier(domainKey);
+                }
+                if (state.sequentialClockExprs.find(domainKey) != state.sequentialClockExprs.end()) {
+                    return sanitizeIdentifier(parsedDomain->second);
+                }
+                return resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+            };
 
             std::string internalHeader = std::filesystem::path(std::string(headerFilename)).stem().string() + "_internal.hpp";
             os << "#include \"" << internalHeader << "\"\n\n";
             os << "#include <algorithm>\n";
             if (state.emitsDpicCalls) {
                 os << "#include <cstring>\n";
+                if (state.enableDpicTrace) {
+                    os << "#include <iostream>\n";
+                }
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "#include <set>\n\n";
@@ -3584,26 +3828,51 @@ namespace wolvrix::lib::emit
 
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                 os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()), ";
-                os << "active_shards_(" << state.shardCount() << "U, 0), active_shard_queue_() { reset(); }\n";
+                os << "active_shard_words_((" << state.shardCount() << "U + 63U) / 64U, UINT64_C(0)), ";
+                os << "active_word_queued_((" << state.shardCount() << "U + 63U) / 64U, 0), active_word_queue_() { reset(); }\n";
             } else {
                 os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()) { reset(); }\n";
             }
             os << "SSimTop::~SSimTop() { delete evalTemps_; delete state_; }\n\n";
-            os << "void SSimTop::set_reset(unsigned reset) { reset_ = reset; }\n\n";
+            if (hasInputPortNamed(state.inputPorts, "reset")) {
+                os << "void SSimTop::set_reset(unsigned reset) { const auto value = static_cast<std::uint8_t>(reset); ";
+                os << "if (!(input_reset_ == value)) { input_reset_ = value; non_clock_inputs_dirty_ = true;";
+                if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
+                    if (const auto headsIt = state.activitySourceHeadShards.find("input_reset");
+                        headsIt != state.activitySourceHeadShards.end() && !headsIt->second.empty()) {
+                        os << " static constexpr std::uint32_t kActivityHeads_input_reset[] = {";
+                        bool first = true;
+                        for (int shard : headsIt->second) {
+                            os << (first ? "" : ", ") << shard << "U";
+                            first = false;
+                        }
+                        os << "}; activate_shards(kActivityHeads_input_reset, " << headsIt->second.size() << "U);";
+                    } else if (const auto shardIt = state.activitySourceFirstShard.find("input_reset");
+                               shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
+                        os << " activate_shard_range(" << shardIt->second << "U);";
+                    }
+                }
+                os << " } }\n\n";
+            } else {
+                os << "void SSimTop::set_reset(unsigned reset) { reset_ = reset; }\n\n";
+            }
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                 os << "void SSimTop::activate_all_shards() {\n";
-                os << "    active_shard_queue_.clear();\n";
-                os << "    std::fill(active_shards_.begin(), active_shards_.end(), 0);\n";
+                os << "    active_word_queue_.clear();\n";
+                os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
+                os << "    std::fill(active_word_queued_.begin(), active_word_queued_.end(), 0);\n";
                 os << "    for (std::uint32_t i = 0; i < " << state.shardCount() << "U; ++i) { activate_shard(i); }\n";
                 os << "}\n\n";
                 os << "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count) {\n";
                 os << "    for (std::size_t i = 0; i < count; ++i) { activate_shard(indices[i]); }\n";
                 os << "}\n\n";
                 os << "void SSimTop::activate_shard(std::uint32_t shard) {\n";
-                os << "    if (shard >= active_shards_.size()) { return; }\n";
-                os << "    if (active_shards_[shard] != 0) { return; }\n";
-                os << "    active_shards_[shard] = 1;\n";
-                os << "    active_shard_queue_.push_back(shard);\n";
+                os << "    if (shard >= " << state.shardCount() << "U) { return; }\n";
+                os << "    const std::uint32_t word = shard / 64U;\n";
+                os << "    const std::uint64_t mask = (UINT64_C(1) << (shard % 64U));\n";
+                os << "    if ((active_shard_words_[word] & mask) != UINT64_C(0)) { return; }\n";
+                os << "    active_shard_words_[word] |= mask;\n";
+                os << "    if (active_word_queued_[word] == 0) { active_word_queued_[word] = 1; active_word_queue_.push_back(word); }\n";
                 os << "}\n\n";
                 os << "void SSimTop::activate_shard_range(std::uint32_t firstShard) {\n";
                 os << "    for (std::uint32_t i = firstShard; i < " << state.shardCount() << "U; ++i) { activate_shard(i); }\n";
@@ -3622,6 +3891,10 @@ namespace wolvrix::lib::emit
                 os << "    output_" << sanitizeIdentifier(name) << "_ = " << zeroInitializerForWidth(width) << ";\n";
             }
             os << "    non_clock_inputs_dirty_ = true;\n";
+            if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
+                state.dpicGlobalWarmupSteps > 0) {
+                os << "    gsim_pre_dpic_steps_ = 0;\n";
+            }
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                 os << "    activate_all_shards();\n";
             }
@@ -3630,8 +3903,7 @@ namespace wolvrix::lib::emit
                         for (const auto &domainKey : sequentialDomains) {
                             const auto parsedDomain = parseSequentialDomain(domainKey);
                             if (parsedDomain) {
-                                const std::string resetClock =
-                                    resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                                const std::string resetClock = prevClockStateNameForDomain(domainKey);
                                 if (resetClockNames.insert(resetClock).second) {
                             os << "    prev_" << resetClock << "_ = false;\n";
                         }
@@ -3644,11 +3916,19 @@ namespace wolvrix::lib::emit
             if (state.enableSharding && state.shardCount() > 0) {
                 if (state.enableActivityWatermark) {
                     os << "    std::size_t active_cursor_ = 0;\n";
-                    os << "    while (active_cursor_ < active_shard_queue_.size()) {\n";
-                    os << "        const std::uint32_t active_shard_ = active_shard_queue_[active_cursor_++];\n";
-                    os << "        switch (active_shard_) {\n";
+                    os << "    while (active_cursor_ < active_word_queue_.size()) {\n";
+                    os << "        const std::uint32_t active_word_ = active_word_queue_[active_cursor_++];\n";
+                    os << "        if (active_word_ >= active_shard_words_.size()) { continue; }\n";
+                    os << "        active_word_queued_[active_word_] = 0;\n";
+                    os << "        std::uint64_t active_bits_ = active_shard_words_[active_word_];\n";
+                    os << "        active_shard_words_[active_word_] = UINT64_C(0);\n";
+                    os << "        while (active_bits_ != UINT64_C(0)) {\n";
+                    os << "            const std::uint32_t active_bit_ = static_cast<std::uint32_t>(__builtin_ctzll(active_bits_));\n";
+                    os << "            active_bits_ &= ~(UINT64_C(1) << active_bit_);\n";
+                    os << "            const std::uint32_t active_shard_ = active_word_ * 64U + active_bit_;\n";
+                    os << "            switch (active_shard_) {\n";
                     for (int i = 0; i < state.shardCount(); ++i) {
-                        os << "        case " << i << "U: { sched_" << i << "();";
+                        os << "            case " << i << "U: { sched_" << i << "();";
                         const auto& succ = (i < static_cast<int>(state.shardSuccessors.size())) ? state.shardSuccessors[static_cast<std::size_t>(i)] : std::set<int>{};
                         if (!succ.empty()) {
                             os << " static constexpr std::uint32_t kShardSuccessors" << i << "[] = {";
@@ -3657,15 +3937,25 @@ namespace wolvrix::lib::emit
                                 os << (first ? "" : ", ") << successor << "U";
                                 first = false;
                             }
-                            os << "}; activate_shards(kShardSuccessors" << i << ", " << succ.size() << "U);";
+                            os << "}; for (std::uint32_t successor_shard_ : kShardSuccessors" << i << ") { ";
+                            os << "if (successor_shard_ / 64U == active_word_) { active_bits_ |= (UINT64_C(1) << (successor_shard_ % 64U)); } ";
+                            os << "else { activate_shard(successor_shard_); } }";
                         }
                         os << " break; }\n";
                     }
-                    os << "        default: break;\n";
+                    os << "            default: break;\n";
+                    os << "            }\n";
+                    os << "            const std::uint64_t local_bits_ = active_shard_words_[active_word_];\n";
+                    os << "            if (local_bits_ != UINT64_C(0)) {\n";
+                    os << "                active_bits_ |= local_bits_;\n";
+                    os << "                active_shard_words_[active_word_] = UINT64_C(0);\n";
+                    os << "                active_word_queued_[active_word_] = 0;\n";
+                    os << "            }\n";
                     os << "        }\n";
                     os << "    }\n";
-                    os << "    active_shard_queue_.clear();\n";
-                    os << "    std::fill(active_shards_.begin(), active_shards_.end(), 0);\n";
+                    os << "    active_word_queue_.clear();\n";
+                    os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
+                    os << "    std::fill(active_word_queued_.begin(), active_word_queued_.end(), 0);\n";
                 } else {
                     for (int i = 0; i < state.shardCount(); ++i) {
                         os << "    sched_" << i << "();\n";
@@ -3702,7 +3992,7 @@ namespace wolvrix::lib::emit
                     }
                 }
                 if (state.enableActivityWatermark) {
-                    os << "    if (active_shard_queue_.empty()) { activate_all_shards(); }\n";
+                    os << "    if (active_word_queue_.empty()) { activate_all_shards(); }\n";
                 }
                 os << "    non_clock_inputs_dirty_ = false;\n";
                 os << "}\n\n";
@@ -3713,6 +4003,7 @@ namespace wolvrix::lib::emit
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    bool dirty_replayed_ = false;\n";
             }
+            os << "    bool post_commit_settled_ = false;\n";
             if (state.tempU8Count > 0) {
                 os << "    const auto* tempU8_data_ = evalTemps_->tempU8;\n";
                 os << "    (void)tempU8_data_;\n";
@@ -3767,9 +4058,8 @@ namespace wolvrix::lib::emit
                         std::set<std::string> resetClockAssignments;
                         for (const auto &domainState : domainClockExprs) {
                             const auto parsedDomain = parseSequentialDomain(domainState.first);
-                            const std::string resolvedClock =
-                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                            const std::string prevClock = "prev_" + resolvedClock + "_";
+                            const std::string prevClockState = prevClockStateNameForDomain(domainState.first);
+                            const std::string prevClock = "prev_" + prevClockState + "_";
                             if (resetClockAssignments.insert(prevClock).second) {
                                 os << "        " << prevClock << " = static_cast<bool>(" << domainState.second << ");\n";
                             }
@@ -3782,9 +4072,8 @@ namespace wolvrix::lib::emit
                     for (const auto &domainState : domainClockExprs) {
                         const auto parsedDomain = parseSequentialDomain(domainState.first);
                         const std::string edge = parsedDomain->first;
-                        const std::string resolvedClock =
-                            resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                        const std::string prevClock = "prev_" + resolvedClock + "_";
+                        const std::string prevClockState = prevClockStateNameForDomain(domainState.first);
+                        const std::string prevClock = "prev_" + prevClockState + "_";
                         const std::string edgeExpr = edge == "posedge"
                                                          ? "(!" + prevClock + " && static_cast<bool>(" + domainState.second + "))"
                                                          : "(" + prevClock + " && !static_cast<bool>(" + domainState.second + "))";
@@ -3810,19 +4099,21 @@ namespace wolvrix::lib::emit
                         }
                     }
                     os << "    }\n";
+                    os << "    bool any_domain_reg_committed_ = false;\n";
                     for (const auto &domainKey : sequentialDomains) {
                         const auto parsedDomain = parseSequentialDomain(domainKey);
                         const std::string edge = parsedDomain->first;
-                        std::string resolvedClock =
-                            resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                         std::string currClockExpr;
                         auto exprIt = state.sequentialClockExprs.find(domainKey);
                         if (exprIt != state.sequentialClockExprs.end()) {
                             currClockExpr = exprIt->second;
                         } else {
+                            const std::string resolvedClock =
+                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
                             currClockExpr = "input_" + resolvedClock + "_";
                         }
-                        const std::string prevClock = "prev_" + resolvedClock + "_";
+                        const std::string prevClockState = prevClockStateNameForDomain(domainKey);
+                        const std::string prevClock = "prev_" + prevClockState + "_";
                         currClockExpr = commitStepClockExpr(std::move(currClockExpr));
                         const std::string edgeExpr = edge == "posedge"
                                                          ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
@@ -3834,16 +4125,84 @@ namespace wolvrix::lib::emit
                             os << "            replay_dirty_input_shards();\n";
                             os << "        }\n";
                         }
-                        if (auto chunkIt = sequentialChunkMethods.find(domainKey); chunkIt != sequentialChunkMethods.end()) {
-                            os << "        bool domain_committed_ = false;\n";
-                            for (const auto &methodName : chunkIt->second) {
-                                os << "        " << methodName << "(domain_committed_);\n";
+                        if (auto regChunkIt = sequentialRegChunkMethods.find(domainKey); regChunkIt != sequentialRegChunkMethods.end()) {
+                            os << "        bool domain_reg_committed_ = false;\n";
+                            for (const auto &methodName : regChunkIt->second) {
+                                os << "        " << methodName << "(domain_reg_committed_);\n";
                             }
-                            os << "        if (domain_committed_) {\n";
+                            os << "        if (domain_reg_committed_) {\n";
                             os << "            committed_ = true;\n";
+                            os << "            any_domain_reg_committed_ = true;\n";
                             if (state.enableSharding && state.shardCount() > 0) {
                                 os << "            non_clock_inputs_dirty_ = true;\n";
                             }
+                            os << "        }\n";
+                        }
+                        os << "    }\n";
+                    }
+                    os << "    if (any_domain_reg_committed_) {\n";
+                    if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
+                        state.dpicGlobalWarmupSteps > 0) {
+                        os << "        if (gsim_pre_dpic_steps_ < " << state.dpicGlobalWarmupSteps << "U) {\n";
+                        os << "            activate_all_shards();\n";
+                        os << "        } else {\n";
+                        if (!state.dpicPreSettleShards.empty()) {
+                            os << "            static constexpr std::uint32_t kDpicPreSettleShards[] = {";
+                            bool firstShard = true;
+                            for (int shard : state.dpicPreSettleShards) {
+                                os << (firstShard ? "" : ", ") << shard << "U";
+                                firstShard = false;
+                            }
+                            os << "};\n";
+                            os << "            activate_shards(kDpicPreSettleShards, " << state.dpicPreSettleShards.size() << "U);\n";
+                        }
+                        os << "        }\n";
+                    } else if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
+                               !state.dpicPreSettleShards.empty()) {
+                        os << "        static constexpr std::uint32_t kDpicPreSettleShards[] = {";
+                        bool firstShard = true;
+                        for (int shard : state.dpicPreSettleShards) {
+                            os << (firstShard ? "" : ", ") << shard << "U";
+                            firstShard = false;
+                        }
+                        os << "};\n";
+                        os << "        activate_shards(kDpicPreSettleShards, " << state.dpicPreSettleShards.size() << "U);\n";
+                    }
+                    os << "        settle();\n";
+                    os << "        post_commit_settled_ = true;\n";
+                    os << "    }\n";
+                    for (const auto &domainKey : sequentialDomains) {
+                        const auto parsedDomain = parseSequentialDomain(domainKey);
+                        const std::string edge = parsedDomain->first;
+                        std::string currClockExpr;
+                        auto exprIt = state.sequentialClockExprs.find(domainKey);
+                        if (exprIt != state.sequentialClockExprs.end()) {
+                            currClockExpr = exprIt->second;
+                        } else {
+                            const std::string resolvedClock =
+                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                            currClockExpr = "input_" + resolvedClock + "_";
+                        }
+                        const std::string prevClockState = prevClockStateNameForDomain(domainKey);
+                        const std::string prevClock = "prev_" + prevClockState + "_";
+                        currClockExpr = commitStepClockExpr(std::move(currClockExpr));
+                        const std::string edgeExpr = edge == "posedge"
+                                                         ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
+                                                         : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
+                        os << "    if (" << edgeExpr << ") {\n";
+                        if (state.enableSharding && state.shardCount() > 0) {
+                            os << "        if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
+                            os << "            dirty_replayed_ = true;\n";
+                            os << "            replay_dirty_input_shards();\n";
+                            os << "        }\n";
+                        }
+                        if (auto stmtChunkIt = sequentialStmtChunkMethods.find(domainKey); stmtChunkIt != sequentialStmtChunkMethods.end()) {
+                            os << "        bool domain_stmt_committed_ = false;\n";
+                            for (const auto &methodName : stmtChunkIt->second) {
+                                os << "        " << methodName << "(domain_stmt_committed_);\n";
+                            }
+                            os << "        if (domain_stmt_committed_) {\n";
+                            os << "            committed_ = true;\n";
                             os << "        }\n";
                         } else if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
                             os << "        const bool committed_before_domain_ = committed_;\n";
@@ -3867,9 +4226,8 @@ namespace wolvrix::lib::emit
                         std::set<std::string> postDomainClockAssignments;
                         for (const auto &domainState : domainClockExprs) {
                             const auto parsedDomain = parseSequentialDomain(domainState.first);
-                            const std::string resolvedClock =
-                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                            const std::string prevClock = "prev_" + resolvedClock + "_";
+                            const std::string prevClockState = prevClockStateNameForDomain(domainState.first);
+                            const std::string prevClock = "prev_" + prevClockState + "_";
                             if (postDomainClockAssignments.insert(prevClock).second) {
                                 os << "    " << prevClock << " = static_cast<bool>(" << domainState.second << ");\n";
                             }
@@ -3885,12 +4243,16 @@ namespace wolvrix::lib::emit
                 os << "    }\n";
             }
             if (state.enableSharding && state.shardCount() > 0) {
-                os << "    if (committed_ || non_clock_inputs_dirty_ || dirty_replayed_) {\n";
+                os << "    if (!post_commit_settled_ && (committed_ || non_clock_inputs_dirty_ || dirty_replayed_)) {\n";
             } else {
-                os << "    if (committed_ || non_clock_inputs_dirty_) {\n";
+                os << "    if (!post_commit_settled_ && (committed_ || non_clock_inputs_dirty_)) {\n";
             }
             os << "        settle();\n";
             os << "    }\n";
+            if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
+                state.dpicGlobalWarmupSteps > 0) {
+                os << "    if (committed_) { ++gsim_pre_dpic_steps_; }\n";
+            }
             os << "    if (committed_) { ++difftest_step_; }\n";
             os << "    difftest_exit_ = 0;\n";
             os << "}\n\n";
@@ -4099,6 +4461,9 @@ namespace wolvrix::lib::emit
             os << "#include \"" << internalHeaderFilename << "\"\n";
             if (state.emitsDpicCalls) {
                 os << "#include <cstring>\n";
+                if (state.enableDpicTrace) {
+                    os << "#include <iostream>\n";
+                }
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "\n";
@@ -4114,6 +4479,35 @@ namespace wolvrix::lib::emit
                            return stmt.find(updateFlag) != std::string::npos ||
                                   stmt.find("wolvrix_gsim_mask_merge") != std::string::npos;
                        });
+            };
+            auto emitRegTouch = [&](const std::string& regName, std::string_view indent) {
+                if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
+                    return;
+                }
+                std::set<int> firstShards;
+                if (const auto headsIt = state.activitySourceHeadShards.find(regName);
+                    headsIt != state.activitySourceHeadShards.end()) {
+                    firstShards.insert(headsIt->second.begin(), headsIt->second.end());
+                }
+                if (firstShards.empty()) {
+                    if (const auto shardIt = state.activitySourceFirstShard.find(regName);
+                        shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
+                        firstShards.insert(shardIt->second);
+                    }
+                }
+                if (!firstShards.empty()) {
+                    os << indent << "static constexpr std::uint32_t kTouchedStateFirstShards_"
+                       << sanitizeIdentifier(regName) << "[] = {";
+                    bool first = true;
+                    for (int firstShard : firstShards) {
+                        os << (first ? "" : ", ") << firstShard << "U";
+                        first = false;
+                    }
+                    os << "}; activate_shards(kTouchedStateFirstShards_" << sanitizeIdentifier(regName)
+                       << ", " << firstShards.size() << "U); ";
+                } else {
+                    os << indent << "activate_all_shards(); ";
+                }
             };
             auto emitStatement = [&](std::string s) {
                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
@@ -4234,16 +4628,21 @@ namespace wolvrix::lib::emit
                         maskMergeArgs && (*maskMergeArgs)[0] == stateExpr) {
                         os << "    if (" << parsed->condition << ") { if (wolvrix_gsim_mask_merge_in_place("
                            << stateExpr << ", " << (*maskMergeArgs)[1] << ", " << (*maskMergeArgs)[2]
-                           << ")) { chunk_updated_ = true; committed_ = true; } }\n";
+                           << ")) { ";
+                        emitRegTouch(regName, "");
+                        os << "chunk_updated_ = true; committed_ = true; } }\n";
                     } else if (isSimpleWideLvalue(parsed->rhs)) {
                         os << "    if (" << parsed->condition << ") { if (" << stateExpr << " != " << parsed->rhs
-                           << ") { " << stateExpr << " = " << parsed->rhs
-                           << "; chunk_updated_ = true; committed_ = true; } }\n";
+                           << ") { " << stateExpr << " = " << parsed->rhs << "; ";
+                        emitRegTouch(regName, "");
+                        os << "chunk_updated_ = true; committed_ = true; } }\n";
                     } else {
                         const std::string tempName = "direct_next_" + regName;
                         os << "    if (" << parsed->condition << ") { auto " << tempName << " = " << parsed->rhs
                            << "; if (" << stateExpr << " != " << tempName << ") { " << stateExpr
-                           << " = std::move(" << tempName << "); chunk_updated_ = true; committed_ = true; } }\n";
+                           << " = std::move(" << tempName << "); ";
+                        emitRegTouch(regName, "");
+                        os << "chunk_updated_ = true; committed_ = true; } }\n";
                     }
                     continue;
                 }
@@ -4252,7 +4651,9 @@ namespace wolvrix::lib::emit
                     const std::string tempName = "direct_next_" + regName;
                     os << "    if (" << parsed->condition << ") { const auto " << tempName << " = " << parsed->rhs
                        << "; if (" << stateExpr << " != " << tempName << ") { " << stateExpr
-                       << " = " << tempName << "; chunk_updated_ = true; committed_ = true; } }\n";
+                       << " = " << tempName << "; ";
+                    emitRegTouch(regName, "");
+                    os << "chunk_updated_ = true; committed_ = true; } }\n";
                     continue;
                 }
                 for (const auto &stmt : regStmtIt->second) {
@@ -4306,7 +4707,7 @@ namespace wolvrix::lib::emit
                     const auto regStmtIt = chunk.regStmts.find(regName);
                     const std::vector<std::string>& regStmts = regStmtIt != chunk.regStmts.end() ? regStmtIt->second : chunk.stmts;
                     const bool wideReg = isWideReg(regName, regStmts);
-                    if (wideReg && regStmts.size() == 1) {
+                    if ((wideReg && regStmts.size() == 1) || (!wideReg && canDirectScalarWrite(regName, regStmts))) {
                         continue;
                     }
                     if (wideReg) {
@@ -4429,6 +4830,8 @@ namespace wolvrix::lib::emit
         state.maxShardSize = parsePositiveIntAttr(options, "behavior_shard_max_bytes", state.maxShardSize);
         state.commitShardSize = parsePositiveIntAttr(options, "commit_shard_max_bytes", state.commitShardSize);
         state.enableActivityWatermark = attrEnabled(options, "activity_shard_watermark", false);
+        state.enableDpicTrace = attrEnabled(options, "dpic_trace", false);
+        state.dpicGlobalWarmupSteps = parsePositiveIntAttr(options, "dpic_global_warmup_steps", 0);
         const bool emitMetadata = attrEnabled(options, "emit_metadata", true);
         std::vector<std::string> outputKeepPrefixes;
         if (auto keepPrefixesAttr = attrValue(options, "output_keep_prefixes"))
