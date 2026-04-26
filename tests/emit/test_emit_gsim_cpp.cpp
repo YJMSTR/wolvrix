@@ -459,6 +459,96 @@ Design buildDpicCallDesign()
     return design;
 }
 
+Design buildDpicReturnReadDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto addr = makeValue(graph, "addr", 64, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("addr", addr);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "data_storage", "data_reg", 64, "data");
+    const auto dataRead = makeRegisterRead(graph, "data_read", "data_read_op", 64, "data");
+    graph.bindOutputPort("data", dataRead);
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("difftest_ram_read"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{64});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"rIdx"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"longint"});
+    graph.setAttr(dpiImport, "hasReturn", true);
+    graph.setAttr(dpiImport, "returnWidth", static_cast<int64_t>(64));
+    graph.setAttr(dpiImport, "returnSigned", false);
+    graph.setAttr(dpiImport, "returnType", std::string("longint"));
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto readResult = makeValue(graph, "read_result", 64, false);
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_ram_read"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, addr);
+    graph.addOperand(dpiCall, clk);
+    graph.addResult(dpiCall, readResult);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("difftest_ram_read"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"rIdx"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", true);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 64, "64'hffffffffffffffff");
+    makeRegisterWrite(graph, "data_write", one, readResult, mask, clk, "data");
+
+    return design;
+}
+
+Design buildDpicOutputReadDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto addr = makeValue(graph, "addr", 32, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("addr", addr);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "data_storage", "data_reg", 64, "data");
+    const auto dataRead = makeRegisterRead(graph, "data_read", "data_read_op", 64, "data");
+    graph.bindOutputPort("data", dataRead);
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("flash_read"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input", "output"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{32, 64});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"addr", "data"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"int", "longint"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto readResult = makeValue(graph, "read_result", 64, false);
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_flash_read"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, addr);
+    graph.addOperand(dpiCall, clk);
+    graph.addResult(dpiCall, readResult);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("flash_read"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"addr"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{"data"});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 64, "64'hffffffffffffffff");
+    makeRegisterWrite(graph, "data_write", one, readResult, mask, clk, "data");
+
+    return design;
+}
+
 Design buildDpicPostSequentialSettleDesign()
 {
     Design design;
@@ -470,7 +560,17 @@ Design buildDpicPostSequentialSettleDesign()
 
     (void)makeRegister(graph, "pc_storage", "pc_reg", 8, "pc");
     const auto pcRead = makeRegisterRead(graph, "pc_read", "pc_read_op", 8, "pc");
-    graph.bindOutputPort("pc", pcRead);
+
+    auto pcForDpi = pcRead;
+    for (int i = 0; i < 160; ++i) {
+        const auto nextPcValue = makeValue(graph, "pc_chain_" + std::to_string(i), 8, false);
+        const auto assign = graph.createOperation(
+            OperationKind::kAssign, graph.internSymbol("pc_chain_assign_" + std::to_string(i)));
+        graph.addOperand(assign, pcForDpi);
+        graph.addResult(assign, nextPcValue);
+        pcForDpi = nextPcValue;
+    }
+    graph.bindOutputPort("pc", pcForDpi);
 
     const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
     const auto nextPc = makeConstant(graph, "next_pc", "next_pc_const", 8, "8'h2a");
@@ -488,7 +588,7 @@ Design buildDpicPostSequentialSettleDesign()
 
     const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture_pc"));
     graph.addOperand(dpiCall, one);
-    graph.addOperand(dpiCall, pcRead);
+    graph.addOperand(dpiCall, pcForDpi);
     graph.addOperand(dpiCall, clk);
     graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
     graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
@@ -496,6 +596,83 @@ Design buildDpicPostSequentialSettleDesign()
     graph.setAttr(dpiCall, "hasReturn", false);
     graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
     graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
+
+Design buildDerivedClockPostCommitReplayDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "gate_storage", "gate_reg", 1, "gate");
+    const auto gateRead = makeRegisterRead(graph, "gate_read", "gate_read_op", 1, "gate");
+    (void)makeRegister(graph, "data_storage", "data_reg", 8, "data");
+    const auto dataRead = makeRegisterRead(graph, "data_read", "data_read_op", 8, "data");
+    graph.bindOutputPort("data", dataRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask1 = makeConstant(graph, "mask1", "mask1_const", 1, "1'b1");
+    const auto dataValue = makeConstant(graph, "data_value", "data_value_const", 8, "8'h5a");
+    const auto mask8 = makeConstant(graph, "mask8", "mask8_const", 8, "8'hff");
+
+    makeRegisterWrite(graph, "gate_write", one, one, mask1, clk, "gate");
+
+    const auto gatedClk = makeValue(graph, "gated_clk", 1, false);
+    const auto andOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("gated_clk_and"));
+    graph.addOperand(andOp, clk);
+    graph.addOperand(andOp, gateRead);
+    graph.addResult(andOp, gatedClk);
+
+    const auto dataWrite = makeRegisterWrite(graph, "data_write", one, dataValue, mask8, gatedClk, "data");
+    graph.setAttr(dataWrite, "clockSymbol", std::string("gated_clk"));
+
+    // Keep this fixture above the sharding threshold so it covers the
+    // activity-watermark path used by XiangShan-scale GSIM emission.
+    for (int i = 0; i < 140; ++i) {
+        (void)makeConstant(graph, "padding_const_" + std::to_string(i),
+                           "padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
+Design buildSettledDerivedInputClockDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto en = makeValue(graph, "en", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("en", en);
+
+    (void)makeRegister(graph, "data_storage", "data_reg", 8, "data");
+    const auto dataRead = makeRegisterRead(graph, "data_read", "data_read_op", 8, "data");
+    graph.bindOutputPort("data", dataRead);
+
+    const auto gatedClk = makeValue(graph, "gated_clk", 1, false);
+    const auto andOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("input_gated_clk_and"));
+    graph.addOperand(andOp, clk);
+    graph.addOperand(andOp, en);
+    graph.addResult(andOp, gatedClk);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto dataValue = makeConstant(graph, "data_value", "data_value_const", 8, "8'h5a");
+    const auto mask8 = makeConstant(graph, "mask8", "mask8_const", 8, "8'hff");
+    const auto dataWrite = makeRegisterWrite(graph, "data_write", one, dataValue, mask8, gatedClk, "data");
+    graph.setAttr(dataWrite, "clockSymbol", std::string("gated_clk"));
+
+    for (int i = 0; i < 140; ++i) {
+        (void)makeConstant(graph, "settled_clock_padding_const_" + std::to_string(i),
+                           "settled_clock_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
 
     return design;
 }
@@ -2328,6 +2505,248 @@ int main() {
     compileAndRunHarness(dir, "dpic_call_top", runner);
 }
 
+void testDpicReturnValueFeedsSequentialWrite()
+{
+    Design design = buildDpicReturnReadDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_return_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_return_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower return-valued kDpicCall ops");
+    expect(!diags.hasError(), "EmitGsimCpp should not report return-valued kDpicCall ops as unsupported");
+
+    const std::string source = readFile(dir / "dpic_return_top.cpp");
+    expect(contains(source, "#include \"difftest-dpic.h\""),
+           "return-valued dpic source should include the generated DPI-C header");
+    const std::string commitChunk = readFile(dir / "dpic_return_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(commitChunk, "difftest_ram_read(static_cast<std::uint64_t>"),
+           "return-valued DPIC call should be inlined into the edge update that consumes it");
+    expect(!contains(commitChunk, "kDpicCall-output"),
+           "return-valued DPIC call should not be rejected as an output-arg call");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_ram_read_calls = 0;
+extern "C" inline std::uint64_t difftest_ram_read(std::uint64_t rIdx) {
+    ++g_dpic_ram_read_calls;
+    return rIdx ^ UINT64_C(0x123456789abcdef0);
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_return_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_addr(UINT64_C(0x10));
+    sim.set_clk(0);
+    sim.step();
+    if (g_dpic_ram_read_calls != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_ram_read_calls != 1) {
+        return 2;
+    }
+    if (sim.get_data() != (UINT64_C(0x10) ^ UINT64_C(0x123456789abcdef0))) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_return_top", runner);
+}
+
+void testDpicOutputArgFeedsSequentialWrite()
+{
+    Design design = buildDpicOutputReadDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_output_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_output_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower output-arg kDpicCall ops");
+    expect(!diags.hasError(), "EmitGsimCpp should not report output-arg kDpicCall ops as unsupported");
+
+    const std::string source = readFile(dir / "dpic_output_top.cpp");
+    expect(contains(source, "#include \"difftest-dpic.h\""),
+           "output-arg dpic source should include the generated DPI-C header");
+    const std::string commitChunk = readFile(dir / "dpic_output_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(commitChunk, "flash_read(static_cast<std::uint32_t>"),
+           "output-arg DPIC call should preserve the imported function call");
+    expect(contains(commitChunk, "&dpic_out_"),
+           "output-arg DPIC call should pass writable pointer storage");
+    expect(!contains(commitChunk, "kDpicCall-noninput"),
+           "output-arg DPIC call should not be rejected as non-input");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_flash_read_calls = 0;
+extern "C" inline void flash_read(std::uint32_t addr, std::uint64_t *data) {
+    ++g_flash_read_calls;
+    *data = static_cast<std::uint64_t>(addr) | UINT64_C(0xdead000000000000);
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_output_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_addr(0x34);
+    sim.set_clk(0);
+    sim.step();
+    if (g_flash_read_calls != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (g_flash_read_calls != 1) {
+        return 2;
+    }
+    if (sim.get_data() != (UINT64_C(0xdead000000000000) | UINT64_C(0x34))) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_output_top", runner);
+}
+
+void testDerivedClockEdgesSeePriorDomainCommits()
+{
+    Design design = buildDerivedClockPostCommitReplayDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "derived_clock_post_commit_replay";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("derived_clock_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "4096";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp derived-clock fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp derived-clock fixture should not emit errors");
+
+    const std::string source = readFile(dir / "derived_clock_top.cpp");
+    expect(contains(source, "dirty_replayed_ = false;"),
+           "committed register domains should invalidate dirty replay before later derived-clock edge checks");
+    expect(contains(source, "if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n        dirty_replayed_ = true;\n        replay_dirty_input_shards();\n    }\n    if ((!prev_gated_clk_"),
+           "derived-clock edge checks should replay dirty shards before evaluating the edge expression");
+
+    const std::string runner = R"CPP(
+#include "derived_clock_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    if (sim.get_data() != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_data() != 0x5a) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "derived_clock_top", runner);
+}
+
+void testSettlePreservesDerivedClockInputEdges()
+{
+    Design design = buildSettledDerivedInputClockDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "settled_derived_clock_input_edge";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("settled_clock_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp settled derived-clock fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp settled derived-clock fixture should not emit errors");
+
+    const std::string source = readFile(dir / "settled_clock_top.cpp");
+    expect(contains(source, "void SSimTop::settle() {\n    if (clock_inputs_dirty_) {\n        replay_dirty_input_shards();\n        clock_inputs_dirty_ = false;"),
+           "settle should replay clock-dependent dirty shards before clearing clock_inputs_dirty_");
+    expect(contains(source, "const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n        dirty_replayed_ = true;\n        replay_dirty_input_shards();\n        clock_inputs_dirty_ = false;\n        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;"),
+           "clock-input replay should not consume pending non-clock dirty state");
+
+    const std::string runner = R"CPP(
+#include "settled_clock_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.set_en(1);
+    sim.commit_step();
+    if (sim.get_data() != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.settle();
+    sim.commit_step();
+    if (sim.get_data() != 0x5a) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "settled_clock_top", runner);
+}
+
 void testDpicSamplesPostSequentialSettleState()
 {
     Design design = buildDpicPostSequentialSettleDesign();
@@ -2352,6 +2771,9 @@ void testDpicSamplesPostSequentialSettleState()
     const std::string source = readFile(dir / "dpic_post_seq_top.cpp");
     expect(contains(source, "domain_reg_committed_"), "commit_step should separate register chunks from DPIC chunks");
     expect(contains(source, "post_commit_settled_"), "commit_step should avoid redundant final settle after pre-DPIC settle");
+    expect(contains(source, "kDpicPreSettleShards"), "DPIC post-sequential fixture should emit a pre-settle shard set");
+    expect(contains(source, "kDpicPreSettleShards[] = {0U, 16U}"),
+           "DPIC post-sequential fixture should seed the upstream producer shard without expanding to every shard");
 
     std::ofstream stub(dir / "difftest-dpic.h");
     if (!stub.is_open()) {
@@ -3967,11 +4389,11 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "sharded runtime should expose compact active-shard activation helper");
     expect(contains(source, "while (active_cursor_ < active_word_queue_.size())"),
            "settle should drain the active-word worklist instead of always replaying every shard");
-    expect(contains(source, "kShardSuccessors"),
-           "settle should enqueue shard successors from generated fanout metadata");
-    expect(contains(source, "successor_shard_ / 64U == active_word_"),
-           "settle should use a grhsim-style local same-word successor fast path");
-    expect(contains(source, "active_bits_ |= (UINT64_C(1) << (successor_shard_ % 64U))"),
+    expect(contains(source, "kShardSuccessorMask"),
+           "settle should enqueue shard successors from generated word-mask fanout metadata");
+    expect(contains(source, "activate_shard_mask"),
+           "settle should enqueue cross-word successors as packed active-word masks");
+    expect(contains(source, "active_bits_ |= kShardSuccessorMask"),
            "same-word successor activation should stay in the local active-word bitmap");
 }
 
@@ -4007,8 +4429,8 @@ void testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout()
     const std::string source = readFile(dir / "active_worklist_top.cpp");
     expect(contains(source, "switch (active_shard_)"),
            "active-worklist fixture should use switch dispatch instead of a linear active-shard scan");
-    expect(contains(source, "kShardSuccessors"),
-           "active-worklist fixture should emit successor fanout for convergent dependencies");
+    expect(contains(source, "kShardSuccessorMask"),
+           "active-worklist fixture should emit packed successor fanout for convergent dependencies");
 
     instrumentSchedCounters(dir, "active_worklist_top", shardCount);
 
@@ -4480,6 +4902,10 @@ int main()
         testResetCompatibilitySetterDrivesTopLevelResetPort();
         testDpicImportNoOpCompileAndRun();
         testDpicCallCompileAndRun();
+        testDpicReturnValueFeedsSequentialWrite();
+        testDpicOutputArgFeedsSequentialWrite();
+        testDerivedClockEdgesSeePriorDomainCommits();
+        testSettlePreservesDerivedClockInputEdges();
         testDpicSamplesPostSequentialSettleState();
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
