@@ -549,6 +549,132 @@ Design buildDpicOutputReadDesign()
     return design;
 }
 
+Design buildDpicJtagTickMultiResultDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto en = makeValue(graph, "en", 1, false);
+    const auto tickIn = makeValue(graph, "tick_in", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("en", en);
+    graph.bindInputPort("tick_in", tickIn);
+
+    (void)makeRegister(graph, "result_storage", "result_reg", 32, "result");
+    (void)makeRegister(graph, "tck_storage", "tck_reg", 1, "tck");
+    (void)makeRegister(graph, "tms_storage", "tms_reg", 1, "tms");
+    (void)makeRegister(graph, "tdi_storage", "tdi_reg", 1, "tdi");
+    (void)makeRegister(graph, "trstn_storage", "trstn_reg", 1, "trstn");
+
+    graph.bindOutputPort("result", makeRegisterRead(graph, "result_read", "result_read_op", 32, "result"));
+    graph.bindOutputPort("tck", makeRegisterRead(graph, "tck_read", "tck_read_op", 1, "tck"));
+    graph.bindOutputPort("tms", makeRegisterRead(graph, "tms_read", "tms_read_op", 1, "tms"));
+    graph.bindOutputPort("tdi", makeRegisterRead(graph, "tdi_read", "tdi_read_op", 1, "tdi"));
+    graph.bindOutputPort("trstn", makeRegisterRead(graph, "trstn_read", "trstn_read_op", 1, "trstn"));
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("jtag_tick"));
+    graph.setAttr(dpiImport, "argsDirection",
+                  std::vector<std::string>{"output", "output", "output", "output", "input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1, 1, 1, 1, 1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"tck", "tms", "tdi", "trstn", "tdo"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, false, false, false, false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit", "bit", "bit", "bit", "bit"});
+    graph.setAttr(dpiImport, "hasReturn", true);
+    graph.setAttr(dpiImport, "returnWidth", static_cast<int64_t>(32));
+    graph.setAttr(dpiImport, "returnSigned", true);
+    graph.setAttr(dpiImport, "returnType", std::string("int"));
+
+    const auto ret = makeValue(graph, "jtag_ret", 32, false);
+    const auto tck = makeValue(graph, "jtag_tck", 1, false);
+    const auto tms = makeValue(graph, "jtag_tms", 1, false);
+    const auto tdi = makeValue(graph, "jtag_tdi", 1, false);
+    const auto trstn = makeValue(graph, "jtag_trstn", 1, false);
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_jtag_tick"));
+    graph.addOperand(dpiCall, en);
+    graph.addOperand(dpiCall, tickIn);
+    graph.addOperand(dpiCall, clk);
+    graph.addResult(dpiCall, ret);
+    graph.addResult(dpiCall, tck);
+    graph.addResult(dpiCall, tms);
+    graph.addResult(dpiCall, tdi);
+    graph.addResult(dpiCall, trstn);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("jtag_tick"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"tdo"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{"tck", "tms", "tdi", "trstn"});
+    graph.setAttr(dpiCall, "hasReturn", true);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    const auto mask32 = makeConstant(graph, "mask32", "mask32_const", 32, "32'hffffffff");
+    const auto mask1 = makeConstant(graph, "mask1", "mask1_const", 1, "1'b1");
+    makeRegisterWrite(graph, "result_write", en, ret, mask32, clk, "result");
+    makeRegisterWrite(graph, "tck_write", en, tck, mask1, clk, "tck");
+    makeRegisterWrite(graph, "tms_write", en, tms, mask1, clk, "tms");
+    makeRegisterWrite(graph, "tdi_write", en, tdi, mask1, clk, "tdi");
+    makeRegisterWrite(graph, "trstn_write", en, trstn, mask1, clk, "trstn");
+
+    return design;
+}
+
+Design buildDpicJtagTickPreOnlyOutputDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto en = makeValue(graph, "en", 1, false);
+    const auto tickIn = makeValue(graph, "tick_in", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("en", en);
+    graph.bindInputPort("tick_in", tickIn);
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("jtag_tick"));
+    graph.setAttr(dpiImport, "argsDirection",
+                  std::vector<std::string>{"output", "output", "output", "output", "input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1, 1, 1, 1, 1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"tck", "tms", "tdi", "trstn", "tdo"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, false, false, false, false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit", "bit", "bit", "bit", "bit"});
+    graph.setAttr(dpiImport, "hasReturn", true);
+    graph.setAttr(dpiImport, "returnWidth", static_cast<int64_t>(32));
+    graph.setAttr(dpiImport, "returnSigned", true);
+    graph.setAttr(dpiImport, "returnType", std::string("int"));
+
+    const auto ret = makeValue(graph, "jtag_ret", 32, false);
+    const auto tck = makeValue(graph, "jtag_tck", 1, false);
+    const auto tms = makeValue(graph, "jtag_tms", 1, false);
+    const auto tdi = makeValue(graph, "jtag_tdi", 1, false);
+    const auto trstn = makeValue(graph, "jtag_trstn", 1, false);
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_jtag_tick"));
+    graph.addOperand(dpiCall, en);
+    graph.addOperand(dpiCall, tickIn);
+    graph.addOperand(dpiCall, clk);
+    graph.addResult(dpiCall, ret);
+    graph.addResult(dpiCall, tck);
+    graph.addResult(dpiCall, tms);
+    graph.addResult(dpiCall, tdi);
+    graph.addResult(dpiCall, trstn);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("jtag_tick"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"tdo"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{"tck", "tms", "tdi", "trstn"});
+    graph.setAttr(dpiCall, "hasReturn", true);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    graph.bindOutputPort("result", ret);
+    graph.bindOutputPort("tck", tck);
+    graph.bindOutputPort("tms", tms);
+    graph.bindOutputPort("tdi", tdi);
+    graph.bindOutputPort("trstn", trstn);
+
+    return design;
+}
+
 Design buildDpicPostSequentialSettleDesign()
 {
     Design design;
@@ -2645,6 +2771,233 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "dpic_output_top", runner);
+}
+
+void testDpicJtagTickMultiResultCallOnceAndConditionGated()
+{
+    Design design = buildDpicJtagTickMultiResultDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_jtag_tick_multi_result_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_jtag_tick_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower return-plus-output-arg jtag_tick kDpicCall ops");
+    expect(!diags.hasError(), "EmitGsimCpp should not report return-plus-output-arg jtag_tick as unsupported");
+
+    const std::string source = readFile(dir / "dpic_jtag_tick_top.cpp");
+    expect(contains(source, "#include \"difftest-dpic.h\""),
+           "jtag_tick source should include the generated DPI-C header");
+    const std::string header = readFile(dir / "dpic_jtag_tick_top_internal.hpp");
+    expect(contains(header, "extern \"C\" int jtag_tick(std::uint8_t *, std::uint8_t *, std::uint8_t *, std::uint8_t *, std::uint8_t);"),
+           "jtag_tick prototype should preserve the int return and output pointer ABI");
+    const std::string preChunk = readFile(dir / "dpic_jtag_tick_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(preChunk, "jtag_tick(&result.out0, &result.out1, &result.out2, &result.out3, static_cast<std::uint8_t>"),
+           "jtag_tick call should pass four output pointers before the input argument");
+    expect(countOccurrences(preChunk, "jtag_tick(") == 1,
+           "one same-edge multi-result kDpicCall should emit exactly one jtag_tick invocation");
+    expect(contains(preChunk, "if (input_en_)"),
+           "jtag_tick should be condition-gated before the imported call");
+    expect(!contains(preChunk, "kDpicCall-output"),
+           "return-plus-output jtag_tick should not be rejected as output-only unsupported");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+
+inline unsigned g_jtag_tick_calls = 0;
+inline std::uint8_t g_jtag_tick_last_input = 0;
+
+extern "C" inline int jtag_tick(std::uint8_t *tck,
+                                std::uint8_t *tms,
+                                std::uint8_t *tdi,
+                                std::uint8_t *trstn,
+                                std::uint8_t tdo) {
+    ++g_jtag_tick_calls;
+    g_jtag_tick_last_input = tdo;
+    *tck = static_cast<std::uint8_t>(g_jtag_tick_calls & 1U);
+    *tms = static_cast<std::uint8_t>((g_jtag_tick_calls >> 1U) & 1U);
+    *tdi = static_cast<std::uint8_t>(tdo & 1U);
+    *trstn = static_cast<std::uint8_t>(1U);
+    return static_cast<int>(UINT32_C(0xCAFE0000) |
+                            (static_cast<std::uint32_t>(g_jtag_tick_calls) << 8U) |
+                            static_cast<std::uint32_t>(tdo));
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_jtag_tick_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_en(0);
+    sim.set_tick_in(1);
+    sim.set_clk(0);
+    sim.step();
+
+    sim.set_clk(1);
+    sim.step();
+    if (g_jtag_tick_calls != 0) {
+        return 1;
+    }
+    if (sim.get_result() != 0 || sim.get_tck() != 0 || sim.get_tms() != 0 ||
+        sim.get_tdi() != 0 || sim.get_trstn() != 0) {
+        return 2;
+    }
+
+    sim.set_clk(0);
+    sim.step();
+    if (g_jtag_tick_calls != 0) {
+        return 3;
+    }
+
+    sim.set_en(1);
+    sim.set_tick_in(1);
+    sim.set_clk(1);
+    sim.step();
+    if (g_jtag_tick_calls != 1 || g_jtag_tick_last_input != 1) {
+        return 4;
+    }
+    if (sim.get_result() != (UINT32_C(0xCAFE0000) | UINT32_C(0x100) | UINT32_C(1))) {
+        return 5;
+    }
+    if (sim.get_tck() != 1 || sim.get_tms() != 0 || sim.get_tdi() != 1 || sim.get_trstn() != 1) {
+        return 6;
+    }
+
+    sim.step();
+    if (g_jtag_tick_calls != 1) {
+        return 7;
+    }
+
+    sim.set_clk(0);
+    sim.step();
+    sim.set_tick_in(0);
+    sim.set_clk(1);
+    sim.step();
+    if (g_jtag_tick_calls != 2 || g_jtag_tick_last_input != 0) {
+        return 8;
+    }
+    if (sim.get_result() != (UINT32_C(0xCAFE0000) | UINT32_C(0x200))) {
+        return 9;
+    }
+    if (sim.get_tck() != 0 || sim.get_tms() != 1 || sim.get_tdi() != 0 || sim.get_trstn() != 1) {
+        return 10;
+    }
+
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_jtag_tick_top", runner);
+}
+
+void testDpicJtagTickPreOnlySequentialClockDeclared()
+{
+    Design design = buildDpicJtagTickPreOnlyOutputDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_jtag_tick_pre_only_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_jtag_tick_pre_only_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower pre-only return-plus-output-arg jtag_tick ops");
+    expect(!diags.hasError(), "EmitGsimCpp should not reject pre-only return-plus-output-arg jtag_tick ops");
+
+    const std::string publicHeader = readFile(dir / "dpic_jtag_tick_pre_only_top.hpp");
+    expect(contains(publicHeader, "bool prev_clk_ = false;"),
+           "pre-only sequential DPI domains should declare their previous-clock state");
+    const std::string internalHeader = readFile(dir / "dpic_jtag_tick_pre_only_top_internal.hpp");
+    expect(contains(internalHeader, "extern \"C\" int jtag_tick(std::uint8_t *, std::uint8_t *, std::uint8_t *, std::uint8_t *, std::uint8_t);"),
+           "pre-only jtag_tick prototype should preserve the int return and output pointer ABI");
+
+    const std::string preChunk = readFile(dir / "dpic_jtag_tick_pre_only_top_commit_chunk_posedge_clk_0.cpp");
+    expect(countOccurrences(preChunk, "jtag_tick(") == 1,
+           "pre-only return-plus-output kDpicCall should emit exactly one jtag_tick invocation");
+    expect(contains(preChunk, "if (input_en_)"),
+           "pre-only jtag_tick should remain condition-gated");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+
+inline unsigned g_jtag_tick_calls = 0;
+
+extern "C" inline int jtag_tick(std::uint8_t *tck,
+                                std::uint8_t *tms,
+                                std::uint8_t *tdi,
+                                std::uint8_t *trstn,
+                                std::uint8_t tdo) {
+    ++g_jtag_tick_calls;
+    *tck = static_cast<std::uint8_t>(1U);
+    *tms = static_cast<std::uint8_t>(tdo & 1U);
+    *tdi = static_cast<std::uint8_t>((tdo ^ 1U) & 1U);
+    *trstn = static_cast<std::uint8_t>(1U);
+    return static_cast<int>(UINT32_C(0xFACE0000) | static_cast<std::uint32_t>(tdo));
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_jtag_tick_pre_only_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_en(1);
+    sim.set_tick_in(1);
+    sim.set_clk(0);
+    sim.step();
+    if (g_jtag_tick_calls != 0) {
+        return 1;
+    }
+
+    sim.set_clk(1);
+    sim.step();
+    if (g_jtag_tick_calls != 1) {
+        return 2;
+    }
+    if (sim.get_result() != (UINT32_C(0xFACE0000) | UINT32_C(1))) {
+        return 3;
+    }
+    if (sim.get_tck() != 1 || sim.get_tms() != 1 || sim.get_tdi() != 0 || sim.get_trstn() != 1) {
+        return 4;
+    }
+
+    sim.step();
+    if (g_jtag_tick_calls != 1) {
+        return 5;
+    }
+
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_jtag_tick_pre_only_top", runner);
 }
 
 void testDerivedClockEdgesSeePriorDomainCommits()
@@ -4904,6 +5257,8 @@ int main()
         testDpicCallCompileAndRun();
         testDpicReturnValueFeedsSequentialWrite();
         testDpicOutputArgFeedsSequentialWrite();
+        testDpicJtagTickMultiResultCallOnceAndConditionGated();
+        testDpicJtagTickPreOnlySequentialClockDeclared();
         testDerivedClockEdgesSeePriorDomainCommits();
         testSettlePreservesDerivedClockInputEdges();
         testDpicSamplesPostSequentialSettleState();

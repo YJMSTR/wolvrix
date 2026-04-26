@@ -44,6 +44,7 @@ namespace wolvrix::lib::emit
             std::vector<int64_t> argWidths;
             bool hasReturn = false;
             int64_t returnWidth = 0;
+            std::string returnType;
         };
 
         // Code generation state for lowering GRH operations to C++
@@ -71,6 +72,7 @@ namespace wolvrix::lib::emit
             std::vector<int32_t> tempVecWidths;
 
             // Sequential update statements (grouped by clock domain)
+            std::map<std::string, std::vector<std::string>> sequentialPreStmts;
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             std::map<std::string, std::map<std::string, std::vector<std::string>>> sequentialRegStmts;
             std::map<std::string, std::string> sequentialClockExprs;
@@ -93,6 +95,7 @@ namespace wolvrix::lib::emit
             bool emitsDpicCalls = false;
             bool enableDpicTrace = false;
             std::size_t dpicTraceCallSite = 0;
+            std::size_t dpicMaterializedCallSite = 0;
             std::set<int> dpicPreSettleShards;
             int dpicGlobalWarmupSteps = 0;
 
@@ -337,6 +340,7 @@ namespace wolvrix::lib::emit
             std::vector<std::string> regNames;
             std::map<std::string, std::vector<std::string>> regStmts;
             std::vector<std::string> stmts;
+            bool preReg = false;
         };
 
         // Convert Verilog-style constant to C++ constant
@@ -488,6 +492,15 @@ namespace wolvrix::lib::emit
                 return "std::uint32_t";
             }
             return "std::uint64_t";
+        }
+
+        std::string dpicReturnTypeForImport(const DpicImportInfo& importInfo)
+        {
+            if (importInfo.returnType == "int")
+            {
+                return "int";
+            }
+            return dpicCppTypeForWidth(importInfo.returnWidth);
         }
 
         bool startsWith(std::string_view text, std::string_view prefix)
@@ -1981,6 +1994,11 @@ namespace wolvrix::lib::emit
                             importInfo.returnWidth = *returnWidth;
                         }
                     }
+                    if (auto returnTypeAttr = op.attr("returnType")) {
+                        if (auto *returnType = std::get_if<std::string>(&*returnTypeAttr)) {
+                            importInfo.returnType = *returnType;
+                        }
+                    }
                     if (!importInfo.symbol.empty()) {
                         state.dpicImports[importInfo.symbol] = std::move(importInfo);
                     }
@@ -2046,6 +2064,124 @@ namespace wolvrix::lib::emit
                     const std::string clockExpr = getOperandExpr(eventStart);
                     if (clockExpr != "0" && !clockExpr.empty()) {
                         state.sequentialClockExprs.try_emplace(domainKey, clockExpr);
+                    }
+
+                    if (hasReturn && hasOutputArgs) {
+                        const std::size_t returnOffset = 1U;
+                        if (results.size() != returnOffset + outNames->size()) {
+                            std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                            state.unsupportedOps.push_back("kDpicCall-result-count (" + opName + ")");
+                            break;
+                        }
+
+                        std::vector<std::string> resultRefs(results.size());
+                        std::vector<std::string> resultTypes(results.size());
+                        std::vector<int32_t> resultWidths(results.size(), 0);
+                        bool resultRefsOk = true;
+                        for (std::size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex) {
+                            const auto resultValue = graph.getValue(results[resultIndex]);
+                            if (resultValue.width() > 64) {
+                                std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                                state.unsupportedOps.push_back("kDpicCall-materialized-wide (" + opName + ")");
+                                resultRefsOk = false;
+                                break;
+                            }
+                            resultWidths[resultIndex] = resultValue.width();
+                            resultTypes[resultIndex] = getCppTypeForWidth(resultValue.width());
+                            resultRefs[resultIndex] =
+                                state.materializeResultRef(results[resultIndex], resultTypes[resultIndex], resultValue.width());
+                        }
+                        if (!resultRefsOk) {
+                            break;
+                        }
+
+                        const std::size_t callSite = state.dpicMaterializedCallSite++;
+                        const std::string structName = "WolvrixGsimDpicResult" + std::to_string(callSite);
+                        const std::string resultName = "dpic_result_" + std::to_string(callSite) + "_";
+
+                        std::vector<std::string> callArgs;
+                        callArgs.reserve(formalCount);
+                        bool materializedCallOk = true;
+                        for (std::size_t formalIndex = 0; formalIndex < formalCount; ++formalIndex) {
+                            if (importInfo.argDirs[formalIndex] == "input") {
+                                const auto nameIt =
+                                    std::find(inNames->begin(), inNames->end(), importInfo.argNames[formalIndex]);
+                                if (nameIt == inNames->end()) {
+                                    std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                                    state.unsupportedOps.push_back("kDpicCall-arg (" + opName + ")");
+                                    materializedCallOk = false;
+                                    break;
+                                }
+                                const std::size_t inputIndex =
+                                    static_cast<std::size_t>(std::distance(inNames->begin(), nameIt));
+                                const std::size_t operandIndex = 1U + inputIndex;
+                                if (operandIndex >= eventStart) {
+                                    std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                                    state.unsupportedOps.push_back("kDpicCall-arg-index (" + opName + ")");
+                                    materializedCallOk = false;
+                                    break;
+                                }
+                                callArgs.push_back(
+                                    dpicCastExpr(getOperandExpr(operandIndex), importInfo.argWidths[formalIndex]));
+                            } else if (importInfo.argDirs[formalIndex] == "output") {
+                                const auto nameIt =
+                                    std::find(outNames->begin(), outNames->end(), importInfo.argNames[formalIndex]);
+                                if (nameIt == outNames->end()) {
+                                    std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                                    state.unsupportedOps.push_back("kDpicCall-output-arg (" + opName + ")");
+                                    materializedCallOk = false;
+                                    break;
+                                }
+                                const std::size_t outputIndex =
+                                    static_cast<std::size_t>(std::distance(outNames->begin(), nameIt));
+                                callArgs.push_back("&result.out" + std::to_string(outputIndex));
+                            } else {
+                                std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                                state.unsupportedOps.push_back("kDpicCall-arg-dir (" + opName + ")");
+                                materializedCallOk = false;
+                                break;
+                            }
+                        }
+                        if (!materializedCallOk) {
+                            break;
+                        }
+
+                        state.markDpicPreSettleValue(operands[0]);
+                        for (std::size_t operandIndex = 1U; operandIndex < eventStart; ++operandIndex) {
+                            state.markDpicPreSettleValue(operands[operandIndex]);
+                        }
+
+                        std::string callExpr = *target + "(";
+                        for (std::size_t i = 0; i < callArgs.size(); ++i) {
+                            if (i != 0) {
+                                callExpr += ", ";
+                            }
+                            callExpr += callArgs[i];
+                        }
+                        callExpr += ")";
+
+                        std::string stmt = "        { struct " + structName + " { " + resultTypes[0] + " ret{};";
+                        for (std::size_t outputIndex = 0; outputIndex < outNames->size(); ++outputIndex) {
+                            const std::size_t resultIndex = returnOffset + outputIndex;
+                            stmt += " " + resultTypes[resultIndex] + " out" + std::to_string(outputIndex) + "{};";
+                        }
+                        stmt += " }; const auto " + resultName + " = ([&](){ " + structName + " result{}; if (" +
+                                condition + ") { result.ret = " +
+                                castScalarExprForWidth(callExpr, resultWidths[0]) +
+                                "; committed_ = true; } return result; }()); ";
+                        stmt += resultRefs[0] + " = " + resultName + ".ret;";
+                        for (std::size_t outputIndex = 0; outputIndex < outNames->size(); ++outputIndex) {
+                            const std::size_t resultIndex = returnOffset + outputIndex;
+                            stmt += " " + resultRefs[resultIndex] + " = " + resultName + ".out" +
+                                    std::to_string(outputIndex) + ";";
+                        }
+                        stmt += " }";
+                        state.sequentialPreStmts[domainKey].push_back(std::move(stmt));
+                        for (std::size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex) {
+                            recordResultMetadata(resultIndex);
+                        }
+                        state.emitsDpicCalls = true;
+                        break;
                     }
 
                     if (!hasReturn && hasOutputArgs && outNames->size() == 1U && results.size() == 1U) {
@@ -2993,6 +3129,9 @@ namespace wolvrix::lib::emit
             std::vector<SequentialChunkPlan> plans;
             const std::size_t maxChunkBytes = static_cast<std::size_t>(std::max(32768, state.commitShardSize));
             std::set<std::string> domains;
+            for (const auto& [domainKey, _] : state.sequentialPreStmts) {
+                domains.insert(domainKey);
+            }
             for (const auto& [domainKey, _] : state.sequentialRegStmts) {
                 domains.insert(domainKey);
             }
@@ -3001,6 +3140,32 @@ namespace wolvrix::lib::emit
             }
             for (const auto& domainKey : domains) {
                 std::size_t chunkIndex = 0;
+                if (auto preIt = state.sequentialPreStmts.find(domainKey); preIt != state.sequentialPreStmts.end()) {
+                    SequentialChunkPlan current;
+                    current.domainKey = domainKey;
+                    current.preReg = true;
+                    std::size_t currentBytes = 0;
+                    auto flushCurrent = [&]() {
+                        if (current.stmts.empty()) {
+                            return;
+                        }
+                        current.methodName = "commit_chunk_" + sanitizeIdentifier(domainKey) + "_" + std::to_string(chunkIndex++);
+                        plans.push_back(current);
+                        current = SequentialChunkPlan{};
+                        current.domainKey = domainKey;
+                        current.preReg = true;
+                        currentBytes = 0;
+                    };
+                    for (const auto& stmt : preIt->second) {
+                        const std::size_t estimatedBytes = stmt.size() + 1;
+                        if (!current.stmts.empty() && currentBytes + estimatedBytes > maxChunkBytes) {
+                            flushCurrent();
+                        }
+                        current.stmts.push_back(stmt);
+                        currentBytes += estimatedBytes;
+                    }
+                    flushCurrent();
+                }
                 if (auto regIt = state.sequentialRegStmts.find(domainKey); regIt != state.sequentialRegStmts.end()) {
                     SequentialChunkPlan current;
                     current.domainKey = domainKey;
@@ -3711,6 +3876,9 @@ namespace wolvrix::lib::emit
             // Input port setters
             std::set<std::string> sequentialClockInputs;
             std::set<std::string> headerSequentialDomains;
+            for (const auto &domain : state.sequentialPreStmts) {
+                headerSequentialDomains.insert(domain.first);
+            }
             for (const auto &domain : state.sequentialStmts) {
                 headerSequentialDomains.insert(domain.first);
             }
@@ -3959,11 +4127,16 @@ namespace wolvrix::lib::emit
             std::map<std::string, std::vector<std::string>> sequentialRegChunkMethods;
             std::map<std::string, std::vector<std::string>> sequentialStmtChunkMethods;
             std::set<std::string> sequentialDomains;
+            for (const auto &domain : state.sequentialPreStmts) {
+                sequentialDomains.insert(domain.first);
+            }
             for (const auto &domain : state.sequentialStmts) {
                 sequentialDomains.insert(domain.first);
             }
             for (const auto &chunk : sequentialChunks) {
-                if (chunk.regNames.empty() && !chunk.stmts.empty()) {
+                if (chunk.preReg) {
+                    sequentialRegChunkMethods[chunk.domainKey].push_back(chunk.methodName);
+                } else if (chunk.regNames.empty() && !chunk.stmts.empty()) {
                     sequentialStmtChunkMethods[chunk.domainKey].push_back(chunk.methodName);
                 } else {
                     sequentialRegChunkMethods[chunk.domainKey].push_back(chunk.methodName);
@@ -5041,7 +5214,7 @@ namespace wolvrix::lib::emit
                         continue;
                     }
                     const std::string returnType = importInfo.hasReturn
-                                                       ? dpicCppTypeForWidth(importInfo.returnWidth)
+                                                       ? dpicReturnTypeForImport(importInfo)
                                                        : std::string("void");
                     os << "extern \"C\" " << returnType << " " << symbol << "(";
                     for (std::size_t i = 0; i < importInfo.argNames.size(); ++i) {
