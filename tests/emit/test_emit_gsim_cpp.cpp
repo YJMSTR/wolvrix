@@ -3125,6 +3125,61 @@ int main() {
 }
 
 
+void testXsZeroRetireTraceEmitsPresenceBits()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_InstrCommit"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"valid"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_instr_commit"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("v_difftest_InstrCommit"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"valid"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "xs_zero_retire_trace_present";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("xs_zero_retire_trace_top");
+    options.topOverrides = {"top"};
+    options.attributes["dpic_trace"] = "1";
+    options.attributes["xs_zero_retire_trace"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should emit XS zero-retire trace fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report XS zero-retire trace fixture errors");
+
+    const std::string chunk = readFile(dir / "xs_zero_retire_trace_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "r36_t1903395_present=0"),
+           "XS zero-retire trace should keep stale temp labels visible with explicit absence markers");
+    expect(contains(chunk, "r36_s78873_present=0"),
+           "XS zero-retire trace should keep missing state labels visible with explicit absence markers");
+}
+
 void testDpicCallCompileAndRun()
 {
     Design design = buildDpicCallDesign();
@@ -6560,6 +6615,7 @@ int main()
         testSingleClockRuntimeCompileAndRun();
         testResetCompatibilitySetterDrivesTopLevelResetPort();
         testDpicImportNoOpCompileAndRun();
+        testXsZeroRetireTraceEmitsPresenceBits();
         testDpicCallCompileAndRun();
         testNoOutputShardedDpicConditionReplaysDirtyInputs();
         testDpicDirtyReplayIncludesProducerClosure();

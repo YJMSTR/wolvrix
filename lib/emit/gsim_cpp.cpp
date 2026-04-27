@@ -2439,18 +2439,25 @@ namespace wolvrix::lib::emit
                             if (*target != "v_difftest_InstrCommit") {
                                 return;
                             }
-                            if (state.tempU8Count <= 2516282U || state.stateU8Count <= 236509U) {
-                                return;
-                            }
                             auto appendTempU8 = [&](std::string_view label, std::size_t index) {
+                                const bool present = index < state.tempU8Count;
                                 stmt += " << \" r36_" + std::string(label) +
-                                        "=\" << static_cast<std::uint64_t>(evalTemps_->tempU8[" +
-                                        std::to_string(index) + "])";
+                                        "=\" << static_cast<std::uint64_t>(";
+                                stmt += present ? "evalTemps_->tempU8[" + std::to_string(index) + "]"
+                                                : "UINT64_C(0)";
+                                stmt += ")";
+                                stmt += " << \" r36_" + std::string(label) + "_present="
+                                      + (present ? "1" : "0") + "\"";
                             };
                             auto appendStateU8 = [&](std::string_view label, std::size_t index) {
+                                const bool present = index < state.stateU8Count;
                                 stmt += " << \" r36_" + std::string(label) +
-                                        "=\" << static_cast<std::uint64_t>(state_->stateU8[" +
-                                        std::to_string(index) + "])";
+                                        "=\" << static_cast<std::uint64_t>(";
+                                stmt += present ? "state_->stateU8[" + std::to_string(index) + "]"
+                                                : "UINT64_C(0)";
+                                stmt += ")";
+                                stmt += " << \" r36_" + std::string(label) + "_present="
+                                      + (present ? "1" : "0") + "\"";
                             };
                             appendTempU8("t1903395", 1903395);
                             appendTempU8("t2516282", 2516282);
