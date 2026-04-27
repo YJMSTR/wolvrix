@@ -2597,19 +2597,19 @@ namespace wolvrix::lib::emit
                             std::max(graph->valueWidth(ops[0]),
                                      graph->valueWidth(ops[1]));
                         const std::string tok = binOpToken(defOp.kind());
+                        const bool relationalCompare =
+                            defOp.kind() == wolvrix::lib::grh::OperationKind::kLt ||
+                            defOp.kind() == wolvrix::lib::grh::OperationKind::kLe ||
+                            defOp.kind() == wolvrix::lib::grh::OperationKind::kGt ||
+                            defOp.kind() == wolvrix::lib::grh::OperationKind::kGe;
+                        const bool bothSigned = graph->valueSigned(ops[0]) && graph->valueSigned(ops[1]);
                         const std::string lhs = resultWidth > 0
-                                                    ? inlineExpr.extendOperand(ops[0], resultWidth)
+                                                    ? inlineExpr.extendShiftOperand(ops[0], resultWidth, bothSigned)
                                                     : inlineExpr.valueExpr(ops[0]);
                         const std::string rhs = resultWidth > 0
-                                                    ? inlineExpr.extendOperand(ops[1], resultWidth)
+                                                    ? inlineExpr.extendShiftOperand(ops[1], resultWidth, bothSigned)
                                                     : inlineExpr.valueExpr(ops[1]);
-                        const bool signedCompare =
-                            (defOp.kind() == wolvrix::lib::grh::OperationKind::kLt ||
-                             defOp.kind() == wolvrix::lib::grh::OperationKind::kLe ||
-                             defOp.kind() == wolvrix::lib::grh::OperationKind::kGt ||
-                             defOp.kind() == wolvrix::lib::grh::OperationKind::kGe) &&
-                            graph->valueSigned(ops[0]) &&
-                            graph->valueSigned(ops[1]);
+                        const bool signedCompare = relationalCompare && bothSigned;
                         const std::string lhsExpr = signedCompare ? "$signed(" + lhs + ")" : lhs;
                         const std::string rhsExpr = signedCompare ? "$signed(" + rhs + ")" : rhs;
                         expr = lhsExpr + " " + tok + " " + rhsExpr;
@@ -3705,19 +3705,19 @@ namespace wolvrix::lib::emit
                         std::max(graph->valueWidth(operands[0]),
                                  graph->valueWidth(operands[1]));
                     const std::string tok = binOpToken(op.kind());
+                    const bool relationalCompare =
+                        op.kind() == wolvrix::lib::grh::OperationKind::kLt ||
+                        op.kind() == wolvrix::lib::grh::OperationKind::kLe ||
+                        op.kind() == wolvrix::lib::grh::OperationKind::kGt ||
+                        op.kind() == wolvrix::lib::grh::OperationKind::kGe;
+                    const bool bothSigned = graph->valueSigned(operands[0]) && graph->valueSigned(operands[1]);
                     const std::string lhs = resultWidth > 0
-                                                ? baseExpr.extendOperand(operands[0], resultWidth)
+                                                ? baseExpr.extendShiftOperand(operands[0], resultWidth, bothSigned)
                                                 : valueExpr(operands[0]);
                     const std::string rhs = resultWidth > 0
-                                                ? baseExpr.extendOperand(operands[1], resultWidth)
+                                                ? baseExpr.extendShiftOperand(operands[1], resultWidth, bothSigned)
                                                 : valueExpr(operands[1]);
-                    const bool signedCompare =
-                        (op.kind() == wolvrix::lib::grh::OperationKind::kLt ||
-                         op.kind() == wolvrix::lib::grh::OperationKind::kLe ||
-                         op.kind() == wolvrix::lib::grh::OperationKind::kGt ||
-                         op.kind() == wolvrix::lib::grh::OperationKind::kGe) &&
-                        graph->valueSigned(operands[0]) &&
-                        graph->valueSigned(operands[1]);
+                    const bool signedCompare = relationalCompare && bothSigned;
                     const std::string lhsExpr = signedCompare ? "$signed(" + lhs + ")" : lhs;
                     const std::string rhsExpr = signedCompare ? "$signed(" + rhs + ")" : rhs;
                     addValueAssign(results[0], lhsExpr + " " + tok + " " + rhsExpr, opId);

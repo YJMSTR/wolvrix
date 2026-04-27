@@ -514,6 +514,19 @@ Design buildNoOutputDpicConditionWithProducerClosureDesign()
     graph.bindInputPort("en", en);
     graph.bindInputPort("clk", clk);
 
+    const auto independentSeed = makeConstant(graph, "independent_seed", "independent_seed_op", 1, "1'b1");
+    auto independentCurrent = independentSeed;
+    for (int i = 0; i < 400; ++i)
+    {
+        const auto next = makeValue(graph, "independent_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("independent_not_" + std::to_string(i)));
+        graph.addOperand(op, independentCurrent);
+        graph.addResult(op, next);
+        independentCurrent = next;
+    }
+    (void)independentCurrent;
+
     const auto constSeed = makeConstant(graph, "const_seed", "const_seed_op", 1, "1'b1");
     auto constCurrent = constSeed;
     for (int i = 0; i < 176; ++i)
@@ -604,6 +617,21 @@ Design buildNoOutputLatchGatedDpicDesign()
     graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
     graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
 
+    return design;
+}
+
+Design buildResetReleaseLatchDpicDesign()
+{
+    Design design = buildNoOutputLatchGatedDpicDesign();
+    auto* graph = design.findGraph("top");
+    if (graph == nullptr) {
+        throw std::runtime_error("reset-release fixture missing top graph");
+    }
+    const auto gate = graph->findValue("gate_latch_q");
+    if (!gate) {
+        throw std::runtime_error("reset-release fixture missing latch read value");
+    }
+    graph->bindOutputPort("gate", gate);
     return design;
 }
 
@@ -1307,6 +1335,92 @@ Design buildCompareDesign()
     graph.addOperand(neOp, inA);
     graph.addOperand(neOp, inB);
     graph.addResult(neOp, outNe);
+
+    return design;
+}
+
+Design buildSignedCompareDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 4, true);
+    const auto inB = makeValue(graph, "b", 8, true);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outLt = makeValue(graph, "lt_y", 1, false);
+    const auto outLe = makeValue(graph, "le_y", 1, false);
+    const auto outGt = makeValue(graph, "gt_y", 1, false);
+    const auto outGe = makeValue(graph, "ge_y", 1, false);
+    graph.bindOutputPort("lt_y", outLt);
+    graph.bindOutputPort("le_y", outLe);
+    graph.bindOutputPort("gt_y", outGt);
+    graph.bindOutputPort("ge_y", outGe);
+
+    const auto ltOp = graph.createOperation(OperationKind::kLt, graph.internSymbol("signed_lt_y_op"));
+    graph.addOperand(ltOp, inA);
+    graph.addOperand(ltOp, inB);
+    graph.addResult(ltOp, outLt);
+
+    const auto leOp = graph.createOperation(OperationKind::kLe, graph.internSymbol("signed_le_y_op"));
+    graph.addOperand(leOp, inA);
+    graph.addOperand(leOp, inB);
+    graph.addResult(leOp, outLe);
+
+    const auto gtOp = graph.createOperation(OperationKind::kGt, graph.internSymbol("signed_gt_y_op"));
+    graph.addOperand(gtOp, inA);
+    graph.addOperand(gtOp, inB);
+    graph.addResult(gtOp, outGt);
+
+    const auto geOp = graph.createOperation(OperationKind::kGe, graph.internSymbol("signed_ge_y_op"));
+    graph.addOperand(geOp, inA);
+    graph.addOperand(geOp, inB);
+    graph.addResult(geOp, outGe);
+
+    return design;
+}
+
+Design buildMixedSignedCompareDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto inA = makeValue(graph, "a", 4, true);
+    const auto inB = makeValue(graph, "b", 8, false);
+    graph.bindInputPort("a", inA);
+    graph.bindInputPort("b", inB);
+
+    const auto outLt = makeValue(graph, "lt_y", 1, false);
+    const auto outLe = makeValue(graph, "le_y", 1, false);
+    const auto outGt = makeValue(graph, "gt_y", 1, false);
+    const auto outGe = makeValue(graph, "ge_y", 1, false);
+    graph.bindOutputPort("lt_y", outLt);
+    graph.bindOutputPort("le_y", outLe);
+    graph.bindOutputPort("gt_y", outGt);
+    graph.bindOutputPort("ge_y", outGe);
+
+    const auto ltOp = graph.createOperation(OperationKind::kLt, graph.internSymbol("mixed_lt_y_op"));
+    graph.addOperand(ltOp, inA);
+    graph.addOperand(ltOp, inB);
+    graph.addResult(ltOp, outLt);
+
+    const auto leOp = graph.createOperation(OperationKind::kLe, graph.internSymbol("mixed_le_y_op"));
+    graph.addOperand(leOp, inA);
+    graph.addOperand(leOp, inB);
+    graph.addResult(leOp, outLe);
+
+    const auto gtOp = graph.createOperation(OperationKind::kGt, graph.internSymbol("mixed_gt_y_op"));
+    graph.addOperand(gtOp, inA);
+    graph.addOperand(gtOp, inB);
+    graph.addResult(gtOp, outGt);
+
+    const auto geOp = graph.createOperation(OperationKind::kGe, graph.internSymbol("mixed_ge_y_op"));
+    graph.addOperand(geOp, inA);
+    graph.addOperand(geOp, inB);
+    graph.addResult(geOp, outGe);
 
     return design;
 }
@@ -2498,8 +2612,29 @@ void testDifftestCompatibilityAccessorsUseTopLevelPorts()
            "top-level difftest_step port accessor should read emitted output port storage");
     expect(contains(header, "get_difftest__DOT__exit() const { return get_difftest_exit(); }"),
            "downstream compatibility difftest exit accessor should forward to top-level output port");
-    expect(contains(header, "get_difftest__DOT__step() const { return difftest_step_; }"),
-           "downstream compatibility difftest step accessor should keep the no-diff progress counter fallback");
+    expect(contains(header, "get_difftest__DOT__step() const { return get_difftest_step(); }"),
+           "downstream compatibility difftest step accessor should forward to the real top-level output port");
+
+    const std::string runner = R"CPP(
+#include "difftest_ports.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_step_in(0);
+    sim.settle();
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 1;
+    }
+    sim.set_step_in(7);
+    sim.settle();
+    if (sim.get_difftest__DOT__step() != 7) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "difftest_ports", runner);
 }
 
 void testFailureWithoutPriorMetadata()
@@ -3054,6 +3189,14 @@ void testDpicDirtyReplayIncludesProducerClosure()
     expect(replayCalls > 4,
            "dirty replay should include non-dirty producer shard closure before the dirty DPIC condition shard");
 
+    std::size_t shardCount = 0;
+    while (std::filesystem::exists(dir / ("dpic_closure_top_sched_" + std::to_string(shardCount) + ".cpp")))
+    {
+        ++shardCount;
+    }
+    expect(replayCalls < shardCount,
+           "dirty producer closure should not pull independent producer-only shards into replay");
+
     std::ofstream stub(dir / "difftest-dpic.h");
     if (!stub.is_open()) {
         throw std::runtime_error("failed to write dpic stub header");
@@ -3162,6 +3305,75 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "dpic_latch_top", runner);
+}
+
+void testResetReleaseKeepsPostResetReplayDirty()
+{
+    Design design = buildResetReleaseLatchDpicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "reset_release_post_reset_replay";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reset_release_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp reset-release fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp reset-release fixture should not emit errors");
+
+    const std::string source = readFile(dir / "reset_release_top.cpp");
+    expect(contains(source, "reset_ = false;\n        prev_clk_ = static_cast<bool>(input_clk_);\n        difftest_exit_ = 0;\n        clock_inputs_dirty_ = true;\n        non_clock_inputs_dirty_ = true;\n        activate_all_shards();\n        return;"),
+           "reset branch should preserve a post-reset dirty replay opportunity");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void dpi_capture(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "reset_release_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_reset(1);
+    sim.set_en(1);
+    sim.set_d(1);
+    sim.set_clk(0);
+    sim.commit_step();
+    if (sim.get_gate() != 0) {
+        return 1;
+    }
+    sim.set_reset(0);
+    sim.settle();
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "reset_release_top", runner);
 }
 
 void testNoDiffGuardedDpicCallsCompileOut()
@@ -3276,6 +3488,11 @@ int main() {
     }
     realHeader << "#pragma once\n"
                << "#include <cstdint>\n"
+               << "struct DpicHeaderMemsetProbe { std::uint8_t bytes[8]; };\n"
+               << "inline void difftest_header_memset_probe() {\n"
+               << "    DpicHeaderMemsetProbe buffer[1];\n"
+               << "    memset(buffer, 0, sizeof(buffer));\n"
+               << "}\n"
                << "extern \"C\" std::uint8_t v_difftest_ReturnValue(std::uint8_t value);\n"
                << "extern \"C\" void v_difftest_OutputValue(std::uint8_t *value);\n";
     realHeader.close();
@@ -3285,7 +3502,11 @@ int main() {
         const auto name = entry.path().filename().string();
         if (name.starts_with("dpic_no_diff_value_top_sched_") && name.ends_with(".cpp")) {
             const std::string shard = readFile(entry.path());
-            if (contains(shard, "#include \"difftest-dpic.h\"")) {
+            const auto cstringPos = shard.find("#include <cstring>");
+            const auto dpicHeaderPos = shard.find("#include \"difftest-dpic.h\"");
+            if (dpicHeaderPos != std::string::npos) {
+                expect(cstringPos != std::string::npos && cstringPos < dpicHeaderPos,
+                       "sharded value-producing v_difftest DPIC expressions should include <cstring> before the real difftest header");
                 shardIncludesDifftestHeader = true;
                 break;
             }
@@ -4263,6 +4484,110 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "compare_top", runner);
+}
+
+void testSignedCompareCompileAndRun()
+{
+    Design design = buildSignedCompareDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "signed_compare_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("signed_compare_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp signed compare fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp signed compare fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "signed_compare_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0xF); // signed 4-bit -1
+    sim.set_b(1);
+    sim.step();
+    if (sim.get_lt_y() != 1 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 0) {
+        return 1;
+    }
+    sim.set_a(7);
+    sim.set_b(0xFF); // signed 8-bit -1
+    sim.step();
+    if (sim.get_lt_y() != 0 || sim.get_le_y() != 0 || sim.get_gt_y() != 1 || sim.get_ge_y() != 1) {
+        return 2;
+    }
+    sim.set_a(0x17); // signed 4-bit +7; setter high bits must be ignored
+    sim.set_b(8);
+    sim.step();
+    if (sim.get_lt_y() != 1 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 0) {
+        return 3;
+    }
+    sim.set_a(0x8);  // signed 4-bit -8
+    sim.set_b(0xF8); // signed 8-bit -8
+    sim.step();
+    if (sim.get_lt_y() != 0 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 1) {
+        return 4;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "signed_compare_top", runner);
+}
+
+void testMixedSignedCompareCompileAndRun()
+{
+    Design design = buildMixedSignedCompareDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "mixed_signed_compare_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("mixed_signed_compare_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp mixed signed compare fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp mixed signed compare fixture should not emit errors");
+
+    const std::string runner = R"CPP(
+#include "mixed_signed_compare_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0xF); // signed 4-bit -1, but mixed compare is unsigned
+    sim.set_b(1);
+    sim.step();
+    if (sim.get_lt_y() != 0 || sim.get_le_y() != 0 || sim.get_gt_y() != 1 || sim.get_ge_y() != 1) {
+        return 1;
+    }
+    sim.set_a(0x8);  // signed 4-bit -8, compared as unsigned 8
+    sim.set_b(0xF8);
+    sim.step();
+    if (sim.get_lt_y() != 1 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 0) {
+        return 2;
+    }
+    sim.set_a(0x18); // declared 4-bit value is unsigned 8 after masking
+    sim.set_b(9);
+    sim.step();
+    if (sim.get_lt_y() != 1 || sim.get_le_y() != 1 || sim.get_gt_y() != 0 || sim.get_ge_y() != 0) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "mixed_signed_compare_top", runner);
 }
 
 void testXnorCompileAndRun()
@@ -6013,6 +6338,7 @@ int main()
         testNoOutputShardedDpicConditionReplaysDirtyInputs();
         testDpicDirtyReplayIncludesProducerClosure();
         testShardedDirtyReplaySettlesLatchBeforeDpicCondition();
+        testResetReleaseKeepsPostResetReplayDirty();
         testNoDiffGuardedDpicCallsCompileOut();
         testNoDiffGuardedValueDpicCallsDefaultOut();
         testNoDiffGuardedMultiResultDpicCallsDefaultOut();
@@ -6030,6 +6356,8 @@ int main()
         testLogicBinaryCompileAndRun();
         testCaseEqCompileAndRun();
         testCompareCompileAndRun();
+        testSignedCompareCompileAndRun();
+        testMixedSignedCompareCompileAndRun();
         testXnorCompileAndRun();
         testSliceStaticCompileAndRun();
         testConcatCompileAndRun();

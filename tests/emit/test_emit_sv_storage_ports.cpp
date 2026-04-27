@@ -123,6 +123,48 @@ Design buildDesign()
     return design;
 }
 
+Design buildMixedSignedCompareDesign()
+{
+    Design design;
+    Graph &graph = design.createGraph("mixed_signed_compare");
+    design.markAsTop(graph.symbol());
+
+    const auto lhs = graph.createValue(graph.internSymbol("a"), 4, true);
+    const auto rhs = graph.createValue(graph.internSymbol("b"), 8, false);
+    const auto ltOut = graph.createValue(graph.internSymbol("lt_y"), 1, false);
+    const auto leOut = graph.createValue(graph.internSymbol("le_y"), 1, false);
+    const auto gtOut = graph.createValue(graph.internSymbol("gt_y"), 1, false);
+    const auto geOut = graph.createValue(graph.internSymbol("ge_y"), 1, false);
+    graph.bindInputPort("a", lhs);
+    graph.bindInputPort("b", rhs);
+    graph.bindOutputPort("lt_y", ltOut);
+    graph.bindOutputPort("le_y", leOut);
+    graph.bindOutputPort("gt_y", gtOut);
+    graph.bindOutputPort("ge_y", geOut);
+
+    const auto lt = graph.createOperation(OperationKind::kLt, graph.internSymbol("mixed_lt"));
+    graph.addOperand(lt, lhs);
+    graph.addOperand(lt, rhs);
+    graph.addResult(lt, ltOut);
+
+    const auto le = graph.createOperation(OperationKind::kLe, graph.internSymbol("mixed_le"));
+    graph.addOperand(le, lhs);
+    graph.addOperand(le, rhs);
+    graph.addResult(le, leOut);
+
+    const auto gt = graph.createOperation(OperationKind::kGt, graph.internSymbol("mixed_gt"));
+    graph.addOperand(gt, lhs);
+    graph.addOperand(gt, rhs);
+    graph.addResult(gt, gtOut);
+
+    const auto ge = graph.createOperation(OperationKind::kGe, graph.internSymbol("mixed_ge"));
+    graph.addOperand(ge, lhs);
+    graph.addOperand(ge, rhs);
+    graph.addResult(ge, geOut);
+
+    return design;
+}
+
 } // namespace
 
 #ifndef WOLF_SV_EMIT_ARTIFACT_DIR
@@ -200,6 +242,39 @@ int main()
     if (output.find("lat_a = latch_data;") == std::string::npos)
     {
         return fail("Missing latch write");
+    }
+
+    {
+        Design compareDesign = buildMixedSignedCompareDesign();
+        EmitDiagnostics compareDiag;
+        EmitSystemVerilog compareEmitter(&compareDiag);
+        EmitOptions compareOptions;
+        compareOptions.outputDir = std::string(WOLF_SV_EMIT_ARTIFACT_DIR);
+        compareOptions.outputFilename = std::string("emit_mixed_signed_compare.sv");
+        const EmitResult compareResult = compareEmitter.emit(compareDesign, compareOptions);
+        if (!compareResult.success || compareDiag.hasError() || compareResult.artifacts.empty())
+        {
+            return fail("EmitSystemVerilog mixed signed compare fixture failed");
+        }
+
+        const std::string compareOutput = readFile(compareResult.artifacts.front());
+        const std::vector<std::string> mixedComparisons = {
+            "{{4{1'b0}},a} < b",
+            "{{4{1'b0}},a} <= b",
+            "{{4{1'b0}},a} > b",
+            "{{4{1'b0}},a} >= b",
+        };
+        for (const auto &comparison : mixedComparisons)
+        {
+            if (compareOutput.find(comparison) == std::string::npos)
+            {
+                return fail("Mixed signed/unsigned relational compare should zero-extend the narrower signed operand");
+            }
+        }
+        if (compareOutput.find("{{4{a[3]}},a}") != std::string::npos)
+        {
+            return fail("Mixed signed/unsigned relational compare must not sign-extend the signed operand");
+        }
     }
 
     return 0;
