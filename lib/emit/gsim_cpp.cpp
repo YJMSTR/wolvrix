@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
@@ -47,6 +48,11 @@ namespace wolvrix::lib::emit
             std::string returnType;
         };
 
+        constexpr std::uint8_t kDirtyReplayClock = 1U << 0U;
+        constexpr std::uint8_t kDirtyReplayNonClock = 1U << 1U;
+        constexpr std::uint8_t kDirtyReplayAll = kDirtyReplayClock | kDirtyReplayNonClock;
+        constexpr std::uint8_t kDirtyReplayDpicProducer = kDirtyReplayNonClock;
+
         // Code generation state for lowering GRH operations to C++
         struct CodegenState
         {
@@ -75,6 +81,7 @@ namespace wolvrix::lib::emit
             std::map<std::string, std::vector<std::string>> sequentialPreStmts;
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             std::map<std::string, std::vector<bool>> sequentialStmtDirtyOnCommit;
+            std::map<std::string, std::vector<std::vector<std::string>>> sequentialStmtActivitySources;
             std::map<std::string, std::map<std::string, std::vector<std::string>>> sequentialRegStmts;
             std::map<std::string, std::string> sequentialClockExprs;
 
@@ -109,12 +116,12 @@ namespace wolvrix::lib::emit
             // Plain strings avoid ostringstream formatting overhead and the final
             // full-buffer str() copy when writing XiangShan-scale shard files.
             std::vector<std::string> shardBuffers;
-            std::vector<bool> shardNeedsDirtyReplay;
+            std::vector<std::uint8_t> shardDirtyReplayMask;
             int currentShard = 0;
             int maxShardSize = 2097152; // 2MB per behavior shard
             int commitShardSize = 786432; // keep sequential commit translation units small enough for low optimization levels
             int currentShardSize = 0;
-            bool currentOpDependsOnDirtyInput = false;
+            std::uint8_t currentOpDirtyReplayMask = 0;
 
             // Flag to determine if sharding should be enabled based on operation count
             bool enableSharding = false;
@@ -123,8 +130,8 @@ namespace wolvrix::lib::emit
             // scheduler is available.
             bool enableActivityWatermark = false;
 
-            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> dirtyReplayRootInputs;
-            std::unordered_map<wolvrix::lib::grh::ValueId, bool, wolvrix::lib::grh::ValueIdHash> valueDependsOnDirtyInput;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::uint8_t, wolvrix::lib::grh::ValueIdHash> dirtyReplayRootMasks;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::uint8_t, wolvrix::lib::grh::ValueIdHash> valueDirtyReplayMasks;
 
             // Coarse activity tracking borrowed from grhsim's active-supernode model.
             // Memory-bounded XiangShan variant: remember the first sched shard touched by
@@ -158,7 +165,7 @@ namespace wolvrix::lib::emit
                 if (shardBuffers.empty() || currentShard >= static_cast<int>(shardBuffers.size())) {
                     shardBuffers.emplace_back();
                     shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
-                    shardNeedsDirtyReplay.push_back(false);
+                    shardDirtyReplayMask.push_back(0);
                     shardSuccessors.emplace_back();
                     currentShard = static_cast<int>(shardBuffers.size()) - 1;
                     currentShardSize = 0;
@@ -178,7 +185,7 @@ namespace wolvrix::lib::emit
                     if (currentShard >= static_cast<int>(shardBuffers.size())) {
                         shardBuffers.emplace_back();
                         shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
-                        shardNeedsDirtyReplay.push_back(false);
+                        shardDirtyReplayMask.push_back(0);
                         shardSuccessors.emplace_back();
                     }
                 }
@@ -220,10 +227,10 @@ namespace wolvrix::lib::emit
             }
 
             void markCurrentShardActivity() {
-                if (currentShard >= 0 && currentShard < static_cast<int>(shardNeedsDirtyReplay.size()) &&
-                    currentOpDependsOnDirtyInput)
+                if (currentShard >= 0 && currentShard < static_cast<int>(shardDirtyReplayMask.size()) &&
+                    currentOpDirtyReplayMask != 0)
                 {
-                    shardNeedsDirtyReplay[static_cast<std::size_t>(currentShard)] = true;
+                    shardDirtyReplayMask[static_cast<std::size_t>(currentShard)] |= currentOpDirtyReplayMask;
                 }
                 if (enableSharding && currentShard >= 0) {
                     if (currentOpFirstEmittedShard < 0) {
@@ -364,6 +371,7 @@ namespace wolvrix::lib::emit
             std::map<std::string, std::vector<std::string>> regStmts;
             std::vector<std::string> stmts;
             std::vector<bool> stmtDirtyOnCommit;
+            std::vector<std::vector<std::string>> stmtActivitySources;
             bool preReg = false;
         };
 
@@ -813,7 +821,7 @@ namespace wolvrix::lib::emit
                 }
                 return resultWidths[idx];
             };
-            bool opDependsOnDirtyInput = false;
+            std::uint8_t opDirtyReplayMask = 0;
             std::vector<std::string> directActivitySources;
             int opActivityFirstShard = -1;
             auto mergeFirstShard = [&](int shard) {
@@ -827,19 +835,20 @@ namespace wolvrix::lib::emit
             std::set<int> opDependencyProducerShards;
             for (const auto operand : operands)
             {
-                if (state.dirtyReplayRootInputs.count(operand) > 0)
+                if (const auto rootIt = state.dirtyReplayRootMasks.find(operand);
+                    rootIt != state.dirtyReplayRootMasks.end())
                 {
-                    opDependsOnDirtyInput = true;
+                    opDirtyReplayMask |= rootIt->second;
                     if (const auto sourceIt = state.inputActivitySourceNames.find(operand);
                         sourceIt != state.inputActivitySourceNames.end())
                     {
                         directActivitySources.push_back(sourceIt->second);
                     }
                 }
-                if (const auto it = state.valueDependsOnDirtyInput.find(operand);
-                    it != state.valueDependsOnDirtyInput.end() && it->second)
+                if (const auto it = state.valueDirtyReplayMasks.find(operand);
+                    it != state.valueDirtyReplayMasks.end())
                 {
-                    opDependsOnDirtyInput = true;
+                    opDirtyReplayMask |= it->second;
                 }
                 if (state.enableSharding) {
                     if (const auto producerIt = state.valueProducerShard.find(operand);
@@ -862,7 +871,7 @@ namespace wolvrix::lib::emit
                     }
                 }
             }
-            state.currentOpDependsOnDirtyInput = opDependsOnDirtyInput;
+            state.currentOpDirtyReplayMask = opDirtyReplayMask;
             state.currentOpFirstEmittedShard = -1;
             if (state.enableActivityWatermark) {
                 state.setCurrentActivity(std::move(directActivitySources), opActivityFirstShard);
@@ -895,12 +904,12 @@ namespace wolvrix::lib::emit
                 if (idx >= results.size()) {
                     return;
                 }
-                // Absence in valueDependsOnDirtyInput means false.  Do not insert
-                // the overwhelmingly common non-dirty entries: XiangShan-scale
-                // emit otherwise pays millions of hash insertions and stores a
-                // near-op-count boolean map during write_gsim_cpp.
-                if (opDependsOnDirtyInput) {
-                    state.valueDependsOnDirtyInput.emplace(results[idx], true);
+                // Absence in valueDirtyReplayMasks means no dirty replay
+                // dependency.  Do not insert the overwhelmingly common non-dirty
+                // entries: XiangShan-scale emit otherwise pays millions of hash
+                // insertions.
+                if (opDirtyReplayMask != 0) {
+                    state.valueDirtyReplayMasks.emplace(results[idx], opDirtyReplayMask);
                 }
                 const int resultProducerShard = state.enableSharding ? state.lastEmittedShard : -1;
                 if (resultProducerShard >= 0) {
@@ -1910,6 +1919,7 @@ namespace wolvrix::lib::emit
                         "        if (" + condition + ") { const auto __mem_idx = " + indexExpr + "; if (__mem_idx < state_->" +
                         memory.storageName + ".size()) { " + writeExpr + " committed_ = true; } }");
                     state.sequentialStmtDirtyOnCommit[domainKey].push_back(true);
+                    state.sequentialStmtActivitySources[domainKey].push_back({memory.storageName});
                     break;
                 }
 
@@ -2456,6 +2466,7 @@ namespace wolvrix::lib::emit
                     recordDpicCall(state, *target);
                     state.sequentialStmts[domainKey].push_back(guardNoDiffDpicStatement(std::move(stmt), *target));
                     state.sequentialStmtDirtyOnCommit[domainKey].push_back(false);
+                    state.sequentialStmtActivitySources[domainKey].push_back({});
                     break;
                 }
 
@@ -3289,6 +3300,9 @@ namespace wolvrix::lib::emit
                     const auto dirtyIt = state.sequentialStmtDirtyOnCommit.find(domainKey);
                     const std::vector<bool>* dirtyOnCommit =
                         dirtyIt != state.sequentialStmtDirtyOnCommit.end() ? &dirtyIt->second : nullptr;
+                    const auto activityIt = state.sequentialStmtActivitySources.find(domainKey);
+                    const std::vector<std::vector<std::string>>* stmtActivitySources =
+                        activityIt != state.sequentialStmtActivitySources.end() ? &activityIt->second : nullptr;
                     SequentialChunkPlan current;
                     current.domainKey = domainKey;
                     std::size_t currentBytes = 0;
@@ -3311,6 +3325,11 @@ namespace wolvrix::lib::emit
                         current.stmts.push_back(stmt);
                         current.stmtDirtyOnCommit.push_back(
                             dirtyOnCommit == nullptr || stmtIndex >= dirtyOnCommit->size() || (*dirtyOnCommit)[stmtIndex]);
+                        if (stmtActivitySources != nullptr && stmtIndex < stmtActivitySources->size()) {
+                            current.stmtActivitySources.push_back((*stmtActivitySources)[stmtIndex]);
+                        } else {
+                            current.stmtActivitySources.push_back({});
+                        }
                         currentBytes += estimatedBytes;
                     }
                     flushCurrent();
@@ -4106,7 +4125,9 @@ namespace wolvrix::lib::emit
                 for (int i = 0; i < state.shardCount(); ++i) {
                     os << "    void sched_" << i << "();\n";
                 }
-                os << "    void replay_dirty_input_shards();\n";
+                os << "    void replay_dirty_mask_shards(std::uint8_t replay_mask_);\n";
+                os << "    void replay_clock_input_shards();\n";
+                os << "    void replay_non_clock_input_shards();\n";
                 if (state.enableActivityWatermark) {
                     os << "    void activate_all_shards();\n";
                     os << "    void activate_shards(const std::uint32_t* indices, std::size_t count);\n";
@@ -4159,6 +4180,7 @@ namespace wolvrix::lib::emit
             os << "    SSimTopEvalTemps* evalTemps_;\n";
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    bool clock_inputs_dirty_ = true;\n";
+                os << "    bool committed_state_dirty_ = true;\n";
             }
             os << "    bool non_clock_inputs_dirty_ = true;\n";
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
@@ -4408,9 +4430,18 @@ namespace wolvrix::lib::emit
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                 os << "void SSimTop::activate_all_shards() {\n";
                 os << "    active_word_queue_.clear();\n";
-                os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
-                os << "    std::fill(active_word_queued_.begin(), active_word_queued_.end(), 0);\n";
-                os << "    for (std::uint32_t i = 0; i < " << state.shardCount() << "U; ++i) { activate_shard(i); }\n";
+                os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), ~UINT64_C(0));\n";
+                if ((state.shardCount() % 64U) == 0U) {
+                    os << "    if (!active_shard_words_.empty()) { active_shard_words_.back() = ~UINT64_C(0); }\n";
+                } else {
+                    const std::uint64_t lastActiveShardWordMask =
+                        (UINT64_C(1) << (state.shardCount() % 64U)) - UINT64_C(1);
+                    os << "    if (!active_shard_words_.empty()) { active_shard_words_.back() = UINT64_C("
+                       << lastActiveShardWordMask << "); }\n";
+                }
+                os << "    std::fill(active_word_queued_.begin(), active_word_queued_.end(), 1);\n";
+                os << "    active_word_queue_.reserve(active_shard_words_.size());\n";
+                os << "    for (std::uint32_t word = 0; word < active_shard_words_.size(); ++word) { active_word_queue_.push_back(word); }\n";
                 os << "}\n\n";
                 os << "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count) {\n";
                 os << "    for (std::size_t i = 0; i < count; ++i) { activate_shard(indices[i]); }\n";
@@ -4447,6 +4478,7 @@ namespace wolvrix::lib::emit
             }
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    clock_inputs_dirty_ = true;\n";
+                os << "    committed_state_dirty_ = true;\n";
             }
             os << "    non_clock_inputs_dirty_ = true;\n";
             if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
@@ -4473,7 +4505,7 @@ namespace wolvrix::lib::emit
             os << "void SSimTop::settle() {\n";
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    if (clock_inputs_dirty_) {\n";
-                os << "        replay_dirty_input_shards();\n";
+                os << "        replay_dirty_mask_shards(UINT8_C(" << static_cast<unsigned>(kDirtyReplayClock) << "));\n";
                 os << "        clock_inputs_dirty_ = false;\n";
                 os << "    }\n";
                 if (state.enableActivityWatermark) {
@@ -4550,26 +4582,73 @@ namespace wolvrix::lib::emit
             }
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    clock_inputs_dirty_ = false;\n";
+                os << "    committed_state_dirty_ = false;\n";
             }
             os << "    non_clock_inputs_dirty_ = false;\n";
             os << "}\n\n";
 
-            if (state.enableSharding && state.shardCount() > 0) {
-                os << "void SSimTop::replay_dirty_input_shards() {\n";
+            auto emitReplayMaskBody = [&]() {
                 for (int i = 0; i < state.shardCount(); ++i) {
-                    const bool needsDirtyReplay =
-                        i < static_cast<int>(state.shardNeedsDirtyReplay.size()) &&
-                        state.shardNeedsDirtyReplay[static_cast<std::size_t>(i)];
-                    if (needsDirtyReplay) {
-                        os << "    sched_" << i << "();\n";
+                    const std::uint8_t shardMask =
+                        i < static_cast<int>(state.shardDirtyReplayMask.size())
+                            ? state.shardDirtyReplayMask[static_cast<std::size_t>(i)]
+                            : 0;
+                    if (shardMask != 0) {
+                        os << "    if ((replay_mask_ & UINT8_C(" << static_cast<unsigned>(shardMask) << ")) != UINT8_C(0)) { sched_" << i << "();";
+                        if (state.enableActivityWatermark && i < static_cast<int>(state.shardSuccessors.size())) {
+                            const auto& succ = state.shardSuccessors[static_cast<std::size_t>(i)];
+                            if (!succ.empty()) {
+                                std::map<int, std::uint64_t> successorWordMasks;
+                                for (int successor : succ) {
+                                    if (successor < 0) {
+                                        continue;
+                                    }
+                                    const int word = successor / 64;
+                                    const int bit = successor % 64;
+                                    successorWordMasks[word] |= (std::uint64_t{1} << bit);
+                                }
+                                for (const auto& [word, mask] : successorWordMasks) {
+                                    os << " activate_shard_mask(" << word << "U, UINT64_C(" << mask << "));";
+                                }
+                            }
+                        }
+                        os << " }\n";
                     }
                 }
-                if (state.enableActivityWatermark) {
-                    os << "    if (active_word_queue_.empty()) { activate_all_shards(); }\n";
-                }
-                os << "    non_clock_inputs_dirty_ = false;\n";
+            };
+            if (state.enableSharding && state.shardCount() > 0) {
+                os << "void SSimTop::replay_dirty_mask_shards(std::uint8_t replay_mask_) {\n";
+                os << "    if (replay_mask_ == UINT8_C(0)) { return; }\n";
+                emitReplayMaskBody();
                 os << "}\n\n";
+                os << "void SSimTop::replay_clock_input_shards() { replay_dirty_mask_shards(UINT8_C(" << static_cast<unsigned>(kDirtyReplayClock) << ")); clock_inputs_dirty_ = false; }\n\n";
+                os << "void SSimTop::replay_non_clock_input_shards() { replay_dirty_mask_shards(UINT8_C(" << static_cast<unsigned>(kDirtyReplayNonClock) << ")); non_clock_inputs_dirty_ = false; }\n\n";
             }
+
+            auto emitPendingReplay = [&](std::string_view indent, bool includeClock, bool includeNonClock, bool includeCommitted) {
+                os << indent << "std::uint8_t replay_mask_ = UINT8_C(0);\n";
+                if (includeClock) {
+                    os << indent << "if (clock_inputs_dirty_) { replay_mask_ |= UINT8_C("
+                       << static_cast<unsigned>(kDirtyReplayClock) << "); }\n";
+                }
+                if (includeNonClock) {
+                    os << indent << "if (non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C("
+                       << static_cast<unsigned>(kDirtyReplayNonClock) << "); }\n";
+                }
+                os << indent << "if (replay_mask_ != UINT8_C(0)) {\n";
+                os << indent << "    dirty_replayed_ = true;\n";
+                os << indent << "    replay_dirty_mask_shards(replay_mask_);\n";
+                if (includeClock) {
+                    os << indent << "    clock_inputs_dirty_ = false;\n";
+                }
+                if (includeNonClock) {
+                    os << indent << "    non_clock_inputs_dirty_ = false;\n";
+                }
+                os << indent << "}\n";
+                if (includeCommitted) {
+                    os << indent << "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n";
+                }
+            };
 
             os << "void SSimTop::commit_step() {\n";
             os << "    bool committed_ = false;\n";
@@ -4641,6 +4720,7 @@ namespace wolvrix::lib::emit
                         os << "        difftest_exit_ = 0;\n";
                         if (state.enableSharding && state.shardCount() > 0) {
                             os << "        clock_inputs_dirty_ = true;\n";
+                            os << "        committed_state_dirty_ = true;\n";
                         }
                         os << "        non_clock_inputs_dirty_ = true;\n";
                         if (state.enableSharding && state.enableActivityWatermark) {
@@ -4653,12 +4733,10 @@ namespace wolvrix::lib::emit
                         if (!state.latchStmts.empty()) {
                             os << "        settle();\n";
                             os << "        dirty_replayed_ = true;\n";
-                            os << "        replay_dirty_input_shards();\n";
+                            os << "        replay_clock_input_shards();\n";
                         } else {
                             os << "        const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n";
-                            os << "        dirty_replayed_ = true;\n";
-                            os << "        replay_dirty_input_shards();\n";
-                            os << "        clock_inputs_dirty_ = false;\n";
+                            emitPendingReplay("        ", true, false, true);
                             os << "        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;\n";
                         }
                         os << "    }\n";
@@ -4679,10 +4757,9 @@ namespace wolvrix::lib::emit
                         if (!state.latchStmts.empty()) {
                             os << "        settle();\n";
                             os << "        dirty_replayed_ = true;\n";
-                            os << "        replay_dirty_input_shards();\n";
+                            os << "        replay_non_clock_input_shards();\n";
                         } else {
-                            os << "        dirty_replayed_ = true;\n";
-                            os << "        replay_dirty_input_shards();\n";
+                            emitPendingReplay("        ", false, true, true);
                         }
                     } else {
                         if (!state.outputPorts.empty()) {
@@ -4692,6 +4769,11 @@ namespace wolvrix::lib::emit
                         }
                     }
                     os << "    }\n";
+                    if (state.enableSharding && state.shardCount() > 0) {
+                        os << "    if (committed_state_dirty_) {\n";
+                        emitPendingReplay("        ", false, false, true);
+                        os << "    }\n";
+                    }
                     os << "    bool any_domain_reg_committed_ = false;\n";
                     for (const auto &domainKey : sequentialDomains) {
                         const auto parsedDomain = parseSequentialDomain(domainKey);
@@ -4713,27 +4795,23 @@ namespace wolvrix::lib::emit
                                                          ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
                                                          : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                         if (state.enableSharding && state.shardCount() > 0 && clockNeedsPreEdgeReplay) {
-                            os << "    if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
+                            os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
                             if (!state.latchStmts.empty()) {
                                 os << "        settle();\n";
-                                os << "        dirty_replayed_ = true;\n";
-                                os << "        replay_dirty_input_shards();\n";
+                                emitPendingReplay("        ", false, true, true);
                             } else {
-                                os << "        dirty_replayed_ = true;\n";
-                                os << "        replay_dirty_input_shards();\n";
+                                emitPendingReplay("        ", false, true, true);
                             }
                             os << "    }\n";
                         }
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
-                            os << "        if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
+                            os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
                             if (!state.latchStmts.empty()) {
                                 os << "            settle();\n";
-                                os << "            dirty_replayed_ = true;\n";
-                                os << "            replay_dirty_input_shards();\n";
+                                emitPendingReplay("            ", false, true, true);
                             } else {
-                                os << "            dirty_replayed_ = true;\n";
-                                os << "            replay_dirty_input_shards();\n";
+                                emitPendingReplay("            ", false, true, true);
                             }
                             os << "        }\n";
                         }
@@ -4747,7 +4825,7 @@ namespace wolvrix::lib::emit
                             os << "            committed_ = true;\n";
                             os << "            any_domain_reg_committed_ = true;\n";
                             if (state.enableSharding && state.shardCount() > 0) {
-                                os << "            non_clock_inputs_dirty_ = true;\n";
+                                os << "            committed_state_dirty_ = true;\n";
                                 os << "            dirty_replayed_ = false;\n";
                             }
                             os << "        }\n";
@@ -4811,14 +4889,12 @@ namespace wolvrix::lib::emit
                                                          : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
-                            os << "        if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
+                            os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
                             if (!state.latchStmts.empty()) {
                                 os << "            settle();\n";
-                                os << "            dirty_replayed_ = true;\n";
-                                os << "            replay_dirty_input_shards();\n";
+                                emitPendingReplay("            ", false, true, true);
                             } else {
-                                os << "            dirty_replayed_ = true;\n";
-                                os << "            replay_dirty_input_shards();\n";
+                                emitPendingReplay("            ", false, true, true);
                             }
                             os << "        }\n";
                         }
@@ -4833,11 +4909,8 @@ namespace wolvrix::lib::emit
                             os << "        }\n";
                             if (state.enableSharding && state.shardCount() > 0) {
                                 os << "        if (domain_stmt_dirty_) {\n";
-                                os << "            non_clock_inputs_dirty_ = true;\n";
+                                os << "            committed_state_dirty_ = true;\n";
                                 os << "            dirty_replayed_ = false;\n";
-                                if (state.enableActivityWatermark) {
-                                    os << "            activate_all_shards();\n";
-                                }
                                 os << "        }\n";
                             }
                         } else if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
@@ -4867,7 +4940,7 @@ namespace wolvrix::lib::emit
                             }
                             if (state.enableSharding && state.shardCount() > 0) {
                                 os << "        if (domain_stmt_dirty_) {\n";
-                                os << "            non_clock_inputs_dirty_ = true;\n";
+                                os << "            committed_state_dirty_ = true;\n";
                                 os << "            dirty_replayed_ = false;\n";
                                 if (state.enableActivityWatermark) {
                                     os << "            activate_all_shards();\n";
@@ -4896,6 +4969,7 @@ namespace wolvrix::lib::emit
                     os << "        difftest_exit_ = 0;\n";
                     if (state.enableSharding && state.shardCount() > 0) {
                         os << "        clock_inputs_dirty_ = true;\n";
+                        os << "        committed_state_dirty_ = true;\n";
                     }
                     os << "        non_clock_inputs_dirty_ = true;\n";
                     if (state.enableSharding && state.enableActivityWatermark) {
@@ -4905,7 +4979,7 @@ namespace wolvrix::lib::emit
                     os << "    }\n";
             }
             if (state.enableSharding && state.shardCount() > 0) {
-                os << "    if (!post_commit_settled_ && (non_clock_inputs_dirty_ || dirty_replayed_)) {\n";
+                os << "    if (!post_commit_settled_ && (non_clock_inputs_dirty_ || committed_state_dirty_ || dirty_replayed_)) {\n";
             } else {
                 os << "    if (!post_commit_settled_ && (committed_ || non_clock_inputs_dirty_)) {\n";
             }
@@ -5135,6 +5209,9 @@ namespace wolvrix::lib::emit
             if (!tracksStatementDirty) {
                 os << "    (void)dirty_on_commit_;\n";
             }
+            if (tracksStatementDirty) {
+                os << "    bool chunk_dirty_on_commit_ = false;\n";
+            }
             if (!chunk.regNames.empty()) {
                 os << "    bool chunk_updated_ = false;\n";
             }
@@ -5176,11 +5253,40 @@ namespace wolvrix::lib::emit
                     os << indent << "activate_all_shards(); ";
                 }
             };
+            auto emitActivitySourceTouches = [&](const std::vector<std::string>& sources, std::string_view indent) {
+                if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
+                    return;
+                }
+                std::set<int> firstShards;
+                for (const auto& source : sources) {
+                    if (const auto headsIt = state.activitySourceHeadShards.find(source);
+                        headsIt != state.activitySourceHeadShards.end()) {
+                        firstShards.insert(headsIt->second.begin(), headsIt->second.end());
+                        continue;
+                    }
+                    if (const auto shardIt = state.activitySourceFirstShard.find(source);
+                        shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
+                        firstShards.insert(shardIt->second);
+                    }
+                }
+                if (!firstShards.empty()) {
+                    os << indent << "static constexpr std::uint32_t kTouchedStmtFirstShards[] = {";
+                    bool first = true;
+                    for (int firstShard : firstShards) {
+                        os << (first ? "" : ", ") << firstShard << "U";
+                        first = false;
+                    }
+                    os << "}; activate_shards(kTouchedStmtFirstShards, "
+                       << firstShards.size() << "U); ";
+                } else {
+                    os << indent << "activate_all_shards(); ";
+                }
+            };
             auto emitStatement = [&](std::string s, bool dirtyOnCommit = false) {
                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
                 if (dirtyOnCommit) {
                     const std::string needle = "committed_ = true;";
-                    const std::string replacement = "dirty_on_commit_ = true; committed_ = true;";
+                    const std::string replacement = "chunk_dirty_on_commit_ = true; dirty_on_commit_ = true; committed_ = true;";
                     std::size_t pos = 0;
                     while ((pos = s.find(needle, pos)) != std::string::npos) {
                         s.replace(pos, needle.size(), replacement);
@@ -5339,6 +5445,32 @@ namespace wolvrix::lib::emit
             for (std::size_t stmtIndex = 0; stmtIndex < chunk.stmts.size(); ++stmtIndex) {
                 emitStatement(chunk.stmts[stmtIndex],
                               tracksStatementDirty && chunk.stmtDirtyOnCommit[stmtIndex]);
+            }
+            if (tracksStatementDirty && state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
+                std::vector<std::string> dirtyActivitySources;
+                std::set<std::string> seenSources;
+                bool hasDirtyStatementWithoutSources = false;
+                for (std::size_t stmtIndex = 0; stmtIndex < chunk.stmts.size(); ++stmtIndex) {
+                    if (!chunk.stmtDirtyOnCommit[stmtIndex]) {
+                        continue;
+                    }
+                    if (stmtIndex >= chunk.stmtActivitySources.size() ||
+                        chunk.stmtActivitySources[stmtIndex].empty()) {
+                        hasDirtyStatementWithoutSources = true;
+                        continue;
+                    }
+                    for (const auto& source : chunk.stmtActivitySources[stmtIndex]) {
+                        if (seenSources.insert(source).second) {
+                            dirtyActivitySources.push_back(source);
+                        }
+                    }
+                }
+                if (hasDirtyStatementWithoutSources) {
+                    dirtyActivitySources.clear();
+                }
+                os << "    if (chunk_dirty_on_commit_) { ";
+                emitActivitySourceTouches(dirtyActivitySources, "");
+                os << "}\n";
             }
             if (!chunk.regNames.empty()) {
                 os << "    if (chunk_updated_) {\n";
@@ -5537,7 +5669,8 @@ namespace wolvrix::lib::emit
         state.enableSharding = metadata->opCount > 128;
         const std::size_t reserveOps = static_cast<std::size_t>(std::max<std::int64_t>(metadata->opCount, 0));
         state.valueVars.reserve(reserveOps);
-        state.valueDependsOnDirtyInput.reserve(reserveOps);
+        state.valueDirtyReplayMasks.reserve(reserveOps);
+        state.dirtyReplayRootMasks.reserve(target->graph->inputPorts().size());
         if (state.enableSharding) {
             state.valueProducerShard.reserve(reserveOps / 4U + 1024U);
             state.valueProducerOpIndex.reserve(reserveOps / 4U + 1024U);
@@ -5571,11 +5704,11 @@ namespace wolvrix::lib::emit
             sequentialClockInputs.insert(resolveSequentialClockStateName(parsedDomain->second, state.inputPorts));
         }
         for (const auto &port : target->graph->inputPorts()) {
-            if (sequentialClockInputs.count(port.name) > 0) {
-                continue;
-            }
-            state.dirtyReplayRootInputs.insert(port.value);
-            state.valueDependsOnDirtyInput[port.value] = true;
+            const std::uint8_t replayMask = sequentialClockInputs.count(port.name) > 0
+                ? kDirtyReplayClock
+                : kDirtyReplayNonClock;
+            state.dirtyReplayRootMasks[port.value] = replayMask;
+            state.valueDirtyReplayMasks[port.value] = replayMask;
             if (state.enableActivityWatermark) {
                 state.inputActivitySourceNames[port.value] = "input_" + sanitizeIdentifier(port.name);
             }
@@ -5625,9 +5758,9 @@ namespace wolvrix::lib::emit
                     const int firstShard = state.opProducerFirstShardByIndex[static_cast<std::size_t>(opIndex)];
                     const int lastShard = state.opProducerLastShardByIndex[static_cast<std::size_t>(opIndex)];
                     if (firstShard >= 0 && lastShard >= firstShard) {
-                        const int maxShard = static_cast<int>(state.shardNeedsDirtyReplay.size()) - 1;
+                        const int maxShard = static_cast<int>(state.shardDirtyReplayMask.size()) - 1;
                         for (int shard = firstShard; shard <= lastShard && shard <= maxShard; ++shard) {
-                            state.shardNeedsDirtyReplay[static_cast<std::size_t>(shard)] = true;
+                            state.shardDirtyReplayMask[static_cast<std::size_t>(shard)] |= kDirtyReplayDpicProducer;
                         }
                     }
                 }
@@ -5648,8 +5781,8 @@ namespace wolvrix::lib::emit
         // that base shard before a later clock edge, otherwise a low-phase input
         // step can clear the dirty flag while leaving commit conditions/RHS temps
         // at reset defaults.
-        if (state.enableSharding && (!state.sequentialStmts.empty() || !state.sequentialRegStmts.empty()) && !state.shardNeedsDirtyReplay.empty()) {
-            state.shardNeedsDirtyReplay.front() = true;
+        if (state.enableSharding && (!state.sequentialStmts.empty() || !state.sequentialRegStmts.empty()) && !state.shardDirtyReplayMask.empty()) {
+            state.shardDirtyReplayMask.front() |= kDirtyReplayAll;
         }
         // Check for unsupported operations
         if (!state.unsupportedOps.empty()) {

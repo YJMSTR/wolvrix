@@ -1169,10 +1169,12 @@ Design buildMemoryWriteDesign()
     const auto wen = makeValue(graph, "wen", 1, false);
     const auto addr = makeValue(graph, "addr", 2, false);
     const auto data = makeValue(graph, "data", 8, false);
+    auto padding = makeValue(graph, "padding_in", 1, false);
     graph.bindInputPort("clk", clk);
     graph.bindInputPort("wen", wen);
     graph.bindInputPort("addr", addr);
     graph.bindInputPort("data", data);
+    graph.bindInputPort("padding_in", padding);
 
     (void)makeMemory(graph, 8, 4, "mem0");
     const auto read = makeMemoryRead(graph, "read_data", "read_data_op", 8, addr, "mem0");
@@ -1180,6 +1182,15 @@ Design buildMemoryWriteDesign()
 
     const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
     makeMemoryWrite(graph, "write_port", wen, addr, data, mask, clk, "mem0");
+    for (int i = 0; i < 130; ++i) {
+        const auto next = makeValue(graph, "memory_write_padding_value_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("memory_write_padding_not_" + std::to_string(i)));
+        graph.addOperand(op, padding);
+        graph.addResult(op, next);
+        padding = next;
+    }
+    graph.bindOutputPort("padding_out", padding);
 
     return design;
 }
@@ -3172,9 +3183,9 @@ void testNoOutputShardedDpicConditionReplaysDirtyInputs()
     const std::string source = readFile(dir / "dpic_no_output_top.cpp");
     expect(!contains(source, "if (sequential_edge_pending_) {\n            non_clock_inputs_dirty_ = false;"),
            "sequential edge with no output ports must not drop pending dirty input replay before DPIC conditions");
-    expect(contains(source, "dirty_replayed_ = true;\n        replay_dirty_input_shards();"),
+    expect(contains(source, "if (non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C(2); }\n        if (replay_mask_ != UINT8_C(0)) {\n            dirty_replayed_ = true;\n            replay_dirty_mask_shards(replay_mask_);"),
            "sequential edge should replay dirty input shards before sampling no-output DPIC conditions");
-    expect(contains(source, "if (!post_commit_settled_ && (non_clock_inputs_dirty_ || dirty_replayed_))"),
+    expect(contains(source, "if (!post_commit_settled_ && (non_clock_inputs_dirty_ || committed_state_dirty_ || dirty_replayed_))"),
            "sharded final settle should not run solely for input-only DPIC side-effect commits");
     const std::string chunk = readFile(dir / "dpic_no_output_top_commit_chunk_posedge_clk_0.cpp");
     expect(contains(chunk, "bool& dirty_on_commit_"),
@@ -3247,11 +3258,11 @@ void testDpicDirtyReplayIncludesProducerClosure()
     expect(!diags.hasError(), "EmitGsimCpp should not report DPIC producer-closure fixture errors");
 
     const std::string source = readFile(dir / "dpic_closure_top.cpp");
-    const std::string marker = "void SSimTop::replay_dirty_input_shards() {";
+    const std::string marker = "void SSimTop::replay_dirty_mask_shards(std::uint8_t replay_mask_) {";
     const auto markerPos = source.find(marker);
     expect(markerPos != std::string::npos,
-           "producer-closure fixture should emit replay_dirty_input_shards helper");
-    const auto endPos = source.find("}\n\nvoid SSimTop::commit_step()", markerPos);
+           "producer-closure fixture should emit replay_non_clock_input_shards helper");
+    const auto endPos = source.find("}\n\nvoid SSimTop::replay_clock_input_shards()", markerPos);
     expect(endPos != std::string::npos,
            "producer-closure fixture should place replay helper before commit_step");
     const std::string replayBody = source.substr(markerPos, endPos - markerPos);
@@ -3406,7 +3417,7 @@ void testResetReleaseKeepsPostResetReplayDirty()
     expect(!diags.hasError(), "EmitGsimCpp reset-release fixture should not emit errors");
 
     const std::string source = readFile(dir / "reset_release_top.cpp");
-    expect(contains(source, "reset_ = false;\n        prev_clk_ = static_cast<bool>(input_clk_);\n        difftest_exit_ = 0;\n        clock_inputs_dirty_ = true;\n        non_clock_inputs_dirty_ = true;\n        activate_all_shards();\n        return;"),
+    expect(contains(source, "reset_ = false;\n        prev_clk_ = static_cast<bool>(input_clk_);\n        difftest_exit_ = 0;\n        clock_inputs_dirty_ = true;\n        committed_state_dirty_ = true;\n        non_clock_inputs_dirty_ = true;\n        activate_all_shards();\n        return;"),
            "reset branch should preserve a post-reset dirty replay opportunity");
 
     std::ofstream stub(dir / "difftest-dpic.h");
@@ -4063,8 +4074,10 @@ void testDerivedClockEdgesSeePriorDomainCommits()
     const std::string source = readFile(dir / "derived_clock_top.cpp");
     expect(contains(source, "dirty_replayed_ = false;"),
            "committed register domains should invalidate dirty replay before later derived-clock edge checks");
-    expect(contains(source, "if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n        dirty_replayed_ = true;\n        replay_dirty_input_shards();\n    }\n    if ((!prev_gated_clk_"),
+    expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n        std::uint8_t replay_mask_ = UINT8_C(0);\n        if (non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C(2); }\n        if (replay_mask_ != UINT8_C(0)) {\n            dirty_replayed_ = true;\n            replay_dirty_mask_shards(replay_mask_);"),
            "derived-clock edge checks should replay dirty shards before evaluating the edge expression");
+    expect(contains(source, "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n    }\n    if ((!prev_gated_clk_"),
+           "derived-clock edge checks should drain touched committed-state shards before evaluating the edge expression");
 
     const std::string runner = R"CPP(
 #include "derived_clock_top.hpp"
@@ -4110,9 +4123,9 @@ void testSettlePreservesDerivedClockInputEdges()
     expect(!diags.hasError(), "EmitGsimCpp settled derived-clock fixture should not emit errors");
 
     const std::string source = readFile(dir / "settled_clock_top.cpp");
-    expect(contains(source, "void SSimTop::settle() {\n    if (clock_inputs_dirty_) {\n        replay_dirty_input_shards();\n        clock_inputs_dirty_ = false;"),
+    expect(contains(source, "void SSimTop::settle() {\n    if (clock_inputs_dirty_) {\n        replay_dirty_mask_shards(UINT8_C(1));"),
            "settle should replay clock-dependent dirty shards before clearing clock_inputs_dirty_");
-    expect(contains(source, "const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n        dirty_replayed_ = true;\n        replay_dirty_input_shards();\n        clock_inputs_dirty_ = false;\n        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;"),
+    expect(contains(source, "const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n        std::uint8_t replay_mask_ = UINT8_C(0);\n        if (clock_inputs_dirty_) { replay_mask_ |= UINT8_C(1); }\n        if (replay_mask_ != UINT8_C(0)) {\n            dirty_replayed_ = true;\n            replay_dirty_mask_shards(replay_mask_);\n            clock_inputs_dirty_ = false;\n        }\n        if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;"),
            "clock-input replay should not consume pending non-clock dirty state");
 
     const std::string runner = R"CPP(
@@ -4168,7 +4181,7 @@ void testDpicSamplesPostSequentialSettleState()
            "DPIC post-sequential fixture should seed the upstream producer shard without expanding to every shard");
     expect(!contains(source, "#ifndef CONFIG_NO_DIFFTEST\n        static constexpr std::uint32_t kDpicPreSettleShards"),
            "runtime DPIC calls should keep pre-DPIC settle even in no-diff builds");
-    expect(contains(source, "if (domain_reg_committed_) {\n            committed_ = true;\n            any_domain_reg_committed_ = true;\n            non_clock_inputs_dirty_ = true;\n            dirty_replayed_ = false;"),
+    expect(contains(source, "if (domain_reg_committed_) {\n            committed_ = true;\n            any_domain_reg_committed_ = true;\n            committed_state_dirty_ = true;\n            dirty_replayed_ = false;"),
            "chunked register commits should invalidate dirty replay and activate post-commit settle work");
     const std::string chunk = readFile(dir / "dpic_post_seq_top_commit_chunk_posedge_clk_1.cpp");
     expect(!contains(chunk, "dirty_on_commit_ = true;"),
@@ -4336,6 +4349,12 @@ void testMemoryWriteCompileAndRun()
     const std::string chunk = readFile(dir / "memory_write_top_commit_chunk_posedge_clk_0.cpp");
     expect(contains(chunk, "dirty_on_commit_ = true; committed_ = true;"),
            "memory-write statement chunks should still invalidate dirty replay after internal state mutation");
+    expect(contains(chunk, "kTouchedStmtFirstShards"),
+           "memory-write statement chunks should activate memory-reader shards through touched-state tables");
+    expect(contains(chunk, "activate_shards(kTouchedStmtFirstShards"),
+           "memory-write statement chunks should use compact touched-state activation");
+    expect(!contains(chunk, "activate_all_shards();"),
+           "memory-write statement chunks should not globally wake every sched shard when memory reader metadata exists");
 
     const std::string runner = R"CPP(
 #include "memory_write_top.hpp"
@@ -5777,8 +5796,8 @@ void testMediumGraphsEnableSharding()
     expect(std::filesystem::exists(dir / "medium_sharded_top_sched_0.cpp"),
            "medium-size graphs should emit at least one sched shard once sharding is enabled");
     const std::string source = readFile(dir / "medium_sharded_top.cpp");
-    expect(contains(source, "void SSimTop::replay_dirty_input_shards() {"),
-           "medium-size sharded fixture should emit replay_dirty_input_shards helper");
+    expect(contains(source, "void SSimTop::replay_non_clock_input_shards() {"),
+           "medium-size sharded fixture should emit replay_non_clock_input_shards helper");
 }
 
 void testDirtyReplayEdgeWithoutCommitRefreshesOutputs()
@@ -5805,11 +5824,11 @@ void testDirtyReplayEdgeWithoutCommitRefreshesOutputs()
     const std::string source = readFile(dir / "dirty_replay_no_commit_top.cpp");
     expect(contains(source, "bool dirty_replayed_ = false;"),
            "sharded commit_step should track edge-local dirty replay");
-    expect(contains(source, "non_clock_inputs_dirty_ || dirty_replayed_"),
+    expect(contains(source, "non_clock_inputs_dirty_ || committed_state_dirty_ || dirty_replayed_"),
            "sharded commit_step should settle after dirty replay even when no commit happens");
     expect(!contains(source, "if (sequential_edge_pending_) {\n            settle();"),
            "sharded dirty replay should not run a full settle before sampling sequential edge conditions");
-    expect(contains(source, "if (non_clock_inputs_dirty_ && !dirty_replayed_)"),
+    expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_)"),
            "sharded commit_step should not replay dirty shards between domains within one edge snapshot");
 
     const std::string runner = R"CPP(
@@ -5863,11 +5882,11 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     expect(!diags.hasError(), "EmitGsimCpp selective-replay fixture should not emit diagnostics");
 
     const std::string source = readFile(dir / "selective_replay_top.cpp");
-    const std::string marker = "void SSimTop::replay_dirty_input_shards() {";
+    const std::string marker = "void SSimTop::replay_dirty_mask_shards(std::uint8_t replay_mask_) {";
     const auto markerPos = source.find(marker);
     expect(markerPos != std::string::npos,
-           "selective-replay fixture should emit replay_dirty_input_shards helper");
-    const auto endPos = source.find("}\n\nvoid SSimTop::commit_step()", markerPos);
+           "selective-replay fixture should emit replay_non_clock_input_shards helper");
+    const auto endPos = source.find("}\n\nvoid SSimTop::replay_clock_input_shards()", markerPos);
     expect(endPos != std::string::npos,
            "selective-replay fixture should place replay helper before commit_step");
     const std::string replayBody = source.substr(markerPos, endPos - markerPos);
@@ -5905,6 +5924,12 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "settle should enqueue cross-word successors as packed active-word masks");
     expect(contains(source, "active_bits_ |= kShardSuccessorMask"),
            "same-word successor activation should stay in the local active-word bitmap");
+    expect(contains(source, "std::fill(active_shard_words_.begin(), active_shard_words_.end(), ~UINT64_C(0));"),
+           "activate_all_shards should bulk-fill active shard words instead of looping per shard");
+    expect(!contains(source, "for (std::uint32_t i = 0; i < ") || !contains(source, "activate_shard(i);"),
+           "activate_all_shards should not activate every shard through the per-shard helper");
+    expect(!contains(replayBody, "active_word_queue_.empty()) { activate_all_shards(); }"),
+           "dirty replay helper should enqueue replayed-shard successors instead of falling back to all shards");
 }
 
 
