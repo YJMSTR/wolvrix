@@ -1907,17 +1907,20 @@ namespace wolvrix::lib::emit
                     const std::string maskExpr = getOperandExpr(3);
                     std::string writeExpr;
                     if (memory.width > 64) {
-                        writeExpr = "state_->" + memory.storageName + "[__mem_idx] = wolvrix_gsim_mask_merge(" +
-                                    "state_->" + memory.storageName + "[__mem_idx], " + dataExpr + ", " + maskExpr + ");";
-                    } else if (maskExpr != "0") {
-                        writeExpr = "state_->" + memory.storageName + "[__mem_idx] = (state_->" + memory.storageName +
-                                    "[__mem_idx] & ~" + maskExpr + ") | (" + dataExpr + " & " + maskExpr + ");";
+                        writeExpr = "if (wolvrix_gsim_mask_merge_in_place(state_->" + memory.storageName +
+                                    "[__mem_idx], " + dataExpr + ", " + maskExpr + ")) { committed_ = true; }";
                     } else {
-                        writeExpr = "state_->" + memory.storageName + "[__mem_idx] = " + dataExpr + ";";
+                        writeExpr = "const auto __mem_mask_ = static_cast<" + memory.rowType + ">(" + maskExpr +
+                                    "); const auto __mem_next_ = static_cast<" + memory.rowType + ">((state_->" +
+                                    memory.storageName + "[__mem_idx] & static_cast<" + memory.rowType +
+                                    ">(~__mem_mask_)) | (static_cast<" + memory.rowType + ">(" + dataExpr +
+                                    ") & __mem_mask_)); if (state_->" + memory.storageName +
+                                    "[__mem_idx] != __mem_next_) { state_->" + memory.storageName +
+                                    "[__mem_idx] = __mem_next_; committed_ = true; }";
                     }
                     state.sequentialStmts[domainKey].push_back(
                         "        if (" + condition + ") { const auto __mem_idx = " + indexExpr + "; if (__mem_idx < state_->" +
-                        memory.storageName + ".size()) { " + writeExpr + " committed_ = true; } }");
+                        memory.storageName + ".size()) { " + writeExpr + " } }");
                     state.sequentialStmtDirtyOnCommit[domainKey].push_back(true);
                     state.sequentialStmtActivitySources[domainKey].push_back({memory.storageName});
                     break;
@@ -4758,17 +4761,6 @@ namespace wolvrix::lib::emit
                             os << "        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;\n";
                         }
                         os << "    }\n";
-                    }
-                    os << "    bool sequential_edge_pending_ = false;\n";
-                    for (const auto &domainState : domainClockExprs) {
-                        const auto parsedDomain = parseSequentialDomain(domainState.first);
-                        const std::string edge = parsedDomain->first;
-                        const std::string prevClockState = prevClockStateNameForDomain(domainState.first);
-                        const std::string prevClock = "prev_" + prevClockState + "_";
-                        const std::string edgeExpr = edge == "posedge"
-                                                         ? "(!" + prevClock + " && static_cast<bool>(" + domainState.second + "))"
-                                                         : "(" + prevClock + " && !static_cast<bool>(" + domainState.second + "))";
-                        os << "    if (" << edgeExpr << ") { sequential_edge_pending_ = true; }\n";
                     }
                     os << "    if (non_clock_inputs_dirty_) {\n";
                     if (state.enableSharding && state.shardCount() > 0) {

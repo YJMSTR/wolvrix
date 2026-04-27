@@ -1195,6 +1195,31 @@ Design buildMemoryWriteDesign()
     return design;
 }
 
+Design buildMemoryZeroMaskWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto wen = makeValue(graph, "wen", 1, false);
+    const auto addr = makeValue(graph, "addr", 2, false);
+    const auto data = makeValue(graph, "data", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("wen", wen);
+    graph.bindInputPort("addr", addr);
+    graph.bindInputPort("data", data);
+
+    (void)makeMemory(graph, 8, 4, "mem0");
+    const auto read = makeMemoryRead(graph, "read_data", "read_data_op", 8, addr, "mem0");
+    graph.bindOutputPort("q", read);
+
+    const auto zeroMask = makeConstant(graph, "zero_mask", "zero_mask_const", 8, "8'h00");
+    makeMemoryWrite(graph, "zero_mask_write_port", wen, addr, data, zeroMask, clk, "mem0");
+
+    return design;
+}
+
 Design buildLatchWriteDesign()
 {
     Design design;
@@ -4362,8 +4387,12 @@ void testMemoryWriteCompileAndRun()
 
     const std::string source = readFile(dir / "memory_write_top.cpp");
     const std::string chunk = readFile(dir / "memory_write_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "if (state_->mem_mem0_[__mem_idx] != __mem_next_)"),
+           "memory-write chunks should compare old and merged values before marking state dirty");
     expect(contains(chunk, "dirty_on_commit_ = true; committed_ = true;"),
-           "memory-write statement chunks should still invalidate dirty replay after internal state mutation");
+           "memory-write statement chunks should invalidate dirty replay only after internal state mutation");
+    expect(!contains(chunk, "state_->mem_mem0_[__mem_idx] = (state_->mem_mem0_[__mem_idx]"),
+           "memory-write chunks should not assign masked scalar rows unconditionally");
     expect(contains(chunk, "kTouchedStmtFirstShards"),
            "memory-write statement chunks should activate memory-reader shards through touched-state tables");
     expect(contains(chunk, "activate_shards(kTouchedStmtFirstShards"),
@@ -4403,6 +4432,60 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "memory_write_top", runner);
+}
+
+void testMemoryZeroMaskWriteCompileAndRun()
+{
+    Design design = buildMemoryZeroMaskWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "memory_zero_mask_write_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("memory_zero_mask_write_top");
+    options.topOverrides = {"top"};
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp zero-mask memory-write fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp zero-mask memory-write fixture should not emit errors");
+
+    const std::string chunk = readFile(dir / "memory_zero_mask_write_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "__mem_mask_"),
+           "zero-mask memory writes should still use masked row-merge semantics");
+    expect(!contains(chunk, "state_->mem_mem0_[__mem_idx] = input_data_;"),
+           "zero-mask memory writes must not be lowered as unconditional full-row writes");
+
+    const std::string runner = R"CPP(
+#include "memory_zero_mask_write_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.set_wen(0);
+    sim.set_addr(2);
+    sim.step();
+    if (sim.get_q() != 0xA5) {
+        return 1;
+    }
+    sim.set_wen(1);
+    sim.set_data(0x3C);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0xA5) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "memory_zero_mask_write_top", runner);
 }
 
 void testLatchWriteCompileAndRun()
@@ -6487,6 +6570,7 @@ int main()
         testLatchWriteCompileAndRun();
         testMemoryReadCompileAndRun();
         testMemoryWriteCompileAndRun();
+        testMemoryZeroMaskWriteCompileAndRun();
         testLogicBinaryCompileAndRun();
         testCaseEqCompileAndRun();
         testCompareCompileAndRun();
