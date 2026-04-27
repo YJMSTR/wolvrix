@@ -841,10 +841,6 @@ namespace wolvrix::lib::emit
                 {
                     opDependsOnDirtyInput = true;
                 }
-                if (graph.valueIsInput(operand))
-                {
-                    opDependsOnDirtyInput = true;
-                }
                 if (state.enableSharding) {
                     if (const auto producerIt = state.valueProducerShard.find(operand);
                         producerIt != state.valueProducerShard.end() && producerIt->second >= 0)
@@ -1761,6 +1757,24 @@ namespace wolvrix::lib::emit
 
                 case OperationKind::kMemory: {
                     // Memory declarations are handled during storage collection.
+                    break;
+                }
+
+                case OperationKind::kInstance: {
+                    auto instanceNameAttr = op.attr("instanceName");
+                    auto moduleNameAttr = op.attr("moduleName");
+                    std::string opName = op.symbolText().empty() ? "unnamed" : std::string(op.symbolText());
+                    if (instanceNameAttr) {
+                        if (auto *instanceName = std::get_if<std::string>(&*instanceNameAttr); instanceName != nullptr && !instanceName->empty()) {
+                            opName = *instanceName;
+                        }
+                    }
+                    if (moduleNameAttr) {
+                        if (auto *moduleName = std::get_if<std::string>(&*moduleNameAttr); moduleName != nullptr && !moduleName->empty()) {
+                            opName += ":" + *moduleName;
+                        }
+                    }
+                    state.unsupportedOps.push_back("kInstance (" + opName + ")");
                     break;
                 }
 

@@ -2753,6 +2753,83 @@ void testFailureOnStaleMetadataAfterDestructiveMutation()
     expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
 }
 
+void seedSingleCombGsimScratchpad(Design &design,
+                                  const Graph &graph,
+                                  OperationId op,
+                                  const std::string &descriptor)
+{
+    const auto opIndex = static_cast<int64_t>(op.index);
+    const std::string &graphSymbol = graph.symbol();
+    const std::string prefix = "gsim." + graphSymbol + ".";
+    const std::vector<int64_t> opList{opIndex};
+    const std::map<std::string, std::vector<int64_t>> combMembers{{"comb", opList}};
+    const std::map<std::string, std::string> combClass{{"comb", "combinational"}};
+
+    design.setScratchpad(prefix + "roots", opList);
+    design.setScratchpad(prefix + "event_groups", combMembers);
+    design.setScratchpad(prefix + "event_group_names", std::vector<std::string>{"comb"});
+    design.setScratchpad(prefix + "schedule.activity_order", std::vector<std::string>{"comb"});
+    design.setScratchpad(prefix + "schedule.activity_members", combMembers);
+    design.setScratchpad(prefix + "schedule.activity_classes", combClass);
+    design.setScratchpad(prefix + "hypergraph.node_names", std::vector<std::string>{"comb"});
+    design.setScratchpad(prefix + "hypergraph.node_members", combMembers);
+    design.setScratchpad(prefix + "hypergraph.edge_names", std::vector<std::string>{"comb"});
+    design.setScratchpad(prefix + "hypergraph.edge_sources", std::map<std::string, std::string>{{"comb", "comb"}});
+    design.setScratchpad(prefix + "hypergraph.edge_targets", std::map<std::string, std::string>{{"comb", "comb"}});
+    design.setScratchpad(prefix + "hypergraph.edge_sinks", combMembers);
+    design.setScratchpad(prefix + "topology.order", opList);
+    design.setScratchpad(prefix + "topology.predecessors", std::map<int64_t, std::vector<int64_t>>{{opIndex, {}}});
+    design.setScratchpad(prefix + "topology.successors", std::map<int64_t, std::vector<int64_t>>{{opIndex, {}}});
+    design.setScratchpad(prefix + "ops.classification", std::map<int64_t, std::string>{{opIndex, "combinational"}});
+    design.setScratchpad(prefix + "ops.descriptors", std::vector<std::string>{descriptor});
+    design.setScratchpad(prefix + "schedule.kind", std::string("activity-v1"));
+    design.setScratchpad(prefix + "schedule.version", static_cast<int64_t>(1));
+    design.setScratchpad(prefix + "schedule.contract", std::string("gsim.activity.schedule.v1"));
+    design.setScratchpad(prefix + "hypergraph.kind", std::string("activity-connectivity-v1"));
+    design.setScratchpad(prefix + "hypergraph.version", static_cast<int64_t>(1));
+    design.setScratchpad(prefix + "hypergraph.contract", std::string("gsim.activity.hypergraph.v1"));
+    design.setScratchpad(prefix + "graph_symbol", graphSymbol);
+    design.setScratchpad(prefix + "op_count", static_cast<int64_t>(1));
+    design.setScratchpad(prefix + "graph_revision", static_cast<int64_t>(graph.revision()));
+}
+
+void testFailureOnUninlinedInstance()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "a", 1, false);
+    const auto out = makeValue(graph, "y", 1, false);
+    graph.bindInputPort("a", in);
+    graph.bindOutputPort("y", out);
+    const auto instanceOp = graph.createOperation(OperationKind::kInstance, graph.internSymbol("u_leaf_op"));
+    graph.setAttr(instanceOp, "instanceName", std::string("u_leaf"));
+    graph.setAttr(instanceOp, "moduleName", std::string("leaf"));
+    graph.setAttr(instanceOp, "inputPortName", std::vector<std::string>{"a"});
+    graph.setAttr(instanceOp, "outputPortName", std::vector<std::string>{"y"});
+    graph.setAttr(instanceOp, "inoutPortName", std::vector<std::string>{});
+    graph.addOperand(instanceOp, in);
+    graph.addResult(instanceOp, out);
+
+    seedSingleCombGsimScratchpad(design, graph, instanceOp, "kInstance u_leaf");
+
+    const auto dir = artifactRoot() / "uninlined_instance";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "EmitGsimCpp should reject un-inlined kInstance operations");
+    expect(diags.hasError(), "un-inlined kInstance should produce diagnostics");
+    expectDiagnosticsContain(diags, "kInstance");
+    expectDiagnosticsContain(diags, "u_leaf:leaf");
+}
+
 void testGraphOnlyAndMultiHopTargetSelectionConsistency()
 {
     {
@@ -6329,6 +6406,7 @@ int main()
         testFailureOnNamespacePathMismatch();
         testFailureOnStaleMetadataAfterMutation();
         testFailureOnStaleMetadataAfterDestructiveMutation();
+        testFailureOnUninlinedInstance();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();
         testSingleClockRuntimeCompileAndRun();
