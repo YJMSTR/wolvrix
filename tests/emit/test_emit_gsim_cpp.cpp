@@ -1945,9 +1945,11 @@ Design buildWideMaskedRegisterDesign()
     const auto clk = makeValue(graph, "clk", 1, false);
     const auto d = makeValue(graph, "d", 130, false);
     const auto mask = makeValue(graph, "mask", 130, false);
+    auto padding = makeValue(graph, "padding_in", 1, false);
     graph.bindInputPort("clk", clk);
     graph.bindInputPort("d", d);
     graph.bindInputPort("mask", mask);
+    graph.bindInputPort("padding_in", padding);
 
     (void)makeRegister(graph, "state_storage", "state_reg", 130, "state");
     const auto stateRead = makeRegisterRead(graph, "state_read", "state_read_op", 130, "state");
@@ -1955,6 +1957,16 @@ Design buildWideMaskedRegisterDesign()
 
     const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
     makeRegisterWrite(graph, "state_write", one, d, mask, clk, "state");
+    for (int i = 0; i < 130; ++i)
+    {
+        const auto next = makeValue(graph, "wide_masked_padding_value_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("wide_masked_padding_not_" + std::to_string(i)));
+        graph.addOperand(op, padding);
+        graph.addResult(op, next);
+        padding = next;
+    }
+    graph.bindOutputPort("padding_out", padding);
 
     return design;
 }
@@ -3183,7 +3195,9 @@ void testNoOutputShardedDpicConditionReplaysDirtyInputs()
     const std::string source = readFile(dir / "dpic_no_output_top.cpp");
     expect(!contains(source, "if (sequential_edge_pending_) {\n            non_clock_inputs_dirty_ = false;"),
            "sequential edge with no output ports must not drop pending dirty input replay before DPIC conditions");
-    expect(contains(source, "if (non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C(2); }\n        if (replay_mask_ != UINT8_C(0)) {\n            dirty_replayed_ = true;\n            replay_dirty_mask_shards(replay_mask_);"),
+    expect(contains(source, "replay_pending_for_commit(dirty_replayed_, false, true);") &&
+               contains(source, "if (include_non_clock_ && non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C(2); }") &&
+               contains(source, "replay_dirty_mask_shards(replay_mask_);"),
            "sequential edge should replay dirty input shards before sampling no-output DPIC conditions");
     expect(contains(source, "if (!post_commit_settled_ && (non_clock_inputs_dirty_ || committed_state_dirty_ || dirty_replayed_))"),
            "sharded final settle should not run solely for input-only DPIC side-effect commits");
@@ -4074,9 +4088,10 @@ void testDerivedClockEdgesSeePriorDomainCommits()
     const std::string source = readFile(dir / "derived_clock_top.cpp");
     expect(contains(source, "dirty_replayed_ = false;"),
            "committed register domains should invalidate dirty replay before later derived-clock edge checks");
-    expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n        std::uint8_t replay_mask_ = UINT8_C(0);\n        if (non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C(2); }\n        if (replay_mask_ != UINT8_C(0)) {\n            dirty_replayed_ = true;\n            replay_dirty_mask_shards(replay_mask_);"),
+    expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n        replay_pending_for_commit(dirty_replayed_, false, true);"),
            "derived-clock edge checks should replay dirty shards before evaluating the edge expression");
-    expect(contains(source, "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n    }\n    if ((!prev_gated_clk_"),
+    expect(contains(source, "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n}\n\nvoid SSimTop::commit_step()") &&
+               contains(source, "replay_pending_for_commit(dirty_replayed_, false, true);\n    }\n    if ((!prev_gated_clk_"),
            "derived-clock edge checks should drain touched committed-state shards before evaluating the edge expression");
 
     const std::string runner = R"CPP(
@@ -4125,7 +4140,7 @@ void testSettlePreservesDerivedClockInputEdges()
     const std::string source = readFile(dir / "settled_clock_top.cpp");
     expect(contains(source, "void SSimTop::settle() {\n    if (clock_inputs_dirty_) {\n        replay_dirty_mask_shards(UINT8_C(1));"),
            "settle should replay clock-dependent dirty shards before clearing clock_inputs_dirty_");
-    expect(contains(source, "const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n        std::uint8_t replay_mask_ = UINT8_C(0);\n        if (clock_inputs_dirty_) { replay_mask_ |= UINT8_C(1); }\n        if (replay_mask_ != UINT8_C(0)) {\n            dirty_replayed_ = true;\n            replay_dirty_mask_shards(replay_mask_);\n            clock_inputs_dirty_ = false;\n        }\n        if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;"),
+    expect(contains(source, "const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n        replay_pending_for_commit(dirty_replayed_, true, false);\n        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;"),
            "clock-input replay should not consume pending non-clock dirty state");
 
     const std::string runner = R"CPP(
@@ -5600,12 +5615,26 @@ void testWideMaskedRegisterCompileAndRun()
     options.outputDir = dir.string();
     options.outputFilename = std::string("wide_masked_register_top");
     options.topOverrides = {"top"};
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp wide masked-register fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp wide masked-register fixture should not emit errors");
 
-    const std::string header = readFile(dir / "wide_masked_register_top_internal.hpp");
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "wolvrix_gsim_mask_merge_in_place"),
+           "wide masked register should use direct in-place masked commit");
+    expect(contains(generatedSources, "if (chunk_updated_)"),
+           "direct in-place commit should use one coalesced chunk activation");
+    expect(!contains(generatedSources, "kTouchedStateFirstShards_reg_"),
+           "direct in-place commits should not emit one touched-state table per register");
 
     const std::string runner = R"CPP(
 #include "wide_masked_register_top.hpp"
@@ -6182,6 +6211,8 @@ void testRegisterPipelineUsesNonBlockingSemantics()
            "activity watermark should activate only shards touched by changed register state");
     expect(contains(generatedSources, "activate_shards(kTouchedStateFirstShards"),
            "activity watermark should use compact touched-state activation tables");
+    expect(!contains(generatedSources, "activate_shards(kTouchedStateFirstShards_"),
+           "direct state writes should coalesce activity activation at the commit-chunk level");
     const std::string runner = R"CPP(
 #include "pipeline_top.hpp"
 #include <array>

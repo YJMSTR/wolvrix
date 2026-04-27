@@ -4128,6 +4128,7 @@ namespace wolvrix::lib::emit
                 os << "    void replay_dirty_mask_shards(std::uint8_t replay_mask_);\n";
                 os << "    void replay_clock_input_shards();\n";
                 os << "    void replay_non_clock_input_shards();\n";
+                os << "    void replay_pending_for_commit(bool& dirty_replayed_, bool include_clock_, bool include_non_clock_);\n";
                 if (state.enableActivityWatermark) {
                     os << "    void activate_all_shards();\n";
                     os << "    void activate_shards(const std::uint32_t* indices, std::size_t count);\n";
@@ -4623,9 +4624,29 @@ namespace wolvrix::lib::emit
                 os << "}\n\n";
                 os << "void SSimTop::replay_clock_input_shards() { replay_dirty_mask_shards(UINT8_C(" << static_cast<unsigned>(kDirtyReplayClock) << ")); clock_inputs_dirty_ = false; }\n\n";
                 os << "void SSimTop::replay_non_clock_input_shards() { replay_dirty_mask_shards(UINT8_C(" << static_cast<unsigned>(kDirtyReplayNonClock) << ")); non_clock_inputs_dirty_ = false; }\n\n";
+                os << "void SSimTop::replay_pending_for_commit(bool& dirty_replayed_, bool include_clock_, bool include_non_clock_) {\n";
+                os << "    std::uint8_t replay_mask_ = UINT8_C(0);\n";
+                os << "    if (include_clock_ && clock_inputs_dirty_) { replay_mask_ |= UINT8_C("
+                   << static_cast<unsigned>(kDirtyReplayClock) << "); }\n";
+                os << "    if (include_non_clock_ && non_clock_inputs_dirty_) { replay_mask_ |= UINT8_C("
+                   << static_cast<unsigned>(kDirtyReplayNonClock) << "); }\n";
+                os << "    if (replay_mask_ != UINT8_C(0)) {\n";
+                os << "        dirty_replayed_ = true;\n";
+                os << "        replay_dirty_mask_shards(replay_mask_);\n";
+                os << "        if (include_clock_) { clock_inputs_dirty_ = false; }\n";
+                os << "        if (include_non_clock_) { non_clock_inputs_dirty_ = false; }\n";
+                os << "    }\n";
+                os << "    if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n";
+                os << "}\n\n";
             }
 
             auto emitPendingReplay = [&](std::string_view indent, bool includeClock, bool includeNonClock, bool includeCommitted) {
+                if (includeCommitted) {
+                    os << indent << "replay_pending_for_commit(dirty_replayed_, "
+                       << (includeClock ? "true" : "false") << ", "
+                       << (includeNonClock ? "true" : "false") << ");\n";
+                    return;
+                }
                 os << indent << "std::uint8_t replay_mask_ = UINT8_C(0);\n";
                 if (includeClock) {
                     os << indent << "if (clock_inputs_dirty_) { replay_mask_ |= UINT8_C("
@@ -4645,9 +4666,6 @@ namespace wolvrix::lib::emit
                     os << indent << "    non_clock_inputs_dirty_ = false;\n";
                 }
                 os << indent << "}\n";
-                if (includeCommitted) {
-                    os << indent << "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n";
-                }
             };
 
             os << "void SSimTop::commit_step() {\n";
@@ -5224,35 +5242,6 @@ namespace wolvrix::lib::emit
                                   stmt.find("wolvrix_gsim_mask_merge") != std::string::npos;
                        });
             };
-            auto emitRegTouch = [&](const std::string& regName, std::string_view indent) {
-                if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
-                    return;
-                }
-                std::set<int> firstShards;
-                if (const auto headsIt = state.activitySourceHeadShards.find(regName);
-                    headsIt != state.activitySourceHeadShards.end()) {
-                    firstShards.insert(headsIt->second.begin(), headsIt->second.end());
-                }
-                if (firstShards.empty()) {
-                    if (const auto shardIt = state.activitySourceFirstShard.find(regName);
-                        shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
-                        firstShards.insert(shardIt->second);
-                    }
-                }
-                if (!firstShards.empty()) {
-                    os << indent << "static constexpr std::uint32_t kTouchedStateFirstShards_"
-                       << sanitizeIdentifier(regName) << "[] = {";
-                    bool first = true;
-                    for (int firstShard : firstShards) {
-                        os << (first ? "" : ", ") << firstShard << "U";
-                        first = false;
-                    }
-                    os << "}; activate_shards(kTouchedStateFirstShards_" << sanitizeIdentifier(regName)
-                       << ", " << firstShards.size() << "U); ";
-                } else {
-                    os << indent << "activate_all_shards(); ";
-                }
-            };
             auto emitActivitySourceTouches = [&](const std::vector<std::string>& sources, std::string_view indent) {
                 if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
                     return;
@@ -5410,21 +5399,17 @@ namespace wolvrix::lib::emit
                         maskMergeArgs && (*maskMergeArgs)[0] == stateExpr) {
                         os << "    if (" << parsed->condition << ") { if (wolvrix_gsim_mask_merge_in_place("
                            << stateExpr << ", " << (*maskMergeArgs)[1] << ", " << (*maskMergeArgs)[2]
-                           << ")) { ";
-                        emitRegTouch(regName, "");
-                        os << "chunk_updated_ = true; committed_ = true; } }\n";
+                           << ")) { chunk_updated_ = true; committed_ = true; } }\n";
                     } else if (isSimpleWideLvalue(parsed->rhs)) {
                         os << "    if (" << parsed->condition << ") { if (" << stateExpr << " != " << parsed->rhs
-                           << ") { " << stateExpr << " = " << parsed->rhs << "; ";
-                        emitRegTouch(regName, "");
-                        os << "chunk_updated_ = true; committed_ = true; } }\n";
+                           << ") { " << stateExpr << " = " << parsed->rhs
+                           << "; chunk_updated_ = true; committed_ = true; } }\n";
                     } else {
                         const std::string tempName = "direct_next_" + regName;
                         os << "    if (" << parsed->condition << ") { auto " << tempName << " = " << parsed->rhs
                            << "; if (" << stateExpr << " != " << tempName << ") { " << stateExpr
-                           << " = std::move(" << tempName << "); ";
-                        emitRegTouch(regName, "");
-                        os << "chunk_updated_ = true; committed_ = true; } }\n";
+                           << " = std::move(" << tempName
+                           << "); chunk_updated_ = true; committed_ = true; } }\n";
                     }
                     continue;
                 }
@@ -5433,9 +5418,7 @@ namespace wolvrix::lib::emit
                     const std::string tempName = "direct_next_" + regName;
                     os << "    if (" << parsed->condition << ") { const auto " << tempName << " = " << parsed->rhs
                        << "; if (" << stateExpr << " != " << tempName << ") { " << stateExpr
-                       << " = " << tempName << "; ";
-                    emitRegTouch(regName, "");
-                    os << "chunk_updated_ = true; committed_ = true; } }\n";
+                       << " = " << tempName << "; chunk_updated_ = true; committed_ = true; } }\n";
                     continue;
                 }
                 for (const auto &stmt : regStmtIt->second) {
