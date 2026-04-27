@@ -104,6 +104,7 @@ namespace wolvrix::lib::emit
             bool emitsNoDiffGuardedDpicCalls = false;
             bool emitsRuntimeDpicCalls = false;
             bool enableDpicTrace = false;
+            bool enableXsZeroRetireTrace = false;
             std::size_t dpicTraceCallSite = 0;
             std::size_t dpicMaterializedCallSite = 0;
             std::set<int> dpicPreSettleShards;
@@ -2431,6 +2432,43 @@ namespace wolvrix::lib::emit
                         const std::string hitsName = "dpic_hits_" + std::to_string(callSite) + "_";
                         const std::string missesName = "dpic_misses_" + std::to_string(callSite) + "_";
                         const bool traceFalseSamples = true;
+                        auto appendRound36XsZeroRetireTrace = [&]() {
+                            if (!state.enableXsZeroRetireTrace) {
+                                return;
+                            }
+                            if (*target != "v_difftest_InstrCommit") {
+                                return;
+                            }
+                            if (state.tempU8Count <= 2516282U || state.stateU8Count <= 236509U) {
+                                return;
+                            }
+                            auto appendTempU8 = [&](std::string_view label, std::size_t index) {
+                                stmt += " << \" r36_" + std::string(label) +
+                                        "=\" << static_cast<std::uint64_t>(evalTemps_->tempU8[" +
+                                        std::to_string(index) + "])";
+                            };
+                            auto appendStateU8 = [&](std::string_view label, std::size_t index) {
+                                stmt += " << \" r36_" + std::string(label) +
+                                        "=\" << static_cast<std::uint64_t>(state_->stateU8[" +
+                                        std::to_string(index) + "])";
+                            };
+                            appendTempU8("t1903395", 1903395);
+                            appendTempU8("t2516282", 2516282);
+                            appendStateU8("s78873", 78873);
+                            appendStateU8("hc0", 92257);
+                            appendStateU8("hc1", 92258);
+                            appendStateU8("hc2", 92259);
+                            appendStateU8("hc3", 92260);
+                            appendStateU8("hc4", 92261);
+                            appendStateU8("deq0_v", 92274);
+                            appendStateU8("deq0_w", 92275);
+                            appendStateU8("deq1_v", 92304);
+                            appendStateU8("deq1_w", 92305);
+                            appendStateU8("redirectValid", 93751);
+                            appendStateU8("redirectAll", 93752);
+                            appendStateU8("flushLast", 77454);
+                            appendStateU8("endpointValid", 236509);
+                        };
                         stmt = "        { const bool " + condName + " = static_cast<bool>(" + condition + "); ";
                         stmt += "static bool " + seenName + " = false; static unsigned " + hitsName + " = 0; ";
                         if (traceFalseSamples) {
@@ -2440,18 +2478,21 @@ namespace wolvrix::lib::emit
                         for (std::size_t i = 0; i < args.size(); ++i) {
                             stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                         }
+                        appendRound36XsZeroRetireTrace();
                         stmt += " << \"\\n\"; " + seenName + " = true; } ";
                         if (traceFalseSamples) {
                             stmt += "if (!" + condName + ") { ++" + missesName + "; if (" + missesName + " <= 16U || (" + missesName + " % 1024U) == 0U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " miss=\" << " + missesName;
                             for (std::size_t i = 0; i < args.size(); ++i) {
                                 stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                             }
+                            appendRound36XsZeroRetireTrace();
                             stmt += " << \"\\n\"; } } ";
                         }
                         stmt += "if (" + condName + ") { ++" + hitsName + "; if (" + hitsName + " <= 16U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " hit=\" << " + hitsName;
                         for (std::size_t i = 0; i < args.size(); ++i) {
                             stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                         }
+                        appendRound36XsZeroRetireTrace();
                         stmt += " << \"\\n\"; } " + *target + "(";
                     } else {
                         stmt = "        if (" + condition + ") { " + *target + "(";
@@ -4591,33 +4632,56 @@ namespace wolvrix::lib::emit
             os << "    non_clock_inputs_dirty_ = false;\n";
             os << "}\n\n";
 
-            auto emitReplayMaskBody = [&]() {
-                for (int i = 0; i < state.shardCount(); ++i) {
-                    const std::uint8_t shardMask =
-                        i < static_cast<int>(state.shardDirtyReplayMask.size())
-                            ? state.shardDirtyReplayMask[static_cast<std::size_t>(i)]
-                            : 0;
-                    if (shardMask != 0) {
-                        os << "    if ((replay_mask_ & UINT8_C(" << static_cast<unsigned>(shardMask) << ")) != UINT8_C(0)) { sched_" << i << "();";
-                        if (state.enableActivityWatermark && i < static_cast<int>(state.shardSuccessors.size())) {
-                            const auto& succ = state.shardSuccessors[static_cast<std::size_t>(i)];
-                            if (!succ.empty()) {
-                                std::map<int, std::uint64_t> successorWordMasks;
-                                for (int successor : succ) {
-                                    if (successor < 0) {
-                                        continue;
-                                    }
-                                    const int word = successor / 64;
-                                    const int bit = successor % 64;
-                                    successorWordMasks[word] |= (std::uint64_t{1} << bit);
-                                }
-                                for (const auto& [word, mask] : successorWordMasks) {
-                                    os << " activate_shard_mask(" << word << "U, UINT64_C(" << mask << "));";
-                                }
+            auto emitReplayShardBody = [&](int shard) {
+                os << "        sched_" << shard << "();";
+                if (state.enableActivityWatermark && shard < static_cast<int>(state.shardSuccessors.size())) {
+                    const auto& succ = state.shardSuccessors[static_cast<std::size_t>(shard)];
+                    if (!succ.empty()) {
+                        std::map<int, std::uint64_t> successorWordMasks;
+                        for (int successor : succ) {
+                            if (successor < 0) {
+                                continue;
                             }
+                            const int word = successor / 64;
+                            const int bit = successor % 64;
+                            successorWordMasks[word] |= (std::uint64_t{1} << bit);
                         }
-                        os << " }\n";
+                        for (const auto& [word, mask] : successorWordMasks) {
+                            os << " activate_shard_mask(" << word << "U, UINT64_C(" << mask << "));";
+                        }
                     }
+                }
+                os << "\n";
+            };
+            auto emitReplayMaskBody = [&]() {
+                int shard = 0;
+                while (shard < state.shardCount()) {
+                    const std::uint8_t shardMask =
+                        shard < static_cast<int>(state.shardDirtyReplayMask.size())
+                            ? state.shardDirtyReplayMask[static_cast<std::size_t>(shard)]
+                            : 0;
+                    if (shardMask == 0) {
+                        ++shard;
+                        continue;
+                    }
+                    int runEnd = shard + 1;
+                    while (runEnd < state.shardCount()) {
+                        const std::uint8_t nextMask =
+                            runEnd < static_cast<int>(state.shardDirtyReplayMask.size())
+                                ? state.shardDirtyReplayMask[static_cast<std::size_t>(runEnd)]
+                                : 0;
+                        if (nextMask != shardMask) {
+                            break;
+                        }
+                        ++runEnd;
+                    }
+                    os << "    if ((replay_mask_ & UINT8_C(" << static_cast<unsigned>(shardMask)
+                       << ")) != UINT8_C(0)) {\n";
+                    for (int replayShard = shard; replayShard < runEnd; ++replayShard) {
+                        emitReplayShardBody(replayShard);
+                    }
+                    os << "    }\n";
+                    shard = runEnd;
                 }
             };
             if (state.enableSharding && state.shardCount() > 0) {
@@ -5628,6 +5692,8 @@ namespace wolvrix::lib::emit
         state.commitShardSize = parsePositiveIntAttr(options, "commit_shard_max_bytes", state.commitShardSize);
         state.enableActivityWatermark = attrEnabled(options, "activity_shard_watermark", false);
         state.enableDpicTrace = attrEnabled(options, "dpic_trace", false);
+        state.enableXsZeroRetireTrace =
+            state.enableDpicTrace && attrEnabled(options, "xs_zero_retire_trace", false);
         state.dpicGlobalWarmupSteps = parsePositiveIntAttr(options, "dpic_global_warmup_steps", 0);
         const bool emitMetadata = attrEnabled(options, "emit_metadata", true);
         std::vector<std::string> outputKeepPrefixes;

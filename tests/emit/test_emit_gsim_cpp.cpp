@@ -6017,10 +6017,19 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
         ++replayCalls;
         searchPos += 6;
     }
+    std::size_t replayGuards = 0;
+    searchPos = 0;
+    while ((searchPos = replayBody.find("if ((replay_mask_ & UINT8_C(", searchPos)) != std::string::npos)
+    {
+        ++replayGuards;
+        searchPos += 29;
+    }
 
     expect(replayCalls > 0, "selective-replay fixture should replay at least one shard");
     expect(replayCalls < shardCount,
            "selective-replay fixture should skip shards that never depend on dirty non-clock inputs");
+    expect(replayGuards > 0 && replayGuards < replayCalls,
+           "dirty replay should share one mask guard across consecutive shards with the same replay mask");
     const std::string header = readFile(dir / "selective_replay_top.hpp");
     expect(contains(header, "std::vector<std::uint64_t> active_shard_words_"),
            "sharded runtime should carry packed active-shard worklist words");
