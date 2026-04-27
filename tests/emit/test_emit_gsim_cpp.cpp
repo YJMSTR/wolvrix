@@ -459,6 +459,305 @@ Design buildDpicCallDesign()
     return design;
 }
 
+Design buildNoOutputShardedDpicConditionDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    auto enCurrent = makeValue(graph, "en", 1, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("en", enCurrent);
+    graph.bindInputPort("clk", clk);
+
+    for (int i = 0; i < 140; ++i)
+    {
+        const auto next = makeValue(graph, "en_chain_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("en_chain_not_" + std::to_string(i)));
+        graph.addOperand(op, enCurrent);
+        graph.addResult(op, next);
+        enCurrent = next;
+    }
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture"));
+    graph.addOperand(dpiCall, enCurrent);
+    graph.addOperand(dpiCall, enCurrent);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
+Design buildNoOutputDpicConditionWithProducerClosureDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto en = makeValue(graph, "en", 1, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("en", en);
+    graph.bindInputPort("clk", clk);
+
+    const auto constSeed = makeConstant(graph, "const_seed", "const_seed_op", 1, "1'b1");
+    auto constCurrent = constSeed;
+    for (int i = 0; i < 176; ++i)
+    {
+        const auto next = makeValue(graph, "producer_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("producer_not_" + std::to_string(i)));
+        graph.addOperand(op, constCurrent);
+        graph.addResult(op, next);
+        constCurrent = next;
+    }
+
+    const auto cond = makeValue(graph, "capture_cond", 1, false);
+    const auto andOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("capture_cond_and"));
+    graph.addOperand(andOp, en);
+    graph.addOperand(andOp, constCurrent);
+    graph.addResult(andOp, cond);
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture"));
+    graph.addOperand(dpiCall, cond);
+    graph.addOperand(dpiCall, cond);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
+Design buildNoOutputLatchGatedDpicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto en = makeValue(graph, "en", 1, false);
+    const auto d = makeValue(graph, "d", 1, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("en", en);
+    graph.bindInputPort("d", d);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeLatch(graph, "gate_latch_decl", 1, "gate_latch");
+    const auto gate = makeLatchRead(graph, "gate_latch_q", "gate_latch_read", 1, "gate_latch");
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 1, "1'b1");
+    const auto latchWrite = graph.createOperation(OperationKind::kLatchWritePort, graph.internSymbol("gate_latch_write"));
+    graph.addOperand(latchWrite, en);
+    graph.addOperand(latchWrite, d);
+    graph.addOperand(latchWrite, mask);
+    graph.setAttr(latchWrite, "latchSymbol", std::string("gate_latch"));
+
+    for (int i = 0; i < 140; ++i)
+    {
+        (void)makeConstant(graph, "latch_padding_const_" + std::to_string(i),
+                           "latch_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture_latch"));
+    graph.addOperand(dpiCall, gate);
+    graph.addOperand(dpiCall, gate);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
+Design buildNoDiffDifftestDpicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_TestEvent"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_difftest_event"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, clk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("v_difftest_TestEvent"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    for (int i = 0; i < 140; ++i)
+    {
+        (void)makeConstant(graph, "difftest_padding_const_" + std::to_string(i),
+                           "difftest_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
+Design buildNoDiffValueDifftestDpicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    const auto one = makeConstant(graph, "value_one", "value_one_const", 1, "1'b1");
+
+    const auto returnImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_ReturnValue"));
+    graph.setAttr(returnImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(returnImport, "argsWidth", std::vector<int64_t>{1});
+    graph.setAttr(returnImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(returnImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(returnImport, "argsType", std::vector<std::string>{"bit"});
+    graph.setAttr(returnImport, "hasReturn", true);
+    graph.setAttr(returnImport, "returnType", std::string("byte"));
+
+    const auto returnValue = makeValue(graph, "return_value", 8, false);
+    const auto returnCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_return_value"));
+    graph.addOperand(returnCall, one);
+    graph.addOperand(returnCall, one);
+    graph.addOperand(returnCall, clk);
+    graph.addResult(returnCall, returnValue);
+    graph.setAttr(returnCall, "targetImportSymbol", std::string("v_difftest_ReturnValue"));
+    graph.setAttr(returnCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(returnCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(returnCall, "hasReturn", true);
+    graph.setAttr(returnCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(returnCall, "clkPolarity", std::string("posedge"));
+    graph.bindOutputPort("ret", returnValue);
+
+    const auto outputImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_OutputValue"));
+    graph.setAttr(outputImport, "argsDirection", std::vector<std::string>{"output"});
+    graph.setAttr(outputImport, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(outputImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(outputImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(outputImport, "argsType", std::vector<std::string>{"byte"});
+    graph.setAttr(outputImport, "hasReturn", false);
+    graph.setAttr(outputImport, "returnType", std::string("void"));
+
+    const auto outputValue = makeValue(graph, "output_value", 8, false);
+    const auto outputCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_output_value"));
+    graph.addOperand(outputCall, one);
+    graph.addOperand(outputCall, clk);
+    graph.addResult(outputCall, outputValue);
+    graph.setAttr(outputCall, "targetImportSymbol", std::string("v_difftest_OutputValue"));
+    graph.setAttr(outputCall, "inArgName", std::vector<std::string>{});
+    graph.setAttr(outputCall, "outArgName", std::vector<std::string>{"value"});
+    graph.setAttr(outputCall, "hasReturn", false);
+    graph.setAttr(outputCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(outputCall, "clkPolarity", std::string("posedge"));
+    graph.bindOutputPort("out", outputValue);
+
+    for (int i = 0; i < 140; ++i)
+    {
+        (void)makeConstant(graph, "value_difftest_padding_const_" + std::to_string(i),
+                           "value_difftest_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
+Design buildNoDiffMultiResultDifftestDpicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    const auto one = makeConstant(graph, "multi_one", "multi_one_const", 1, "1'b1");
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_MultiValue"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input", "output"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{1, 8});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"in", "out"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false, false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"bit", "byte"});
+    graph.setAttr(dpiImport, "hasReturn", true);
+    graph.setAttr(dpiImport, "returnType", std::string("byte"));
+
+    const auto retValue = makeValue(graph, "multi_ret", 8, false);
+    const auto outValue = makeValue(graph, "multi_out", 8, false);
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_multi_value"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, clk);
+    graph.addResult(dpiCall, retValue);
+    graph.addResult(dpiCall, outValue);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("v_difftest_MultiValue"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"in"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{"out"});
+    graph.setAttr(dpiCall, "hasReturn", true);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+    graph.bindOutputPort("ret", retValue);
+    graph.bindOutputPort("out", outValue);
+
+    for (int i = 0; i < 140; ++i)
+    {
+        (void)makeConstant(graph, "multi_difftest_padding_const_" + std::to_string(i),
+                           "multi_difftest_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
 Design buildDpicReturnReadDesign()
 {
     Design design;
@@ -2036,7 +2335,8 @@ void cleanDir(const std::filesystem::path &path)
 
 void compileAndRunHarness(const std::filesystem::path &dir,
                           const std::string &baseName,
-                          const std::string &sourceText)
+                          const std::string &sourceText,
+                          const std::string &extraCxxFlags = {})
 {
     const std::filesystem::path runnerPath = dir / (baseName + "_runner.cpp");
     const std::filesystem::path binaryPath = dir / (baseName + "_runner");
@@ -2069,7 +2369,12 @@ void compileAndRunHarness(const std::filesystem::path &dir,
     {
         compileInputs.push_back(dir / (baseName + ".cpp"));
     }
-    std::string compileCmd = cxx + " -std=c++20 -I " + dir.string();
+    std::string compileCmd = cxx + " -std=c++20";
+    if (!extraCxxFlags.empty())
+    {
+        compileCmd += " " + extraCxxFlags;
+    }
+    compileCmd += " -I " + dir.string();
     for (const auto &input : compileInputs)
     {
         compileCmd += " " + input.string();
@@ -2631,6 +2936,442 @@ int main() {
     compileAndRunHarness(dir, "dpic_call_top", runner);
 }
 
+void testNoOutputShardedDpicConditionReplaysDirtyInputs()
+{
+    Design design = buildNoOutputShardedDpicConditionDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_no_output_dirty_condition";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_no_output_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower no-output sharded DPIC condition fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report no-output DPIC condition fixture errors");
+
+    const std::string source = readFile(dir / "dpic_no_output_top.cpp");
+    expect(!contains(source, "if (sequential_edge_pending_) {\n            non_clock_inputs_dirty_ = false;"),
+           "sequential edge with no output ports must not drop pending dirty input replay before DPIC conditions");
+    expect(contains(source, "dirty_replayed_ = true;\n        replay_dirty_input_shards();"),
+           "sequential edge should replay dirty input shards before sampling no-output DPIC conditions");
+    expect(contains(source, "if (!post_commit_settled_ && (non_clock_inputs_dirty_ || dirty_replayed_))"),
+           "sharded final settle should not run solely for input-only DPIC side-effect commits");
+    const std::string chunk = readFile(dir / "dpic_no_output_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "bool& dirty_on_commit_"),
+           "input-only DPIC statement chunks should carry dirty-on-commit metadata");
+    expect(!contains(chunk, "dirty_on_commit_ = true;"),
+           "input-only DPIC calls should not force all shards dirty after every side-effect event");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void dpi_capture(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_no_output_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_en(0);
+    sim.set_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 0) {
+        return 1;
+    }
+    sim.set_en(1);
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 1) {
+        return 2;
+    }
+    if (sim.get_difftest__DOT__step() != 1) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_no_output_top", runner);
+}
+
+void testDpicDirtyReplayIncludesProducerClosure()
+{
+    Design design = buildNoOutputDpicConditionWithProducerClosureDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_dirty_replay_producer_closure";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_closure_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower DPIC producer-closure fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report DPIC producer-closure fixture errors");
+
+    const std::string source = readFile(dir / "dpic_closure_top.cpp");
+    const std::string marker = "void SSimTop::replay_dirty_input_shards() {";
+    const auto markerPos = source.find(marker);
+    expect(markerPos != std::string::npos,
+           "producer-closure fixture should emit replay_dirty_input_shards helper");
+    const auto endPos = source.find("}\n\nvoid SSimTop::commit_step()", markerPos);
+    expect(endPos != std::string::npos,
+           "producer-closure fixture should place replay helper before commit_step");
+    const std::string replayBody = source.substr(markerPos, endPos - markerPos);
+
+    std::size_t replayCalls = 0;
+    std::size_t searchPos = 0;
+    while ((searchPos = replayBody.find("sched_", searchPos)) != std::string::npos)
+    {
+        ++replayCalls;
+        searchPos += 6;
+    }
+    expect(replayCalls > 4,
+           "dirty replay should include non-dirty producer shard closure before the dirty DPIC condition shard");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void dpi_capture(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_closure_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_en(0);
+    sim.set_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 0) {
+        return 1;
+    }
+    sim.set_en(1);
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_closure_top", runner);
+}
+
+void testShardedDirtyReplaySettlesLatchBeforeDpicCondition()
+{
+    Design design = buildNoOutputLatchGatedDpicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_latch_dirty_condition";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_latch_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower latch-gated DPIC fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report latch-gated DPIC fixture errors");
+
+    const std::string source = readFile(dir / "dpic_latch_top.cpp");
+    expect(contains(source, "if (non_clock_inputs_dirty_) {\n        settle();"),
+           "latch-bearing sharded designs should settle dirty inputs before same-step DPIC edge sampling");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void dpi_capture(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_latch_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_en(0);
+    sim.set_d(0);
+    sim.set_clk(0);
+    sim.set_reset(0);
+    sim.step();
+    if (g_dpic_capture_calls != 0) {
+        return 1;
+    }
+    sim.set_en(1);
+    sim.set_d(1);
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_latch_top", runner);
+}
+
+void testNoDiffGuardedDpicCallsCompileOut()
+{
+    Design design = buildNoDiffDifftestDpicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_no_diff_guard";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_no_diff_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower no-diff guarded DPIC fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report no-diff guarded DPIC errors");
+
+    const std::string source = readFile(dir / "dpic_no_diff_top.cpp");
+    const std::string chunk = readFile(dir / "dpic_no_diff_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(source, "#ifndef CONFIG_NO_DIFFTEST\n        static constexpr std::uint32_t kDpicPreSettleShards") &&
+               contains(source, "        settle();\n        post_commit_settled_ = true;\n#endif"),
+           "pure difftest DPIC pre-settle should be compiled out in CONFIG_NO_DIFFTEST builds");
+    expect(contains(chunk, "#ifndef CONFIG_NO_DIFFTEST") &&
+               contains(chunk, "v_difftest_TestEvent") &&
+               contains(chunk, "#endif"),
+           "difftest DPIC side-effect chunks should compile out with CONFIG_NO_DIFFTEST");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write empty dpic stub header");
+    }
+    stub << "#pragma once\n";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_no_diff_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_no_diff_top", runner, "-DCONFIG_NO_DIFFTEST");
+}
+
+void testNoDiffGuardedValueDpicCallsDefaultOut()
+{
+    Design design = buildNoDiffValueDifftestDpicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_no_diff_value_guard";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_no_diff_value_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower no-diff value DPIC fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report no-diff value DPIC errors");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write empty dpic stub header");
+    }
+    stub << "#pragma once\n";
+    stub.close();
+
+    const std::string source = readFile(dir / "dpic_no_diff_value_top.cpp");
+    expect(contains(source, "#ifndef CONFIG_NO_DIFFTEST\nif (") &&
+               contains(source, "v_difftest_ReturnValue") &&
+               contains(source, "v_difftest_OutputValue"),
+           "value-producing v_difftest DPIC expressions should guard calls in no-diff builds");
+
+    const std::string runner = R"CPP(
+#include "dpic_no_diff_value_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_ret() != 0 || sim.get_out() != 0) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_no_diff_value_top", runner, "-DCONFIG_NO_DIFFTEST");
+
+    std::ofstream realHeader(dir / "difftest-dpic.h");
+    if (!realHeader.is_open()) {
+        throw std::runtime_error("failed to write real dpic header");
+    }
+    realHeader << "#pragma once\n"
+               << "#include <cstdint>\n"
+               << "extern \"C\" std::uint8_t v_difftest_ReturnValue(std::uint8_t value);\n"
+               << "extern \"C\" void v_difftest_OutputValue(std::uint8_t *value);\n";
+    realHeader.close();
+
+    bool shardIncludesDifftestHeader = false;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+        const auto name = entry.path().filename().string();
+        if (name.starts_with("dpic_no_diff_value_top_sched_") && name.ends_with(".cpp")) {
+            const std::string shard = readFile(entry.path());
+            if (contains(shard, "#include \"difftest-dpic.h\"")) {
+                shardIncludesDifftestHeader = true;
+                break;
+            }
+        }
+    }
+    expect(shardIncludesDifftestHeader,
+           "sharded value-producing v_difftest DPIC expressions should include the real difftest header");
+
+    const std::string normalRunner = R"CPP(
+#include "dpic_no_diff_value_top.hpp"
+#include <cstdint>
+
+extern "C" std::uint8_t v_difftest_ReturnValue(std::uint8_t value) {
+    return value ? static_cast<std::uint8_t>(7) : static_cast<std::uint8_t>(0);
+}
+
+extern "C" void v_difftest_OutputValue(std::uint8_t *value) {
+    *value = 9;
+}
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_no_diff_value_top", normalRunner);
+}
+
+void testNoDiffGuardedMultiResultDpicCallsDefaultOut()
+{
+    Design design = buildNoDiffMultiResultDifftestDpicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_no_diff_multi_guard";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_no_diff_multi_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should lower no-diff multi-result DPIC fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report no-diff multi-result DPIC errors");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write empty dpic stub header");
+    }
+    stub << "#pragma once\n";
+    stub.close();
+
+    const std::string chunk = readFile(dir / "dpic_no_diff_multi_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "#ifndef CONFIG_NO_DIFFTEST") &&
+               contains(chunk, "v_difftest_MultiValue") &&
+               contains(chunk, "return result;"),
+           "multi-result v_difftest DPIC pre-statement should guard the call and keep default result values");
+
+    const std::string runner = R"CPP(
+#include "dpic_no_diff_multi_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_ret() != 0 || sim.get_out() != 0) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_no_diff_multi_top", runner, "-DCONFIG_NO_DIFFTEST");
+}
+
 void testDpicReturnValueFeedsSequentialWrite()
 {
     Design design = buildDpicReturnReadDesign();
@@ -3127,6 +3868,13 @@ void testDpicSamplesPostSequentialSettleState()
     expect(contains(source, "kDpicPreSettleShards"), "DPIC post-sequential fixture should emit a pre-settle shard set");
     expect(contains(source, "kDpicPreSettleShards[] = {0U, 16U}"),
            "DPIC post-sequential fixture should seed the upstream producer shard without expanding to every shard");
+    expect(!contains(source, "#ifndef CONFIG_NO_DIFFTEST\n        static constexpr std::uint32_t kDpicPreSettleShards"),
+           "runtime DPIC calls should keep pre-DPIC settle even in no-diff builds");
+    expect(contains(source, "if (domain_reg_committed_) {\n            committed_ = true;\n            any_domain_reg_committed_ = true;\n            non_clock_inputs_dirty_ = true;\n            dirty_replayed_ = false;"),
+           "chunked register commits should invalidate dirty replay and activate post-commit settle work");
+    const std::string chunk = readFile(dir / "dpic_post_seq_top_commit_chunk_posedge_clk_1.cpp");
+    expect(!contains(chunk, "dirty_on_commit_ = true;"),
+           "input-only post-sequential DPIC chunks should not dirty all internal shards after sampling");
 
     std::ofstream stub(dir / "difftest-dpic.h");
     if (!stub.is_open()) {
@@ -3279,12 +4027,17 @@ void testMemoryWriteCompileAndRun()
     options.outputDir = dir.string();
     options.outputFilename = std::string("memory_write_top");
     options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp memory-write fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp memory-write fixture should not emit errors");
 
     const std::string source = readFile(dir / "memory_write_top.cpp");
+    const std::string chunk = readFile(dir / "memory_write_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "dirty_on_commit_ = true; committed_ = true;"),
+           "memory-write statement chunks should still invalidate dirty replay after internal state mutation");
 
     const std::string runner = R"CPP(
 #include "memory_write_top.hpp"
@@ -4650,8 +5403,10 @@ void testDirtyReplayEdgeWithoutCommitRefreshesOutputs()
     const std::string source = readFile(dir / "dirty_replay_no_commit_top.cpp");
     expect(contains(source, "bool dirty_replayed_ = false;"),
            "sharded commit_step should track edge-local dirty replay");
-    expect(contains(source, "committed_ || non_clock_inputs_dirty_ || dirty_replayed_"),
+    expect(contains(source, "non_clock_inputs_dirty_ || dirty_replayed_"),
            "sharded commit_step should settle after dirty replay even when no commit happens");
+    expect(!contains(source, "if (sequential_edge_pending_) {\n            settle();"),
+           "sharded dirty replay should not run a full settle before sampling sequential edge conditions");
     expect(contains(source, "if (non_clock_inputs_dirty_ && !dirty_replayed_)"),
            "sharded commit_step should not replay dirty shards between domains within one edge snapshot");
 
@@ -5255,6 +6010,12 @@ int main()
         testResetCompatibilitySetterDrivesTopLevelResetPort();
         testDpicImportNoOpCompileAndRun();
         testDpicCallCompileAndRun();
+        testNoOutputShardedDpicConditionReplaysDirtyInputs();
+        testDpicDirtyReplayIncludesProducerClosure();
+        testShardedDirtyReplaySettlesLatchBeforeDpicCondition();
+        testNoDiffGuardedDpicCallsCompileOut();
+        testNoDiffGuardedValueDpicCallsDefaultOut();
+        testNoDiffGuardedMultiResultDpicCallsDefaultOut();
         testDpicReturnValueFeedsSequentialWrite();
         testDpicOutputArgFeedsSequentialWrite();
         testDpicJtagTickMultiResultCallOnceAndConditionGated();

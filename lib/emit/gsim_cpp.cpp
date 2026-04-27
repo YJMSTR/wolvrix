@@ -74,6 +74,7 @@ namespace wolvrix::lib::emit
             // Sequential update statements (grouped by clock domain)
             std::map<std::string, std::vector<std::string>> sequentialPreStmts;
             std::map<std::string, std::vector<std::string>> sequentialStmts;
+            std::map<std::string, std::vector<bool>> sequentialStmtDirtyOnCommit;
             std::map<std::string, std::map<std::string, std::vector<std::string>>> sequentialRegStmts;
             std::map<std::string, std::string> sequentialClockExprs;
 
@@ -93,6 +94,8 @@ namespace wolvrix::lib::emit
             // DPI-C imports/calls used by terminal-capable XiangShan difftest.
             std::map<std::string, DpicImportInfo> dpicImports;
             bool emitsDpicCalls = false;
+            bool emitsNoDiffGuardedDpicCalls = false;
+            bool emitsRuntimeDpicCalls = false;
             bool enableDpicTrace = false;
             std::size_t dpicTraceCallSite = 0;
             std::size_t dpicMaterializedCallSite = 0;
@@ -217,8 +220,10 @@ namespace wolvrix::lib::emit
                 {
                     shardNeedsDirtyReplay[static_cast<std::size_t>(currentShard)] = true;
                 }
-                if (enableActivityWatermark && currentShard >= 0) {
+                if (enableSharding && currentShard >= 0) {
                     lastEmittedShard = currentShard;
+                }
+                if (enableActivityWatermark && currentShard >= 0) {
                     for (const auto& source : currentOpDirectActivitySources) {
                         auto [it, inserted] = activitySourceFirstShard.emplace(source, currentShard);
                         if (!inserted && currentShard < it->second) {
@@ -340,6 +345,7 @@ namespace wolvrix::lib::emit
             std::vector<std::string> regNames;
             std::map<std::string, std::vector<std::string>> regStmts;
             std::vector<std::string> stmts;
+            std::vector<bool> stmtDirtyOnCommit;
             bool preReg = false;
         };
 
@@ -713,6 +719,37 @@ namespace wolvrix::lib::emit
             return resolvedClock;
         }
 
+        bool isNoDiffGuardedDpicTarget(std::string_view target)
+        {
+            return startsWith(target, "v_difftest_");
+        }
+
+        void recordDpicCall(CodegenState& state, std::string_view target)
+        {
+            state.emitsDpicCalls = true;
+            if (isNoDiffGuardedDpicTarget(target)) {
+                state.emitsNoDiffGuardedDpicCalls = true;
+            } else {
+                state.emitsRuntimeDpicCalls = true;
+            }
+        }
+
+        std::string guardNoDiffDpicStatement(std::string stmt, std::string_view target)
+        {
+            if (!isNoDiffGuardedDpicTarget(target)) {
+                return stmt;
+            }
+            return std::string("#ifndef CONFIG_NO_DIFFTEST\n") + stmt + "\n#endif";
+        }
+
+        std::string guardNoDiffDpicBlock(std::string block, std::string_view target)
+        {
+            if (!isNoDiffGuardedDpicTarget(target)) {
+                return block;
+            }
+            return std::string("\n#ifndef CONFIG_NO_DIFFTEST\n") + block + "\n#endif\n";
+        }
+
         // Forward declaration
         struct GsimScratchpadMetadata;
 
@@ -775,9 +812,6 @@ namespace wolvrix::lib::emit
                 if (state.dirtyReplayRootInputs.count(operand) > 0)
                 {
                     opDependsOnDirtyInput = true;
-                    if (!state.enableActivityWatermark) {
-                        break;
-                    }
                     if (const auto sourceIt = state.inputActivitySourceNames.find(operand);
                         sourceIt != state.inputActivitySourceNames.end())
                     {
@@ -788,15 +822,16 @@ namespace wolvrix::lib::emit
                     it != state.valueDependsOnDirtyInput.end() && it->second)
                 {
                     opDependsOnDirtyInput = true;
-                    if (!state.enableActivityWatermark) {
-                        break;
-                    }
                 }
                 if (graph.valueIsInput(operand))
                 {
                     opDependsOnDirtyInput = true;
-                    if (!state.enableActivityWatermark) {
-                        break;
+                }
+                if (state.enableSharding) {
+                    if (const auto producerIt = state.valueProducerShard.find(operand);
+                        producerIt != state.valueProducerShard.end() && producerIt->second >= 0)
+                    {
+                        opDependencyProducerShards.insert(producerIt->second);
                     }
                 }
                 if (state.enableActivityWatermark)
@@ -810,7 +845,6 @@ namespace wolvrix::lib::emit
                         producerIt != state.valueProducerShard.end() && producerIt->second >= 0)
                     {
                         mergeFirstShard(producerIt->second);
-                        opDependencyProducerShards.insert(producerIt->second);
                     }
                 }
             }
@@ -1832,6 +1866,7 @@ namespace wolvrix::lib::emit
                     state.sequentialStmts[domainKey].push_back(
                         "        if (" + condition + ") { const auto __mem_idx = " + indexExpr + "; if (__mem_idx < state_->" +
                         memory.storageName + ".size()) { " + writeExpr + " committed_ = true; } }");
+                    state.sequentialStmtDirtyOnCommit[domainKey].push_back(true);
                     break;
                 }
 
@@ -2165,10 +2200,12 @@ namespace wolvrix::lib::emit
                             const std::size_t resultIndex = returnOffset + outputIndex;
                             stmt += " " + resultTypes[resultIndex] + " out" + std::to_string(outputIndex) + "{};";
                         }
-                        stmt += " }; const auto " + resultName + " = ([&](){ " + structName + " result{}; if (" +
-                                condition + ") { result.ret = " +
-                                castScalarExprForWidth(callExpr, resultWidths[0]) +
-                                "; committed_ = true; } return result; }()); ";
+                        stmt += " }; const auto " + resultName + " = ([&](){ " + structName + " result{}; ";
+                        stmt += guardNoDiffDpicBlock("if (" + condition + ") { result.ret = " +
+                                                     castScalarExprForWidth(callExpr, resultWidths[0]) +
+                                                     "; committed_ = true; }",
+                                                     *target);
+                        stmt += " return result; }()); ";
                         stmt += resultRefs[0] + " = " + resultName + ".ret;";
                         for (std::size_t outputIndex = 0; outputIndex < outNames->size(); ++outputIndex) {
                             const std::size_t resultIndex = returnOffset + outputIndex;
@@ -2180,7 +2217,7 @@ namespace wolvrix::lib::emit
                         for (std::size_t resultIndex = 0; resultIndex < results.size(); ++resultIndex) {
                             recordResultMetadata(resultIndex);
                         }
-                        state.emitsDpicCalls = true;
+                        recordDpicCall(state, *target);
                         break;
                     }
 
@@ -2243,10 +2280,11 @@ namespace wolvrix::lib::emit
                         }
                         callExpr += ")";
                         std::string lambdaExpr = "([&](){ " + outType + " dpic_out_ = " +
-                                                 zeroInitializerForWidth(resultValue.width()) + "; if (" + condition +
-                                                 ") { " + callExpr + "; } return dpic_out_; }())";
+                                                 zeroInitializerForWidth(resultValue.width()) + "; ";
+                        lambdaExpr += guardNoDiffDpicBlock("if (" + condition + ") { " + callExpr + "; }", *target);
+                        lambdaExpr += " return dpic_out_; }())";
                         setResultExpr(0, lambdaExpr);
-                        state.emitsDpicCalls = true;
+                        recordDpicCall(state, *target);
                         break;
                     }
 
@@ -2306,13 +2344,15 @@ namespace wolvrix::lib::emit
                         }
                         callExpr += ")";
                         std::string lambdaExpr = "([&](){ " + returnType + " dpic_return_ = " +
-                                                 zeroInitializerForWidth(resultValue.width()) + "; if (" + condition +
-                                                 ") { dpic_return_ = " +
-                                                 castScalarExprForWidth(callExpr, resultValue.width()) +
-                                                 "; } return dpic_return_; }())";
+                                                 zeroInitializerForWidth(resultValue.width()) + "; ";
+                        lambdaExpr += guardNoDiffDpicBlock("if (" + condition + ") { dpic_return_ = " +
+                                                          castScalarExprForWidth(callExpr, resultValue.width()) +
+                                                          "; }",
+                                                          *target);
+                        lambdaExpr += " return dpic_return_; }())";
                         state.valueVars[results[0]] = std::move(lambdaExpr);
                         recordResultMetadata(0);
-                        state.emitsDpicCalls = true;
+                        recordDpicCall(state, *target);
                         break;
                     }
                     if (hasOutputArgs) {
@@ -2364,8 +2404,9 @@ namespace wolvrix::lib::emit
                     if (state.enableDpicTrace) {
                         stmt += " }";
                     }
-                    state.emitsDpicCalls = true;
-                    state.sequentialStmts[domainKey].push_back(std::move(stmt));
+                    recordDpicCall(state, *target);
+                    state.sequentialStmts[domainKey].push_back(guardNoDiffDpicStatement(std::move(stmt), *target));
+                    state.sequentialStmtDirtyOnCommit[domainKey].push_back(false);
                     break;
                 }
 
@@ -3196,6 +3237,9 @@ namespace wolvrix::lib::emit
                     flushCurrent();
                 }
                 if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
+                    const auto dirtyIt = state.sequentialStmtDirtyOnCommit.find(domainKey);
+                    const std::vector<bool>* dirtyOnCommit =
+                        dirtyIt != state.sequentialStmtDirtyOnCommit.end() ? &dirtyIt->second : nullptr;
                     SequentialChunkPlan current;
                     current.domainKey = domainKey;
                     std::size_t currentBytes = 0;
@@ -3209,12 +3253,15 @@ namespace wolvrix::lib::emit
                         current.domainKey = domainKey;
                         currentBytes = 0;
                     };
-                    for (const auto& stmt : stmtIt->second) {
+                    for (std::size_t stmtIndex = 0; stmtIndex < stmtIt->second.size(); ++stmtIndex) {
+                        const auto& stmt = stmtIt->second[stmtIndex];
                         const std::size_t estimatedBytes = stmt.size() + 1;
                         if (!current.stmts.empty() && currentBytes + estimatedBytes > maxChunkBytes) {
                             flushCurrent();
                         }
                         current.stmts.push_back(stmt);
+                        current.stmtDirtyOnCommit.push_back(
+                            dirtyOnCommit == nullptr || stmtIndex >= dirtyOnCommit->size() || (*dirtyOnCommit)[stmtIndex]);
                         currentBytes += estimatedBytes;
                     }
                     flushCurrent();
@@ -4056,7 +4103,7 @@ namespace wolvrix::lib::emit
                 os << "    std::vector<std::uint32_t> active_word_queue_;\n";
             }
             for (const auto &chunk : sequentialChunks) {
-                os << "    void " << chunk.methodName << "(bool& committed_);\n";
+                os << "    void " << chunk.methodName << "(bool& committed_, bool& dirty_on_commit_);\n";
             }
             std::set<std::string> prevClockNames;
             for (const auto &domainKey : headerSequentialDomains) {
@@ -4532,11 +4579,17 @@ namespace wolvrix::lib::emit
                     os << "    }\n";
                     if (state.enableSharding && state.shardCount() > 0) {
                         os << "    if (clock_inputs_dirty_) {\n";
-                        os << "        const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n";
-                        os << "        dirty_replayed_ = true;\n";
-                        os << "        replay_dirty_input_shards();\n";
-                        os << "        clock_inputs_dirty_ = false;\n";
-                        os << "        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;\n";
+                        if (!state.latchStmts.empty()) {
+                            os << "        settle();\n";
+                            os << "        dirty_replayed_ = true;\n";
+                            os << "        replay_dirty_input_shards();\n";
+                        } else {
+                            os << "        const bool had_non_clock_inputs_dirty_ = non_clock_inputs_dirty_;\n";
+                            os << "        dirty_replayed_ = true;\n";
+                            os << "        replay_dirty_input_shards();\n";
+                            os << "        clock_inputs_dirty_ = false;\n";
+                            os << "        non_clock_inputs_dirty_ = had_non_clock_inputs_dirty_;\n";
+                        }
                         os << "    }\n";
                     }
                     os << "    bool sequential_edge_pending_ = false;\n";
@@ -4552,16 +4605,14 @@ namespace wolvrix::lib::emit
                     }
                     os << "    if (non_clock_inputs_dirty_) {\n";
                     if (state.enableSharding && state.shardCount() > 0) {
-                        os << "        dirty_replayed_ = true;\n";
-                        os << "        if (sequential_edge_pending_) {\n";
-                        if (!state.outputPorts.empty()) {
-                            os << "            settle();\n";
+                        if (!state.latchStmts.empty()) {
+                            os << "        settle();\n";
+                            os << "        dirty_replayed_ = true;\n";
+                            os << "        replay_dirty_input_shards();\n";
                         } else {
-                            os << "            non_clock_inputs_dirty_ = false;\n";
+                            os << "        dirty_replayed_ = true;\n";
+                            os << "        replay_dirty_input_shards();\n";
                         }
-                        os << "        } else {\n";
-                        os << "            replay_dirty_input_shards();\n";
-                        os << "        }\n";
                     } else {
                         if (!state.outputPorts.empty()) {
                             os << "        settle();\n";
@@ -4592,21 +4643,34 @@ namespace wolvrix::lib::emit
                                                          : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
                         if (state.enableSharding && state.shardCount() > 0 && clockNeedsPreEdgeReplay) {
                             os << "    if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
-                            os << "        dirty_replayed_ = true;\n";
-                            os << "        replay_dirty_input_shards();\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "        settle();\n";
+                                os << "        dirty_replayed_ = true;\n";
+                                os << "        replay_dirty_input_shards();\n";
+                            } else {
+                                os << "        dirty_replayed_ = true;\n";
+                                os << "        replay_dirty_input_shards();\n";
+                            }
                             os << "    }\n";
                         }
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
                             os << "        if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
-                            os << "            dirty_replayed_ = true;\n";
-                            os << "            replay_dirty_input_shards();\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "            settle();\n";
+                                os << "            dirty_replayed_ = true;\n";
+                                os << "            replay_dirty_input_shards();\n";
+                            } else {
+                                os << "            dirty_replayed_ = true;\n";
+                                os << "            replay_dirty_input_shards();\n";
+                            }
                             os << "        }\n";
                         }
                         if (auto regChunkIt = sequentialRegChunkMethods.find(domainKey); regChunkIt != sequentialRegChunkMethods.end()) {
                             os << "        bool domain_reg_committed_ = false;\n";
+                            os << "        bool domain_reg_dirty_ = false;\n";
                             for (const auto &methodName : regChunkIt->second) {
-                                os << "        " << methodName << "(domain_reg_committed_);\n";
+                                os << "        " << methodName << "(domain_reg_committed_, domain_reg_dirty_);\n";
                             }
                             os << "        if (domain_reg_committed_) {\n";
                             os << "            committed_ = true;\n";
@@ -4620,6 +4684,9 @@ namespace wolvrix::lib::emit
                         os << "    }\n";
                     }
                     os << "    if (any_domain_reg_committed_) {\n";
+                    if (state.emitsNoDiffGuardedDpicCalls && !state.emitsRuntimeDpicCalls) {
+                        os << "#ifndef CONFIG_NO_DIFFTEST\n";
+                    }
                     if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
                         state.dpicGlobalWarmupSteps > 0) {
                         os << "        if (gsim_pre_dpic_steps_ < " << state.dpicGlobalWarmupSteps << "U) {\n";
@@ -4649,6 +4716,9 @@ namespace wolvrix::lib::emit
                     }
                     os << "        settle();\n";
                     os << "        post_commit_settled_ = true;\n";
+                    if (state.emitsNoDiffGuardedDpicCalls && !state.emitsRuntimeDpicCalls) {
+                        os << "#endif\n";
+                    }
                     os << "    }\n";
                     for (const auto &domainKey : sequentialDomains) {
                         const auto parsedDomain = parseSequentialDomain(domainKey);
@@ -4671,28 +4741,63 @@ namespace wolvrix::lib::emit
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
                             os << "        if (non_clock_inputs_dirty_ && !dirty_replayed_) {\n";
-                            os << "            dirty_replayed_ = true;\n";
-                            os << "            replay_dirty_input_shards();\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "            settle();\n";
+                                os << "            dirty_replayed_ = true;\n";
+                                os << "            replay_dirty_input_shards();\n";
+                            } else {
+                                os << "            dirty_replayed_ = true;\n";
+                                os << "            replay_dirty_input_shards();\n";
+                            }
                             os << "        }\n";
                         }
                         if (auto stmtChunkIt = sequentialStmtChunkMethods.find(domainKey); stmtChunkIt != sequentialStmtChunkMethods.end()) {
                             os << "        bool domain_stmt_committed_ = false;\n";
+                            os << "        bool domain_stmt_dirty_ = false;\n";
                             for (const auto &methodName : stmtChunkIt->second) {
-                                os << "        " << methodName << "(domain_stmt_committed_);\n";
+                                os << "        " << methodName << "(domain_stmt_committed_, domain_stmt_dirty_);\n";
                             }
                             os << "        if (domain_stmt_committed_) {\n";
                             os << "            committed_ = true;\n";
                             os << "        }\n";
+                            if (state.enableSharding && state.shardCount() > 0) {
+                                os << "        if (domain_stmt_dirty_) {\n";
+                                os << "            non_clock_inputs_dirty_ = true;\n";
+                                os << "            dirty_replayed_ = false;\n";
+                                if (state.enableActivityWatermark) {
+                                    os << "            activate_all_shards();\n";
+                                }
+                                os << "        }\n";
+                            }
                         } else if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
-                            os << "        const bool committed_before_domain_ = committed_;\n";
-                            for (const auto& stmt : stmtIt->second) {
+                            const auto dirtyIt = state.sequentialStmtDirtyOnCommit.find(domainKey);
+                            const std::vector<bool>* dirtyOnCommit =
+                                dirtyIt != state.sequentialStmtDirtyOnCommit.end() ? &dirtyIt->second : nullptr;
+                            if (state.enableSharding && state.shardCount() > 0) {
+                                os << "        bool domain_stmt_dirty_ = false;\n";
+                            }
+                            for (std::size_t stmtIndex = 0; stmtIndex < stmtIt->second.size(); ++stmtIndex) {
+                                const auto& stmt = stmtIt->second[stmtIndex];
+                                const bool stmtDirtyOnCommit =
+                                    dirtyOnCommit == nullptr || stmtIndex >= dirtyOnCommit->size() ||
+                                    (*dirtyOnCommit)[stmtIndex];
                                 std::string s = stmt;
                                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
+                                if (state.enableSharding && state.shardCount() > 0 && stmtDirtyOnCommit) {
+                                    const std::string needle = "committed_ = true;";
+                                    const std::string replacement = "domain_stmt_dirty_ = true; committed_ = true;";
+                                    std::size_t pos = 0;
+                                    while ((pos = s.find(needle, pos)) != std::string::npos) {
+                                        s.replace(pos, needle.size(), replacement);
+                                        pos += replacement.size();
+                                    }
+                                }
                                 os << "        " << s << "\n";
                             }
                             if (state.enableSharding && state.shardCount() > 0) {
-                                os << "        if (committed_ && !committed_before_domain_) {\n";
+                                os << "        if (domain_stmt_dirty_) {\n";
                                 os << "            non_clock_inputs_dirty_ = true;\n";
+                                os << "            dirty_replayed_ = false;\n";
                                 if (state.enableActivityWatermark) {
                                     os << "            activate_all_shards();\n";
                                 }
@@ -4722,7 +4827,7 @@ namespace wolvrix::lib::emit
                 os << "    }\n";
             }
             if (state.enableSharding && state.shardCount() > 0) {
-                os << "    if (!post_commit_settled_ && (committed_ || non_clock_inputs_dirty_ || dirty_replayed_)) {\n";
+                os << "    if (!post_commit_settled_ && (non_clock_inputs_dirty_ || dirty_replayed_)) {\n";
             } else {
                 os << "    if (!post_commit_settled_ && (committed_ || non_clock_inputs_dirty_)) {\n";
             }
@@ -4946,7 +5051,12 @@ namespace wolvrix::lib::emit
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "\n";
-            os << "void SSimTop::" << chunk.methodName << "(bool& committed_) {\n";
+            os << "void SSimTop::" << chunk.methodName << "(bool& committed_, bool& dirty_on_commit_) {\n";
+            const bool tracksStatementDirty =
+                !chunk.stmts.empty() && chunk.stmtDirtyOnCommit.size() == chunk.stmts.size();
+            if (!tracksStatementDirty) {
+                os << "    (void)dirty_on_commit_;\n";
+            }
             if (!chunk.regNames.empty()) {
                 os << "    bool chunk_updated_ = false;\n";
             }
@@ -4988,8 +5098,17 @@ namespace wolvrix::lib::emit
                     os << indent << "activate_all_shards(); ";
                 }
             };
-            auto emitStatement = [&](std::string s) {
+            auto emitStatement = [&](std::string s, bool dirtyOnCommit = false) {
                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
+                if (dirtyOnCommit) {
+                    const std::string needle = "committed_ = true;";
+                    const std::string replacement = "dirty_on_commit_ = true; committed_ = true;";
+                    std::size_t pos = 0;
+                    while ((pos = s.find(needle, pos)) != std::string::npos) {
+                        s.replace(pos, needle.size(), replacement);
+                        pos += replacement.size();
+                    }
+                }
                 if (!chunk.regNames.empty()) {
                     const std::string needle = "committed_ = true;";
                     const std::string replacement = "chunk_updated_ = true; committed_ = true;";
@@ -5139,19 +5258,9 @@ namespace wolvrix::lib::emit
                     emitStatement(stmt);
                 }
             }
-            for (const auto &stmt : chunk.stmts) {
-                std::string s = stmt;
-                if (s.rfind("        ", 0) == 0) s.erase(0, 8);
-                if (!chunk.regNames.empty()) {
-                    const std::string needle = "committed_ = true;";
-                    const std::string replacement = "chunk_updated_ = true; committed_ = true;";
-                    std::size_t pos = 0;
-                    while ((pos = s.find(needle, pos)) != std::string::npos) {
-                        s.replace(pos, needle.size(), replacement);
-                        pos += replacement.size();
-                    }
-                }
-                os << "    " << s << "\n";
+            for (std::size_t stmtIndex = 0; stmtIndex < chunk.stmts.size(); ++stmtIndex) {
+                emitStatement(chunk.stmts[stmtIndex],
+                              tracksStatementDirty && chunk.stmtDirtyOnCommit[stmtIndex]);
             }
             if (!chunk.regNames.empty()) {
                 os << "    if (chunk_updated_) {\n";
@@ -5424,6 +5533,40 @@ namespace wolvrix::lib::emit
         if (state.enableSharding && (!state.sequentialStmts.empty() || !state.sequentialRegStmts.empty()) && !state.shardNeedsDirtyReplay.empty()) {
             state.shardNeedsDirtyReplay.front() = true;
         }
+        if (state.enableSharding && !state.shardNeedsDirtyReplay.empty()) {
+            std::vector<std::vector<int>> shardPredecessors(state.shardNeedsDirtyReplay.size());
+            for (std::size_t producer = 0; producer < state.shardSuccessors.size(); ++producer) {
+                for (int consumer : state.shardSuccessors[producer]) {
+                    if (consumer >= 0 && static_cast<std::size_t>(consumer) < shardPredecessors.size()) {
+                        shardPredecessors[static_cast<std::size_t>(consumer)].push_back(static_cast<int>(producer));
+                    }
+                }
+            }
+            std::vector<int> replayClosure;
+            replayClosure.reserve(state.shardNeedsDirtyReplay.size());
+            for (std::size_t shard = 0; shard < state.shardNeedsDirtyReplay.size(); ++shard) {
+                if (state.shardNeedsDirtyReplay[shard]) {
+                    replayClosure.push_back(static_cast<int>(shard));
+                }
+            }
+            for (std::size_t cursor = 0; cursor < replayClosure.size(); ++cursor) {
+                const int shard = replayClosure[cursor];
+                if (shard < 0 || static_cast<std::size_t>(shard) >= shardPredecessors.size()) {
+                    continue;
+                }
+                for (int predecessor : shardPredecessors[static_cast<std::size_t>(shard)]) {
+                    if (predecessor < 0) {
+                        continue;
+                    }
+                    const auto predIndex = static_cast<std::size_t>(predecessor);
+                    if (predIndex >= state.shardNeedsDirtyReplay.size() || state.shardNeedsDirtyReplay[predIndex]) {
+                        continue;
+                    }
+                    state.shardNeedsDirtyReplay[predIndex] = true;
+                    replayClosure.push_back(predecessor);
+                }
+            }
+        }
 
         // Check for unsupported operations
         if (!state.unsupportedOps.empty()) {
@@ -5480,6 +5623,9 @@ namespace wolvrix::lib::emit
                 auto shardFile = openOutputFile(shardPath);
                 if (shardFile) {
                     *shardFile << "#include \"" << internalHeaderPath.filename().string() << "\"\n\n";
+                    if (state.emitsNoDiffGuardedDpicCalls) {
+                        *shardFile << "#include \"difftest-dpic.h\"\n\n";
+                    }
                     *shardFile << "void SSimTop::sched_" << i << "() {\n";
                     *shardFile << state.shardBuffers[i];
                     *shardFile << "}\n";
