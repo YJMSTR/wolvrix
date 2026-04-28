@@ -78,6 +78,7 @@ namespace wolvrix::lib::emit
             std::vector<int32_t> tempVecWidths;
 
             // Sequential update statements (grouped by clock domain)
+            std::map<std::string, std::vector<std::string>> sequentialGlobalPreStmts;
             std::map<std::string, std::vector<std::string>> sequentialPreStmts;
             std::map<std::string, std::vector<std::string>> sequentialStmts;
             std::map<std::string, std::vector<bool>> sequentialStmtDirtyOnCommit;
@@ -382,6 +383,7 @@ namespace wolvrix::lib::emit
             std::vector<bool> stmtDirtyOnCommit;
             std::vector<std::vector<std::string>> stmtActivitySources;
             bool preReg = false;
+            bool globalPreReg = false;
         };
 
         // Convert Verilog-style constant to C++ constant
@@ -759,6 +761,14 @@ namespace wolvrix::lib::emit
             return startsWith(target, "v_difftest_");
         }
 
+        bool isGlobalPreEdgeDpicTarget(std::string_view target)
+        {
+            // XiangShan difftest monitor modules are observational edge hooks:
+            // they should sample one global pre-register snapshot, while still
+            // reusing the no-diff guard classification for CONFIG_NO_DIFFTEST.
+            return isNoDiffGuardedDpicTarget(target);
+        }
+
         void recordDpicCall(CodegenState& state, std::string_view target)
         {
             state.emitsDpicCalls = true;
@@ -872,11 +882,24 @@ namespace wolvrix::lib::emit
                         shardIt != state.valueActivityFirstShard.end())
                     {
                         mergeFirstShard(shardIt->second);
+                        if (shardIt->second >= 0) {
+                            opDependencyProducerShards.insert(shardIt->second);
+                        }
                     }
                     if (const auto producerIt = state.valueProducerShard.find(operand);
                         producerIt != state.valueProducerShard.end() && producerIt->second >= 0)
                     {
                         mergeFirstShard(producerIt->second);
+                        if (const auto opIt = state.valueProducerOpIndex.find(operand);
+                            opIt != state.valueProducerOpIndex.end() && opIt->second >= 0 &&
+                            static_cast<std::size_t>(opIt->second) < state.opProducerFirstShardByIndex.size())
+                        {
+                            const int producerFirstShard =
+                                state.opProducerFirstShardByIndex[static_cast<std::size_t>(opIt->second)];
+                            if (producerFirstShard >= 0) {
+                                opDependencyProducerShards.insert(producerFirstShard);
+                            }
+                        }
                     }
                 }
             }
@@ -920,6 +943,9 @@ namespace wolvrix::lib::emit
                 if (opDirtyReplayMask != 0) {
                     state.valueDirtyReplayMasks.emplace(results[idx], opDirtyReplayMask);
                 }
+                const int resultFirstShard = (state.enableSharding && state.currentOpFirstEmittedShard >= 0)
+                                                 ? state.currentOpFirstEmittedShard
+                                                 : (state.enableSharding ? state.lastEmittedShard : -1);
                 const int resultProducerShard = state.enableSharding ? state.lastEmittedShard : -1;
                 if (resultProducerShard >= 0) {
                     state.valueProducerShard[results[idx]] = resultProducerShard;
@@ -927,22 +953,35 @@ namespace wolvrix::lib::emit
                     if (opId.index >= 0 && static_cast<std::size_t>(opId.index) < state.opProducerLastShardByIndex.size()) {
                         state.opProducerLastShardByIndex[static_cast<std::size_t>(opId.index)] = resultProducerShard;
                         state.opProducerFirstShardByIndex[static_cast<std::size_t>(opId.index)] =
-                            state.currentOpFirstEmittedShard >= 0 ? state.currentOpFirstEmittedShard : resultProducerShard;
+                            resultFirstShard >= 0 ? resultFirstShard : resultProducerShard;
+                    }
+                    if (resultFirstShard >= 0 && resultFirstShard != resultProducerShard) {
+                        // A single GRH operation can lower to multiple C++ shard
+                        // statements (for example wide concat zeroing plus several
+                        // OR/store chunks). Activity replay must enter the first
+                        // statement and then walk through the operation in order;
+                        // jumping directly to the last producer shard leaves stale
+                        // partial tempVec contents on indirect replays.
+                        for (int shard = resultFirstShard; shard < resultProducerShard; ++shard) {
+                            if (shard >= 0 && shard < static_cast<int>(state.shardSuccessors.size())) {
+                                state.shardSuccessors[static_cast<std::size_t>(shard)].insert(shard + 1);
+                            }
+                        }
                     }
                     for (const int dependencyShard : opDependencyProducerShards) {
-                        if (dependencyShard >= 0 && dependencyShard != resultProducerShard &&
+                        if (dependencyShard >= 0 && dependencyShard < resultFirstShard &&
                             dependencyShard < static_cast<int>(state.shardSuccessors.size())) {
-                            state.shardSuccessors[static_cast<std::size_t>(dependencyShard)].insert(resultProducerShard);
+                            state.shardSuccessors[static_cast<std::size_t>(dependencyShard)].insert(resultFirstShard);
                         }
                     }
                 }
                 if (state.enableActivityWatermark) {
-                    int resultFirstShard = state.currentOpActivityFirstShard;
-                    if (!state.currentOpDirectActivitySources.empty() && state.lastEmittedShard >= 0 &&
-                        (resultFirstShard < 0 || state.lastEmittedShard < resultFirstShard)) {
-                        resultFirstShard = state.lastEmittedShard;
+                    int activityFirstShard = state.currentOpActivityFirstShard;
+                    if (!state.currentOpDirectActivitySources.empty() && resultFirstShard >= 0 &&
+                        (activityFirstShard < 0 || resultFirstShard < activityFirstShard)) {
+                        activityFirstShard = resultFirstShard;
                     }
-                    state.setValueActivityFirstShard(results[idx], resultFirstShard);
+                    state.setValueActivityFirstShard(results[idx], activityFirstShard);
                 }
             };
 
@@ -1483,6 +1522,7 @@ namespace wolvrix::lib::emit
                                     state.emitShardStatement(resultRef + "[" + std::to_string(wordIndex) + "] |= " + expr + ";");
                                 }
                             }
+                            recordResultMetadata(0);
                             break;
                         }
 
@@ -1494,6 +1534,7 @@ namespace wolvrix::lib::emit
                                                      ", " + std::to_string(width) + ");");
                             bitOffset += width;
                         }
+                        recordResultMetadata(0);
                         break;
                     }
 
@@ -1519,6 +1560,7 @@ namespace wolvrix::lib::emit
                             }
                             state.emitShardStatement(resultRef + " |= " + expr + ";");
                         }
+                        recordResultMetadata(0);
                         break;
                     }
 
@@ -2544,9 +2586,19 @@ namespace wolvrix::lib::emit
                         stmt += " }";
                     }
                     recordDpicCall(state, *target);
-                    state.sequentialStmts[domainKey].push_back(guardNoDiffDpicStatement(std::move(stmt), *target));
-                    state.sequentialStmtDirtyOnCommit[domainKey].push_back(false);
-                    state.sequentialStmtActivitySources[domainKey].push_back({});
+                    if (isGlobalPreEdgeDpicTarget(*target)) {
+                        // Difftest monitor modules are observational always-@edge
+                        // side effects.  Run them in a global pre-register edge
+                        // phase so all no-diff monitors sample one consistent
+                        // pre-edge snapshot before any clock domain writes state.
+                        state.sequentialGlobalPreStmts[domainKey].push_back(
+                            guardNoDiffDpicStatement(std::move(stmt), *target));
+                    } else {
+                        state.sequentialStmts[domainKey].push_back(
+                            guardNoDiffDpicStatement(std::move(stmt), *target));
+                        state.sequentialStmtDirtyOnCommit[domainKey].push_back(false);
+                        state.sequentialStmtActivitySources[domainKey].push_back({});
+                    }
                     break;
                 }
 
@@ -3310,6 +3362,9 @@ namespace wolvrix::lib::emit
             std::vector<SequentialChunkPlan> plans;
             const std::size_t maxChunkBytes = static_cast<std::size_t>(std::max(32768, state.commitShardSize));
             std::set<std::string> domains;
+            for (const auto& [domainKey, _] : state.sequentialGlobalPreStmts) {
+                domains.insert(domainKey);
+            }
             for (const auto& [domainKey, _] : state.sequentialPreStmts) {
                 domains.insert(domainKey);
             }
@@ -3321,6 +3376,36 @@ namespace wolvrix::lib::emit
             }
             for (const auto& domainKey : domains) {
                 std::size_t chunkIndex = 0;
+                if (auto globalPreIt = state.sequentialGlobalPreStmts.find(domainKey);
+                    globalPreIt != state.sequentialGlobalPreStmts.end()) {
+                    SequentialChunkPlan current;
+                    current.domainKey = domainKey;
+                    current.preReg = true;
+                    current.globalPreReg = true;
+                    std::size_t currentBytes = 0;
+                    auto flushCurrent = [&]() {
+                        if (current.stmts.empty()) {
+                            return;
+                        }
+                        current.methodName = "commit_chunk_global_pre_" + sanitizeIdentifier(domainKey) + "_" +
+                                             std::to_string(chunkIndex++);
+                        plans.push_back(current);
+                        current = SequentialChunkPlan{};
+                        current.domainKey = domainKey;
+                        current.preReg = true;
+                        current.globalPreReg = true;
+                        currentBytes = 0;
+                    };
+                    for (const auto& stmt : globalPreIt->second) {
+                        const std::size_t estimatedBytes = stmt.size() + 1;
+                        if (!current.stmts.empty() && currentBytes + estimatedBytes > maxChunkBytes) {
+                            flushCurrent();
+                        }
+                        current.stmts.push_back(stmt);
+                        currentBytes += estimatedBytes;
+                    }
+                    flushCurrent();
+                }
                 if (auto preIt = state.sequentialPreStmts.find(domainKey); preIt != state.sequentialPreStmts.end()) {
                     SequentialChunkPlan current;
                     current.domainKey = domainKey;
@@ -4084,6 +4169,9 @@ namespace wolvrix::lib::emit
             // Input port setters
             std::set<std::string> sequentialClockInputs;
             std::set<std::string> headerSequentialDomains;
+            for (const auto &domain : state.sequentialGlobalPreStmts) {
+                headerSequentialDomains.insert(domain.first);
+            }
             for (const auto &domain : state.sequentialPreStmts) {
                 headerSequentialDomains.insert(domain.first);
             }
@@ -4339,8 +4427,12 @@ namespace wolvrix::lib::emit
             const std::string factoryName = "make_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
             const std::string validateName = "validate_" + sanitizeIdentifier(target.scratchGraphSymbol) + "_metadata";
             std::map<std::string, std::vector<std::string>> sequentialRegChunkMethods;
+            std::map<std::string, std::vector<std::string>> sequentialGlobalPreChunkMethods;
             std::map<std::string, std::vector<std::string>> sequentialStmtChunkMethods;
             std::set<std::string> sequentialDomains;
+            for (const auto &domain : state.sequentialGlobalPreStmts) {
+                sequentialDomains.insert(domain.first);
+            }
             for (const auto &domain : state.sequentialPreStmts) {
                 sequentialDomains.insert(domain.first);
             }
@@ -4348,7 +4440,9 @@ namespace wolvrix::lib::emit
                 sequentialDomains.insert(domain.first);
             }
             for (const auto &chunk : sequentialChunks) {
-                if (chunk.preReg) {
+                if (chunk.globalPreReg) {
+                    sequentialGlobalPreChunkMethods[chunk.domainKey].push_back(chunk.methodName);
+                } else if (chunk.preReg) {
                     sequentialRegChunkMethods[chunk.domainKey].push_back(chunk.methodName);
                 } else if (chunk.regNames.empty() && !chunk.stmts.empty()) {
                     sequentialStmtChunkMethods[chunk.domainKey].push_back(chunk.methodName);
@@ -4898,6 +4992,60 @@ namespace wolvrix::lib::emit
                         os << "    }\n";
                     }
                     os << "    bool any_domain_reg_committed_ = false;\n";
+                    for (const auto &domainKey : sequentialDomains) {
+                        const auto globalPreIt = sequentialGlobalPreChunkMethods.find(domainKey);
+                        if (globalPreIt == sequentialGlobalPreChunkMethods.end()) {
+                            continue;
+                        }
+                        const auto parsedDomain = parseSequentialDomain(domainKey);
+                        const std::string edge = parsedDomain->first;
+                        std::string currClockExpr;
+                        auto exprIt = state.sequentialClockExprs.find(domainKey);
+                        if (exprIt != state.sequentialClockExprs.end()) {
+                            currClockExpr = exprIt->second;
+                        } else {
+                            const std::string resolvedClock =
+                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                            currClockExpr = "input_" + resolvedClock + "_";
+                        }
+                        const bool clockNeedsPreEdgeReplay = exprIt != state.sequentialClockExprs.end();
+                        const std::string prevClockState = prevClockStateNameForDomain(domainKey);
+                        const std::string prevClock = "prev_" + prevClockState + "_";
+                        currClockExpr = commitStepClockExpr(std::move(currClockExpr));
+                        const std::string edgeExpr = edge == "posedge"
+                                                         ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
+                                                         : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
+                        if (state.enableSharding && state.shardCount() > 0 && clockNeedsPreEdgeReplay) {
+                            os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "        settle();\n";
+                                emitPendingReplay("        ", false, true, true);
+                            } else {
+                                emitPendingReplay("        ", false, true, true);
+                            }
+                            os << "    }\n";
+                        }
+                        os << "    if (" << edgeExpr << ") {\n";
+                        if (state.enableSharding && state.shardCount() > 0) {
+                            os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "            settle();\n";
+                                emitPendingReplay("            ", false, true, true);
+                            } else {
+                                emitPendingReplay("            ", false, true, true);
+                            }
+                            os << "        }\n";
+                        }
+                        os << "        bool domain_pre_committed_ = false;\n";
+                        os << "        bool domain_pre_dirty_ = false;\n";
+                        for (const auto &methodName : globalPreIt->second) {
+                            os << "        " << methodName << "(domain_pre_committed_, domain_pre_dirty_);\n";
+                        }
+                        os << "        if (domain_pre_committed_) {\n";
+                        os << "            committed_ = true;\n";
+                        os << "        }\n";
+                        os << "    }\n";
+                    }
                     for (const auto &domainKey : sequentialDomains) {
                         const auto parsedDomain = parseSequentialDomain(domainKey);
                         const std::string edge = parsedDomain->first;
@@ -5790,6 +5938,12 @@ namespace wolvrix::lib::emit
 
         std::set<std::string> sequentialClockInputs;
         std::set<std::string> sequentialDomains;
+        for (const auto &domain : state.sequentialGlobalPreStmts) {
+            sequentialDomains.insert(domain.first);
+        }
+        for (const auto &domain : state.sequentialPreStmts) {
+            sequentialDomains.insert(domain.first);
+        }
         for (const auto &domain : state.sequentialStmts) {
             sequentialDomains.insert(domain.first);
         }

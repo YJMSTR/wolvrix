@@ -1030,7 +1030,7 @@ Design buildDpicPostSequentialSettleDesign()
     const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
     makeRegisterWrite(graph, "pc_write", one, nextPc, mask, clk, "pc");
 
-    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("dpi_capture"));
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_TestEvent"));
     graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
     graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8});
     graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
@@ -1039,11 +1039,56 @@ Design buildDpicPostSequentialSettleDesign()
     graph.setAttr(dpiImport, "hasReturn", false);
     graph.setAttr(dpiImport, "returnType", std::string("void"));
 
-    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_capture_pc"));
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_difftest_pc"));
     graph.addOperand(dpiCall, one);
     graph.addOperand(dpiCall, pcForDpi);
     graph.addOperand(dpiCall, clk);
-    graph.setAttr(dpiCall, "targetImportSymbol", std::string("dpi_capture"));
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("v_difftest_TestEvent"));
+    graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
+    graph.setAttr(dpiCall, "hasReturn", false);
+    graph.setAttr(dpiCall, "eventEdge", std::vector<std::string>{"posedge"});
+    graph.setAttr(dpiCall, "clkPolarity", std::string("posedge"));
+
+    return design;
+}
+
+
+Design buildDpicCrossDomainPreEdgeSnapshotDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto aClk = makeValue(graph, "a_clk", 1, false);
+    const auto bClk = makeValue(graph, "b_clk", 1, false);
+    graph.bindInputPort("a_clk", aClk);
+    graph.bindInputPort("b_clk", bClk);
+
+    (void)makeRegister(graph, "pc_storage", "pc_reg", 8, "pc");
+    const auto pcRead = makeRegisterRead(graph, "pc_read", "pc_read_op", 8, "pc");
+    graph.bindOutputPort("pc", pcRead);
+
+    const auto one = makeConstant(graph, "one", "cross_dpic_one", 1, "1'b1");
+    const auto nextPc = makeConstant(graph, "next_pc", "cross_dpic_next_pc", 8, "8'h2a");
+    const auto mask = makeConstant(graph, "mask", "cross_dpic_mask", 8, "8'hff");
+    const auto pcWrite = makeRegisterWrite(graph, "pc_write", one, nextPc, mask, aClk, "pc");
+    graph.setAttr(pcWrite, "clockSymbol", std::string("a_clk"));
+
+    const auto dpiImport = graph.createOperation(OperationKind::kDpicImport, graph.internSymbol("v_difftest_TestEvent"));
+    graph.setAttr(dpiImport, "argsDirection", std::vector<std::string>{"input"});
+    graph.setAttr(dpiImport, "argsWidth", std::vector<int64_t>{8});
+    graph.setAttr(dpiImport, "argsName", std::vector<std::string>{"value"});
+    graph.setAttr(dpiImport, "argsSigned", std::vector<bool>{false});
+    graph.setAttr(dpiImport, "argsType", std::vector<std::string>{"byte"});
+    graph.setAttr(dpiImport, "hasReturn", false);
+    graph.setAttr(dpiImport, "returnType", std::string("void"));
+
+    const auto dpiCall = graph.createOperation(OperationKind::kDpicCall, graph.internSymbol("call_cross_difftest_pc"));
+    graph.addOperand(dpiCall, one);
+    graph.addOperand(dpiCall, pcRead);
+    graph.addOperand(dpiCall, bClk);
+    graph.setAttr(dpiCall, "targetImportSymbol", std::string("v_difftest_TestEvent"));
     graph.setAttr(dpiCall, "inArgName", std::vector<std::string>{"value"});
     graph.setAttr(dpiCall, "outArgName", std::vector<std::string>{});
     graph.setAttr(dpiCall, "hasReturn", false);
@@ -1611,6 +1656,64 @@ Design buildWideVectorSliceDynamicDesign()
     graph.addOperand(slice, index);
     graph.addResult(slice, out);
     graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(70));
+
+    return design;
+}
+
+Design buildActivityMultiShardConcatSliceDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto data = makeValue(graph, "data", 8, false);
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("data", data);
+    graph.bindInputPort("clk", clk);
+
+    const auto one = makeConstant(graph, "one", "activity_concat_one", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "activity_concat_mask", 8, "8'hff");
+
+    std::vector<ValueId> bankReads;
+    bankReads.reserve(20);
+    for (int i = 0; i < 20; ++i) {
+        const std::string reg = "bank" + std::to_string(i);
+        (void)makeRegister(graph, reg + "_storage", reg + "_reg", 8, reg);
+        const auto read = makeRegisterRead(graph, reg + "_read", reg + "_read_op", 8, reg);
+        bankReads.push_back(read);
+    }
+
+    makeRegisterWrite(graph, "bank12_write", one, data, mask, clk, "bank12");
+
+    // Keep the graph above the sharding threshold while leaving the concat
+    // payload dependent on register activity rather than direct input activity.
+    auto filler = bankReads.front();
+    for (int i = 0; i < 90; ++i) {
+        const auto next = makeValue(graph, "activity_concat_filler_" + std::to_string(i), 8, false);
+        const auto assign = graph.createOperation(
+            OperationKind::kAssign, graph.internSymbol("activity_concat_filler_assign_" + std::to_string(i)));
+        graph.addOperand(assign, filler);
+        graph.addResult(assign, next);
+        filler = next;
+    }
+    graph.bindOutputPort("filler", filler);
+
+    const auto packed = makeValue(graph, "packed_banks", 160, false);
+    const auto concat = graph.createOperation(OperationKind::kConcat, graph.internSymbol("concat_banks"));
+    for (const auto read : bankReads) {
+        graph.addOperand(concat, read);
+    }
+    graph.addResult(concat, packed);
+
+    const auto bank12Index = makeConstant(graph, "bank12_index", "bank12_index_const", 8, "8'd56");
+    const auto payload = makeValue(graph, "payload", 8, false);
+    graph.bindOutputPort("payload", payload);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("slice_bank12"));
+    graph.addOperand(slice, packed);
+    graph.addOperand(slice, bank12Index);
+    graph.addResult(slice, payload);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(8));
 
     return design;
 }
@@ -3173,7 +3276,20 @@ void testXsZeroRetireTraceEmitsPresenceBits()
     expect(result.success, "EmitGsimCpp should emit XS zero-retire trace fixture");
     expect(!diags.hasError(), "EmitGsimCpp should not report XS zero-retire trace fixture errors");
 
-    const std::string chunk = readFile(dir / "xs_zero_retire_trace_top_commit_chunk_posedge_clk_0.cpp");
+    std::string chunk;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+        const auto path = entry.path();
+        if (!entry.is_regular_file() || path.extension() != ".cpp" ||
+            path.filename().string().find("_commit_chunk_") == std::string::npos) {
+            continue;
+        }
+        const std::string candidate = readFile(path);
+        if (contains(candidate, "[wolvrix-gsim-dpic] site=0 target=v_difftest_InstrCommit")) {
+            chunk = candidate;
+            break;
+        }
+    }
+    expect(!chunk.empty(), "XS zero-retire trace should emit an InstrCommit DPIC chunk");
     expect(contains(chunk, "r36_t1903395_present=0"),
            "XS zero-retire trace should keep stale temp labels visible with explicit absence markers");
     expect(contains(chunk, "r36_s78873_present=0"),
@@ -3690,7 +3806,20 @@ void testNoDiffGuardedDpicCallsCompileOut()
     expect(!diags.hasError(), "EmitGsimCpp should not report no-diff guarded DPIC errors");
 
     const std::string source = readFile(dir / "dpic_no_diff_top.cpp");
-    const std::string chunk = readFile(dir / "dpic_no_diff_top_commit_chunk_posedge_clk_0.cpp");
+    std::string chunk;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+        const auto path = entry.path();
+        if (!entry.is_regular_file() || path.extension() != ".cpp" ||
+            path.filename().string().find("_commit_chunk_") == std::string::npos) {
+            continue;
+        }
+        const std::string candidate = readFile(path);
+        if (contains(candidate, "v_difftest_TestEvent")) {
+            chunk = candidate;
+            break;
+        }
+    }
+    expect(!chunk.empty(), "no-diff guarded DPIC fixture should emit a DPIC chunk");
     expect(contains(source, "#ifndef CONFIG_NO_DIFFTEST\n        static constexpr std::uint32_t kDpicPreSettleShards") &&
                contains(source, "        settle();\n        post_commit_settled_ = true;\n#endif"),
            "pure difftest DPIC pre-settle should be compiled out in CONFIG_NO_DIFFTEST builds");
@@ -4357,7 +4486,7 @@ int main() {
     compileAndRunHarness(dir, "settled_clock_top", runner);
 }
 
-void testDpicSamplesPostSequentialSettleState()
+void testDpicSamplesPreEdgeSettledState()
 {
     Design design = buildDpicPostSequentialSettleDesign();
     runGsim(design, "top");
@@ -4375,22 +4504,33 @@ void testDpicSamplesPostSequentialSettleState()
     options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
-    expect(result.success, "EmitGsimCpp DPIC post-sequential fixture should succeed");
-    expect(!diags.hasError(), "EmitGsimCpp DPIC post-sequential fixture should not emit errors");
+    expect(result.success, "EmitGsimCpp DPIC pre-edge sampling fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp DPIC pre-edge sampling fixture should not emit errors");
 
     const std::string source = readFile(dir / "dpic_post_seq_top.cpp");
-    expect(contains(source, "domain_reg_committed_"), "commit_step should separate register chunks from DPIC chunks");
-    expect(contains(source, "post_commit_settled_"), "commit_step should avoid redundant final settle after pre-DPIC settle");
-    expect(contains(source, "kDpicPreSettleShards"), "DPIC post-sequential fixture should emit a pre-settle shard set");
-    expect(contains(source, "kDpicPreSettleShards[] = {0U, 16U}"),
-           "DPIC post-sequential fixture should seed the upstream producer shard without expanding to every shard");
-    expect(!contains(source, "#ifndef CONFIG_NO_DIFFTEST\n        static constexpr std::uint32_t kDpicPreSettleShards"),
-           "runtime DPIC calls should keep pre-DPIC settle even in no-diff builds");
+    expect(contains(source, "domain_reg_committed_"), "commit_step should separate pre-edge DPIC chunks from register chunks");
     expect(contains(source, "if (domain_reg_committed_) {\n            committed_ = true;\n            any_domain_reg_committed_ = true;\n            committed_state_dirty_ = true;\n            dirty_replayed_ = false;"),
            "chunked register commits should invalidate dirty replay and activate post-commit settle work");
-    const std::string chunk = readFile(dir / "dpic_post_seq_top_commit_chunk_posedge_clk_1.cpp");
-    expect(!contains(chunk, "dirty_on_commit_ = true;"),
-           "input-only post-sequential DPIC chunks should not dirty all internal shards after sampling");
+    expect(contains(source, "post_commit_settled_"),
+           "commit_step should still avoid redundant final settle after the post-commit DPI replay settle");
+    expect(contains(source, "kDpicPreSettleShards"),
+           "pre-edge DPIC sampling should keep the upstream producer shard replay set");
+    bool foundDpiChunk = false;
+    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
+        const auto path = entry.path();
+        if (!entry.is_regular_file() || path.extension() != ".cpp" ||
+            path.filename().string().find("_commit_chunk_") == std::string::npos) {
+            continue;
+        }
+        const std::string chunk = readFile(path);
+        if (!contains(chunk, "v_difftest_TestEvent(static_cast<std::uint8_t>")) {
+            continue;
+        }
+        foundDpiChunk = true;
+        expect(!contains(chunk, "dirty_on_commit_ = true;"),
+               "input-only pre-edge DPIC chunks should not dirty all internal shards after sampling");
+    }
+    expect(foundDpiChunk, "input-only DPIC call should be emitted in a clock-edge chunk");
 
     std::ofstream stub(dir / "difftest-dpic.h");
     if (!stub.is_open()) {
@@ -4401,7 +4541,7 @@ void testDpicSamplesPostSequentialSettleState()
 #include <cstdint>
 inline unsigned g_dpic_capture_calls = 0;
 inline std::uint8_t g_dpic_capture_last = 0;
-extern "C" inline void dpi_capture(std::uint8_t value) {
+extern "C" inline void v_difftest_TestEvent(std::uint8_t value) {
     ++g_dpic_capture_calls;
     g_dpic_capture_last = value;
 }
@@ -4421,17 +4561,120 @@ int main() {
     }
     sim.set_clk(1);
     sim.step();
-    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 0x2a) {
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 0) {
         return 2;
     }
     if (sim.get_pc() != 0x2a) {
         return 3;
+    }
+    sim.set_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 1) {
+        return 4;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 2 || g_dpic_capture_last != 0x2a) {
+        return 5;
+    }
+    if (sim.get_pc() != 0x2a) {
+        return 6;
     }
     return 0;
 }
 )CPP";
 
     compileAndRunHarness(dir, "dpic_post_seq_top", runner);
+}
+
+void testDpicUsesGlobalPreEdgeSnapshotAcrossDomains()
+{
+    Design design = buildDpicCrossDomainPreEdgeSnapshotDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_cross_domain_preedge_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_cross_domain_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp DPIC cross-domain fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp DPIC cross-domain fixture should not emit errors");
+
+    const std::string source = readFile(dir / "dpic_cross_domain_top.cpp");
+    expect(contains(source, "commit_chunk_global_pre_posedge_b_clk"),
+           "no-diff DPIC chunks should run in a global pre-edge pass");
+    expect(contains(source, "commit_chunk_posedge_a_clk"),
+           "cross-domain fixture should emit the a-clock register chunk");
+    const auto globalPrePos = source.find("commit_chunk_global_pre_posedge_b_clk");
+    const auto registerPos = source.find("commit_chunk_posedge_a_clk");
+    expect(globalPrePos != std::string::npos && registerPos != std::string::npos && globalPrePos < registerPos,
+           "global no-diff DPIC pass should be emitted before per-domain register chunks");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write cross-domain dpic stub header");
+    }
+    stub << R"HPP(
+#pragma once
+#include <cstdint>
+inline unsigned g_dpic_capture_calls = 0;
+inline std::uint8_t g_dpic_capture_last = 0;
+extern "C" inline void v_difftest_TestEvent(std::uint8_t value) {
+    ++g_dpic_capture_calls;
+    g_dpic_capture_last = value;
+}
+)HPP";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "dpic_cross_domain_top.hpp"
+#include "difftest-dpic.h"
+
+int main() {
+    SSimTop sim;
+    sim.set_a_clk(0);
+    sim.set_b_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 0) {
+        return 1;
+    }
+
+    sim.set_a_clk(1);
+    sim.set_b_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 1 || g_dpic_capture_last != 0) {
+        return 2;
+    }
+    if (sim.get_pc() != 0x2a) {
+        return 3;
+    }
+
+    sim.set_a_clk(0);
+    sim.set_b_clk(0);
+    sim.step();
+    if (g_dpic_capture_calls != 1) {
+        return 4;
+    }
+
+    sim.set_a_clk(1);
+    sim.set_b_clk(1);
+    sim.step();
+    if (g_dpic_capture_calls != 2 || g_dpic_capture_last != 0x2a) {
+        return 5;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "dpic_cross_domain_top", runner);
 }
 
 void testLatchReadNoOpCompileAndRun()
@@ -5394,6 +5637,66 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "wide_vector_slice_dynamic_top", runner);
+}
+
+void testActivityMultiShardConcatSliceReplayCompileAndRun()
+{
+    Design design = buildActivityMultiShardConcatSliceDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "activity_multishard_concat_slice_replay_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("activity_multishard_concat_slice_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp activity multi-shard concat fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp activity multi-shard concat fixture should not emit errors");
+
+    const std::string source = readFile(dir / "activity_multishard_concat_slice_top.cpp");
+    expect(contains(source, "activate_shard_mask"),
+           "activity multi-shard concat fixture should emit shard-successor activation");
+
+    const std::string runner = R"CPP(
+#include "activity_multishard_concat_slice_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.reset();
+    sim.set_clk(0);
+    sim.step();
+    if (sim.get_payload() != 0) {
+        return 1;
+    }
+
+    sim.set_data(0x5a);
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_payload() != 0x5a) {
+        return 2;
+    }
+
+    sim.set_clk(0);
+    sim.step();
+    sim.set_data(0xa5);
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_payload() != 0xa5) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "activity_multishard_concat_slice_top", runner);
 }
 
 void testWideStaticSliceCompileAndRun()
@@ -6749,7 +7052,8 @@ int main()
         testDpicJtagTickPreOnlySequentialClockDeclared();
         testDerivedClockEdgesSeePriorDomainCommits();
         testSettlePreservesDerivedClockInputEdges();
-        testDpicSamplesPostSequentialSettleState();
+        testDpicSamplesPreEdgeSettledState();
+        testDpicUsesGlobalPreEdgeSnapshotAcrossDomains();
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
         testMemoryReadCompileAndRun();
@@ -6769,6 +7073,7 @@ int main()
         testWideBitDynamicSliceCompileAndRun();
         testWideNibbleDynamicSliceCompileAndRun();
         testWideVectorDynamicSliceCompileAndRun();
+        testActivityMultiShardConcatSliceReplayCompileAndRun();
         testWideStaticSliceCompileAndRun();
         testWideVectorPortsInitializeAndCompile();
         testWideConcatCompileAndRun();
