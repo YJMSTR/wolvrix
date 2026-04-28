@@ -4542,7 +4542,20 @@ namespace wolvrix::lib::emit
                 os << "    if (active_word_queued_[word] == 0) { active_word_queued_[word] = 1; active_word_queue_.push_back(word); }\n";
                 os << "}\n\n";
                 os << "void SSimTop::activate_shard_range(std::uint32_t firstShard) {\n";
-                os << "    for (std::uint32_t i = firstShard; i < " << state.shardCount() << "U; ++i) { activate_shard(i); }\n";
+                os << "    if (firstShard >= " << state.shardCount() << "U) { return; }\n";
+                os << "    const std::uint32_t first_word_ = firstShard / 64U;\n";
+                os << "    const std::uint64_t first_mask_ = ~UINT64_C(0) << (firstShard % 64U);\n";
+                os << "    for (std::uint32_t word = first_word_; word < active_shard_words_.size(); ++word) {\n";
+                os << "        std::uint64_t range_mask_ = ~UINT64_C(0);\n";
+                os << "        if (word == first_word_) { range_mask_ &= first_mask_; }\n";
+                if ((state.shardCount() % 64U) != 0U) {
+                    const std::uint64_t lastActiveShardWordMask =
+                        (UINT64_C(1) << (state.shardCount() % 64U)) - UINT64_C(1);
+                    os << "        if (word + 1U == active_shard_words_.size()) { range_mask_ &= UINT64_C("
+                       << lastActiveShardWordMask << "); }\n";
+                }
+                os << "        activate_shard_mask(word, range_mask_);\n";
+                os << "    }\n";
                 os << "}\n\n";
             }
             os << "void SSimTop::reset() {\n";

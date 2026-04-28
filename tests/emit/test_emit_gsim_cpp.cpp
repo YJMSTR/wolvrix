@@ -6212,6 +6212,12 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "same-word successor activation should stay in the local active-word bitmap");
     expect(contains(source, "std::fill(active_shard_words_.begin(), active_shard_words_.end(), ~UINT64_C(0));"),
            "activate_all_shards should bulk-fill active shard words instead of looping per shard");
+    expect(contains(source, "const std::uint32_t first_word_ = firstShard / 64U"),
+           "activate_shard_range should compute a packed starting word for suffix activation");
+    expect(contains(source, "activate_shard_mask(word, range_mask_)"),
+           "activate_shard_range should activate suffixes a word at a time instead of per shard");
+    expect(!contains(source, "for (std::uint32_t i = firstShard") || !contains(source, "activate_shard(i);"),
+           "activate_shard_range should not activate suffixes through the per-shard helper");
     expect(!contains(source, "for (std::uint32_t i = 0; i < ") || !contains(source, "activate_shard(i);"),
            "activate_all_shards should not activate every shard through the per-shard helper");
     expect(!contains(replayBody, "active_word_queue_.empty()) { activate_all_shards(); }"),
