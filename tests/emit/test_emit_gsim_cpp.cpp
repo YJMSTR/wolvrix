@@ -3178,6 +3178,28 @@ void testXsZeroRetireTraceEmitsPresenceBits()
            "XS zero-retire trace should keep stale temp labels visible with explicit absence markers");
     expect(contains(chunk, "r36_s78873_present=0"),
            "XS zero-retire trace should keep missing state labels visible with explicit absence markers");
+    expect(contains(chunk, "r38_t2648875_present=0"),
+           "XS zero-retire trace should include the current endpoint-valid producer temp label");
+    expect(contains(chunk, "r38_t2206312_present=0"),
+           "XS zero-retire trace should include the current endpoint-valid gate temp label");
+    expect(contains(chunk, "r38_t2581973_present=0"),
+           "XS zero-retire trace should include the current enqueue-valid mux temp label");
+    expect(contains(chunk, "r38_t1903395_present=0"),
+           "XS zero-retire trace should include the current deq0 candidate temp label");
+    expect(contains(chunk, "r38_t2516282_present=0"),
+           "XS zero-retire trace should include the current deq1 candidate mux temp label");
+    expect(contains(chunk, "r38_t2020255_present=0"),
+           "XS zero-retire trace should include the current deq1 candidate temp label");
+    expect(contains(chunk, "r38_t2020254_present=0"),
+           "XS zero-retire trace should include the inverted commit gate input temp label");
+    expect(contains(chunk, "r38_endpointPipe0_present=0"),
+           "XS zero-retire trace should include the first endpoint delay state label");
+    expect(contains(chunk, "r38_endpointPipe1_present=0"),
+           "XS zero-retire trace should include the second endpoint delay state label");
+    expect(contains(chunk, "r38_endpointPipe2_present=0"),
+           "XS zero-retire trace should include the InstrCommit endpoint state label");
+    expect(contains(chunk, "r38_crossFtqCommit_present=0"),
+           "XS zero-retire trace should include related named commit-valid state labels");
 }
 
 void testDpicCallCompileAndRun()
@@ -3249,6 +3271,94 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "dpic_call_top", runner);
+}
+
+void testDpicTraceTargetsKeepMatchingCalls()
+{
+    Design design = buildDpicCallDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_trace_targets_match";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_match_top");
+    options.topOverrides = {"top"};
+    options.attributes["dpic_trace"] = "1";
+    options.attributes["dpic_trace_targets"] = "dpi_capture";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should emit DPIC matching target fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report DPIC matching target fixture errors");
+
+    const std::string chunk = readFile(dir / "dpic_match_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "dpi_capture(static_cast<std::uint8_t>"),
+           "DPIC target matching should preserve the runtime call");
+    expect(contains(chunk, "[wolvrix-gsim-dpic]"),
+           "DPIC target matching should keep diagnostics for listed calls");
+    expect(contains(chunk, "first_cond"),
+           "DPIC target matching should keep per-site trace state for listed calls");
+}
+
+void testDpicTraceTargetsFilterUnrelatedCalls()
+{
+    Design design = buildDpicCallDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "dpic_trace_targets_filter";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("dpic_filter_top");
+    options.topOverrides = {"top"};
+    options.attributes["dpic_trace"] = "1";
+    options.attributes["dpic_trace_targets"] = "v_difftest_InstrCommit";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should emit DPIC target-filter fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report DPIC target-filter fixture errors");
+
+    const std::string chunk = readFile(dir / "dpic_filter_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "dpi_capture(static_cast<std::uint8_t>"),
+           "DPIC target filtering should preserve the runtime call");
+    expect(!contains(chunk, "[wolvrix-gsim-dpic]"),
+           "DPIC target filtering should skip diagnostics for unrelated calls");
+    expect(!contains(chunk, "first_cond"),
+           "DPIC target filtering should not leave per-site trace state for skipped calls");
+}
+
+void testXsZeroRetireTraceDefaultsToInstrCommitOnly()
+{
+    Design design = buildDpicCallDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "xs_zero_trace_default_filter";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("xs_zero_filter_top");
+    options.topOverrides = {"top"};
+    options.attributes["dpic_trace"] = "1";
+    options.attributes["xs_zero_retire_trace"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp should emit XS zero-retire default filter fixture");
+    expect(!diags.hasError(), "EmitGsimCpp should not report XS zero-retire default filter fixture errors");
+
+    const std::string chunk = readFile(dir / "xs_zero_filter_top_commit_chunk_posedge_clk_0.cpp");
+    expect(contains(chunk, "dpi_capture(static_cast<std::uint8_t>"),
+           "XS zero-retire trace filtering should preserve unrelated DPIC runtime calls");
+    expect(!contains(chunk, "[wolvrix-gsim-dpic]"),
+           "XS zero-retire trace should default to InstrCommit-only diagnostics");
 }
 
 void testNoOutputShardedDpicConditionReplaysDirtyInputs()
@@ -6617,6 +6727,9 @@ int main()
         testDpicImportNoOpCompileAndRun();
         testXsZeroRetireTraceEmitsPresenceBits();
         testDpicCallCompileAndRun();
+        testDpicTraceTargetsKeepMatchingCalls();
+        testDpicTraceTargetsFilterUnrelatedCalls();
+        testXsZeroRetireTraceDefaultsToInstrCommitOnly();
         testNoOutputShardedDpicConditionReplaysDirtyInputs();
         testDpicDirtyReplayIncludesProducerClosure();
         testShardedDirtyReplaySettlesLatchBeforeDpicCondition();

@@ -105,10 +105,18 @@ namespace wolvrix::lib::emit
             bool emitsRuntimeDpicCalls = false;
             bool enableDpicTrace = false;
             bool enableXsZeroRetireTrace = false;
+            std::set<std::string> dpicTraceTargets;
             std::size_t dpicTraceCallSite = 0;
             std::size_t dpicMaterializedCallSite = 0;
             std::set<int> dpicPreSettleShards;
             int dpicGlobalWarmupSteps = 0;
+
+            bool shouldTraceDpicTarget(std::string_view target) const
+            {
+                return dpicTraceTargets.empty() ||
+                       dpicTraceTargets.count("*") > 0 ||
+                       dpicTraceTargets.count(std::string(target)) > 0;
+            }
 
             // Memory declarations/read lowering support
             std::unordered_map<std::string, MemoryInfo> memories;
@@ -2425,56 +2433,77 @@ namespace wolvrix::lib::emit
                     }
 
                     std::string stmt;
-                    if (state.enableDpicTrace) {
+                    if (state.enableDpicTrace && state.shouldTraceDpicTarget(*target)) {
                         const std::size_t callSite = state.dpicTraceCallSite++;
                         const std::string condName = "dpic_cond_" + std::to_string(callSite) + "_";
                         const std::string seenName = "dpic_seen_" + std::to_string(callSite) + "_";
                         const std::string hitsName = "dpic_hits_" + std::to_string(callSite) + "_";
                         const std::string missesName = "dpic_misses_" + std::to_string(callSite) + "_";
                         const bool traceFalseSamples = true;
-                        auto appendRound36XsZeroRetireTrace = [&]() {
+                        auto appendXsZeroRetireTrace = [&]() {
                             if (!state.enableXsZeroRetireTrace) {
                                 return;
                             }
                             if (*target != "v_difftest_InstrCommit") {
                                 return;
                             }
-                            auto appendTempU8 = [&](std::string_view label, std::size_t index) {
+                            auto appendTempU8 = [&](std::string_view prefix, std::string_view label, std::size_t index) {
                                 const bool present = index < state.tempU8Count;
-                                stmt += " << \" r36_" + std::string(label) +
+                                const std::string fullLabel = std::string(prefix) + "_" + std::string(label);
+                                stmt += " << \" " + fullLabel +
                                         "=\" << static_cast<std::uint64_t>(";
                                 stmt += present ? "evalTemps_->tempU8[" + std::to_string(index) + "]"
                                                 : "UINT64_C(0)";
                                 stmt += ")";
-                                stmt += " << \" r36_" + std::string(label) + "_present="
+                                stmt += " << \" " + fullLabel + "_present="
                                       + (present ? "1" : "0") + "\"";
                             };
-                            auto appendStateU8 = [&](std::string_view label, std::size_t index) {
+                            auto appendStateU8 = [&](std::string_view prefix, std::string_view label, std::size_t index) {
                                 const bool present = index < state.stateU8Count;
-                                stmt += " << \" r36_" + std::string(label) +
+                                const std::string fullLabel = std::string(prefix) + "_" + std::string(label);
+                                stmt += " << \" " + fullLabel +
                                         "=\" << static_cast<std::uint64_t>(";
                                 stmt += present ? "state_->stateU8[" + std::to_string(index) + "]"
                                                 : "UINT64_C(0)";
                                 stmt += ")";
-                                stmt += " << \" r36_" + std::string(label) + "_present="
+                                stmt += " << \" " + fullLabel + "_present="
                                       + (present ? "1" : "0") + "\"";
                             };
-                            appendTempU8("t1903395", 1903395);
-                            appendTempU8("t2516282", 2516282);
-                            appendStateU8("s78873", 78873);
-                            appendStateU8("hc0", 92257);
-                            appendStateU8("hc1", 92258);
-                            appendStateU8("hc2", 92259);
-                            appendStateU8("hc3", 92260);
-                            appendStateU8("hc4", 92261);
-                            appendStateU8("deq0_v", 92274);
-                            appendStateU8("deq0_w", 92275);
-                            appendStateU8("deq1_v", 92304);
-                            appendStateU8("deq1_w", 92305);
-                            appendStateU8("redirectValid", 93751);
-                            appendStateU8("redirectAll", 93752);
-                            appendStateU8("flushLast", 77454);
-                            appendStateU8("endpointValid", 236509);
+                            appendTempU8("r36", "t1903395", 1903395);
+                            appendTempU8("r36", "t2516282", 2516282);
+                            appendStateU8("r36", "s78873", 78873);
+                            appendStateU8("r36", "hc0", 92257);
+                            appendStateU8("r36", "hc1", 92258);
+                            appendStateU8("r36", "hc2", 92259);
+                            appendStateU8("r36", "hc3", 92260);
+                            appendStateU8("r36", "hc4", 92261);
+                            appendStateU8("r36", "deq0_v", 92274);
+                            appendStateU8("r36", "deq0_w", 92275);
+                            appendStateU8("r36", "deq1_v", 92304);
+                            appendStateU8("r36", "deq1_w", 92305);
+                            appendStateU8("r36", "redirectValid", 93751);
+                            appendStateU8("r36", "redirectAll", 93752);
+                            appendStateU8("r36", "flushLast", 77454);
+                            appendStateU8("r36", "endpointValid", 236509);
+
+                            appendTempU8("r38", "t2648875", 2648875);
+                            appendTempU8("r38", "t2206312", 2206312);
+                            appendTempU8("r38", "t2581973", 2581973);
+                            appendTempU8("r38", "t1903395", 1903395);
+                            appendTempU8("r38", "t2516282", 2516282);
+                            appendTempU8("r38", "t2020255", 2020255);
+                            appendTempU8("r38", "t2020254", 2020254);
+                            appendStateU8("r38", "endpointPipe0", 236477);
+                            appendStateU8("r38", "endpointPipe1", 236493);
+                            appendStateU8("r38", "endpointPipe2", 236509);
+                            appendStateU8("r38", "crossFtqCommit", 79792);
+                            appendStateU8("r38", "deq0_v", 92274);
+                            appendStateU8("r38", "deq0_w", 92275);
+                            appendStateU8("r38", "deq1_v", 92304);
+                            appendStateU8("r38", "deq1_w", 92305);
+                            appendStateU8("r38", "redirectValid", 93751);
+                            appendStateU8("r38", "redirectAll", 93752);
+                            appendStateU8("r38", "flushLast", 77454);
                         };
                         stmt = "        { const bool " + condName + " = static_cast<bool>(" + condition + "); ";
                         stmt += "static bool " + seenName + " = false; static unsigned " + hitsName + " = 0; ";
@@ -2485,21 +2514,21 @@ namespace wolvrix::lib::emit
                         for (std::size_t i = 0; i < args.size(); ++i) {
                             stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                         }
-                        appendRound36XsZeroRetireTrace();
+                        appendXsZeroRetireTrace();
                         stmt += " << \"\\n\"; " + seenName + " = true; } ";
                         if (traceFalseSamples) {
                             stmt += "if (!" + condName + ") { ++" + missesName + "; if (" + missesName + " <= 16U || (" + missesName + " % 1024U) == 0U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " miss=\" << " + missesName;
                             for (std::size_t i = 0; i < args.size(); ++i) {
                                 stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                             }
-                            appendRound36XsZeroRetireTrace();
+                            appendXsZeroRetireTrace();
                             stmt += " << \"\\n\"; } } ";
                         }
                         stmt += "if (" + condName + ") { ++" + hitsName + "; if (" + hitsName + " <= 16U) { std::cerr << \"[wolvrix-gsim-dpic] site=" + std::to_string(callSite) + " target=" + *target + " hit=\" << " + hitsName;
                         for (std::size_t i = 0; i < args.size(); ++i) {
                             stmt += " << \" arg" + std::to_string(i) + "=\" << static_cast<std::uint64_t>(" + args[i] + ")";
                         }
-                        appendRound36XsZeroRetireTrace();
+                        appendXsZeroRetireTrace();
                         stmt += " << \"\\n\"; } " + *target + "(";
                     } else {
                         stmt = "        if (" + condition + ") { " + *target + "(";
@@ -2511,7 +2540,7 @@ namespace wolvrix::lib::emit
                         stmt += args[i];
                     }
                     stmt += "); committed_ = true; }";
-                    if (state.enableDpicTrace) {
+                    if (state.enableDpicTrace && state.shouldTraceDpicTarget(*target)) {
                         stmt += " }";
                     }
                     recordDpicCall(state, *target);
@@ -5702,6 +5731,16 @@ namespace wolvrix::lib::emit
         state.enableXsZeroRetireTrace =
             state.enableDpicTrace && attrEnabled(options, "xs_zero_retire_trace", false);
         state.dpicGlobalWarmupSteps = parsePositiveIntAttr(options, "dpic_global_warmup_steps", 0);
+        if (auto targetsAttr = attrValue(options, "dpic_trace_targets"))
+        {
+            for (auto &targetName : splitCsv(*targetsAttr)) {
+                state.dpicTraceTargets.insert(std::move(targetName));
+            }
+        }
+        if (state.enableXsZeroRetireTrace && state.dpicTraceTargets.empty())
+        {
+            state.dpicTraceTargets.insert("v_difftest_InstrCommit");
+        }
         const bool emitMetadata = attrEnabled(options, "emit_metadata", true);
         std::vector<std::string> outputKeepPrefixes;
         if (auto keepPrefixesAttr = attrValue(options, "output_keep_prefixes"))
