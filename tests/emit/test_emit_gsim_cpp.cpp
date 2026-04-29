@@ -2246,6 +2246,39 @@ Design buildSelectiveReplayShardedDesign()
     return design;
 }
 
+Design buildFirstShardDirtyReplayDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto input = makeValue(graph, "in", 1, false);
+    graph.bindInputPort("in", input);
+
+    const auto dirtyOut = makeValue(graph, "dirty_out", 1, false);
+    const auto firstDirty = graph.createOperation(OperationKind::kNot, graph.internSymbol("first_dirty_not"));
+    graph.addOperand(firstDirty, input);
+    graph.addResult(firstDirty, dirtyOut);
+    graph.bindOutputPort("dirty_out", dirtyOut);
+
+    const auto constSeed = makeConstant(graph, "first_shard_const_seed", "first_shard_const_seed_op", 1, "1'b1");
+    auto constCurrent = constSeed;
+    // Keep enough input-independent work after the first dirty statement to
+    // force multiple shards while keeping shard 0's first statement as the
+    // non-clock dirty replay boundary under test.
+    for (int i = 0; i < 176; ++i)
+    {
+        const auto next = makeValue(graph, "first_shard_const_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("first_shard_const_not_" + std::to_string(i)));
+        graph.addOperand(op, constCurrent);
+        graph.addResult(op, next);
+        constCurrent = next;
+    }
+    graph.bindOutputPort("const_out", constCurrent);
+    return design;
+}
+
 
 Design buildConvergentActiveReplayDesign()
 {
@@ -6527,6 +6560,63 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "dirty replay helper should enqueue replayed-shard successors instead of falling back to all shards");
 }
 
+void testFirstShardFirstStatementKeepsDirtyReplayMask()
+{
+    Design design = buildFirstShardDirtyReplayDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "first_shard_dirty_replay_emit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("first_shard_dirty_replay_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp first-shard dirty replay fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp first-shard dirty replay fixture should not emit diagnostics");
+
+    const std::string source = readFile(dir / "first_shard_dirty_replay_top.cpp");
+    const std::string marker = "void SSimTop::replay_dirty_mask_shards(std::uint8_t replay_mask_) {";
+    const auto markerPos = source.find(marker);
+    expect(markerPos != std::string::npos,
+           "first-shard fixture should emit replay_dirty_mask_shards helper");
+    const auto endPos = source.find("}\n\nvoid SSimTop::replay_clock_input_shards()", markerPos);
+    expect(endPos != std::string::npos,
+           "first-shard fixture should place replay helper before commit_step");
+    const std::string replayBody = source.substr(markerPos, endPos - markerPos);
+
+    expect(contains(replayBody, "if ((replay_mask_ & UINT8_C(2)) != UINT8_C(0)) {\n        sched_0();"),
+           "first-shard dirty replay helper should guard sched_0 with the non-clock dirty mask");
+
+    const std::string runner = R"CPP(
+#include "first_shard_dirty_replay_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(0);
+    sim.settle();
+    if (sim.get_dirty_out() != 1) {
+        return 1;
+    }
+    sim.set_in(1);
+    sim.settle();
+    if (sim.get_dirty_out() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "first_shard_dirty_replay_top", runner);
+}
+
 
 void testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout()
 {
@@ -7090,6 +7180,7 @@ int main()
         testMediumGraphsEnableSharding();
         testDirtyReplayEdgeWithoutCommitRefreshesOutputs();
         testReplayDirtyInputShardsSkipsInputIndependentShards();
+        testFirstShardFirstStatementKeepsDirtyReplayMask();
         testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout();
         testShiftCompileAndRun();
         testWideShiftCompileAndRun();

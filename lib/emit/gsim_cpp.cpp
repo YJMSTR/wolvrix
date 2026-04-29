@@ -261,8 +261,8 @@ namespace wolvrix::lib::emit
 
             void emitShardStatement(const std::string& stmt) {
                 ensureShardSpace(static_cast<int>(stmt.length()));
-                markCurrentShardActivity();
                 std::string* shard = getCurrentShardBuffer();
+                markCurrentShardActivity();
                 shard->append(stmt);
                 shard->push_back('\n');
                 currentShardSize += static_cast<int>(stmt.length());
@@ -271,8 +271,8 @@ namespace wolvrix::lib::emit
             void emitShardAssignment(const std::string& lhs, const std::string& rhs) {
                 const int estimatedSize = static_cast<int>(lhs.length() + rhs.length() + 4U);
                 ensureShardSpace(estimatedSize);
-                markCurrentShardActivity();
                 std::string* shard = getCurrentShardBuffer();
+                markCurrentShardActivity();
                 shard->append(lhs);
                 shard->append(" = ");
                 shard->append(rhs);
