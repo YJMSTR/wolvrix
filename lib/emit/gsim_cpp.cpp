@@ -7558,27 +7558,8 @@ namespace wolvrix::lib::emit
                     os << indent << "activate_all_shards(); ";
                 }
             };
-            auto activitySourceTouchText = [&](const std::string& source, std::string_view indent = "") {
-                std::ostringstream touch;
-                if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
-                    return touch.str();
-                }
-                std::set<int> firstShards;
-                if (const auto headsIt = state.activitySourceHeadShards.find(source);
-                    headsIt != state.activitySourceHeadShards.end()) {
-                    firstShards.insert(headsIt->second.begin(), headsIt->second.end());
-                } else if (const auto shardIt = state.activitySourceFirstShard.find(source);
-                           shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
-                    firstShards.insert(shardIt->second);
-                }
-                if (!firstShards.empty()) {
-                    emitShardWordMaskActivation(touch, shardWordMasksFor(firstShards), indent, " ");
-                } else {
-                    touch << indent << "activate_all_shards(); ";
-                }
-                return touch.str();
-            };
             auto emitStatement = [&](std::string s, bool dirtyOnCommit = false, const std::string* touchSource = nullptr) {
+                (void)touchSource;
                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
                 if (dirtyOnCommit) {
                     const std::string needle = "committed_ = true;";
@@ -7592,9 +7573,6 @@ namespace wolvrix::lib::emit
                 if (!chunk.regNames.empty()) {
                     const std::string needle = "committed_ = true;";
                     std::string replacement = "chunk_updated_ = true; ";
-                    if (touchSource != nullptr) {
-                        replacement += activitySourceTouchText(*touchSource);
-                    }
                     replacement += "committed_ = true;";
                     std::size_t pos = 0;
                     while ((pos = s.find(needle, pos)) != std::string::npos) {
@@ -7771,6 +7749,12 @@ namespace wolvrix::lib::emit
             }
             for (const auto& [regName, stmt] : delayedDirectWrites) {
                 emitStatement(stmt, false, &regName);
+            }
+            if (!chunk.regNames.empty() && state.enableSharding &&
+                state.enableActivityWatermark && state.shardCount() > 0) {
+                os << "    if (chunk_updated_) { ";
+                emitActivitySourceTouches(chunk.regNames, "");
+                os << "}\n";
             }
             if (tracksStatementDirty && state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                 std::vector<std::string> dirtyActivitySources;

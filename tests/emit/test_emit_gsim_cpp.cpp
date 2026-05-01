@@ -8566,22 +8566,26 @@ void testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce()
     options.outputFilename = std::string("multi_chunk_multi_masked_scalar_top");
     options.topOverrides = {"top"};
     options.attributes["commit_shard_max_bytes"] = "32768";
+    options.attributes["activity_shard_watermark"] = "1";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp multi-chunk multi-masked scalar fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp multi-chunk multi-masked scalar fixture should not emit errors");
 
     std::string generatedSources;
+    std::string commitChunkSources;
     std::size_t commitChunkCount = 0;
     for (const auto& entry : std::filesystem::directory_iterator(dir))
     {
         if (entry.path().extension() == ".cpp")
         {
             const auto pathText = entry.path().filename().string();
+            const std::string source = readFile(entry.path());
             if (pathText.find("_commit_chunk_") != std::string::npos) {
                 ++commitChunkCount;
+                commitChunkSources += source;
             }
-            generatedSources += readFile(entry.path());
+            generatedSources += source;
         }
     }
     expect(commitChunkCount > 1,
@@ -8591,6 +8595,10 @@ void testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce()
            "multi-chunk multi-masked scalar writes should still merge through a local next-state value");
     expect(countOccurrences(generatedSources, "static_cast<std::size_t>(0), next_reg_q)") == 1,
            "multi-chunk multi-masked scalar writes should append one sparse pending write per register per chunk");
+    expect(countOccurrences(commitChunkSources, "if (chunk_updated_) { activate_shard_mask(") <= commitChunkCount,
+           "multi-chunk register activity should be touched once per updated chunk rather than per write site");
+    expect(countOccurrences(commitChunkSources, "chunk_updated_ = true; activate_shard_mask(") == 0,
+           "multi-chunk register activity should not be duplicated at each scalar write site");
 
     const std::string runner = R"CPP(
 #include "multi_chunk_multi_masked_scalar_top.hpp"
