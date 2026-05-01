@@ -3020,6 +3020,38 @@ Design buildMultiMaskedScalarRegisterWriteDesign()
     return design;
 }
 
+Design buildMultiChunkMultiMaskedScalarRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto lowData = makeConstant(graph, "low_data", "low_data_const", 8, "8'h0a");
+    const auto lowMask = makeConstant(graph, "low_mask", "low_mask_const", 8, "8'h0f");
+    const auto highData = makeConstant(graph, "high_data", "high_data_const", 8, "8'hb0");
+    const auto highMask = makeConstant(graph, "high_mask", "high_mask_const", 8, "8'hf0");
+    makeRegisterWrite(graph, "q_low_write", one, lowData, lowMask, clk, "q");
+    makeRegisterWrite(graph, "q_high_write", one, highData, highMask, clk, "q");
+
+    const auto padValue = makeConstant(graph, "pad_value", "pad_value_const", 8, "8'h11");
+    const auto padMask = makeConstant(graph, "pad_mask", "pad_mask_const", 8, "8'hff");
+    for (int i = 0; i < 520; ++i) {
+        const std::string sym = "m_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, padMask, clk, sym);
+    }
+
+    return design;
+}
+
 Design buildMultiMaskedWideRegisterWriteDesign()
 {
     Design design;
@@ -8519,6 +8551,66 @@ int main() {
     compileAndRunHarness(dir, "multi_masked_scalar_top", runner);
 }
 
+void testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce()
+{
+    Design design = buildMultiChunkMultiMaskedScalarRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "multi_chunk_multi_masked_scalar";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("multi_chunk_multi_masked_scalar_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp multi-chunk multi-masked scalar fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp multi-chunk multi-masked scalar fixture should not emit errors");
+
+    std::string generatedSources;
+    std::size_t commitChunkCount = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            const auto pathText = entry.path().filename().string();
+            if (pathText.find("_commit_chunk_") != std::string::npos) {
+                ++commitChunkCount;
+            }
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(commitChunkCount > 1,
+           "multi-chunk multi-masked scalar fixture should force more than one commit chunk");
+    expect(contains(generatedSources, "next_reg_q_merged_ = ((next_reg_q)") &&
+               contains(generatedSources, "next_reg_q_updated_ = true"),
+           "multi-chunk multi-masked scalar writes should still merge through a local next-state value");
+    expect(countOccurrences(generatedSources, "static_cast<std::size_t>(0), next_reg_q)") == 1,
+           "multi-chunk multi-masked scalar writes should append one sparse pending write per register per chunk");
+
+    const std::string runner = R"CPP(
+#include "multi_chunk_multi_masked_scalar_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0xba) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "multi_chunk_multi_masked_scalar_top", runner);
+}
+
 void testMultiMaskedWideRegisterWritesAccumulateInNextState()
 {
     Design design = buildMultiMaskedWideRegisterWriteDesign();
@@ -8692,9 +8784,8 @@ void testMultiChunkRegisterWritesUseDomainNextState()
            "multi-chunk register chunk methods should append staged writes to the sparse domain next-state target");
     expect(contains(generatedSources, "domain_next_stateU8_.reserve("),
            "multi-chunk register domains should reserve sparse pending storage by pool");
-    expect(contains(generatedSources, "next_stateU8_->emplace_back(static_cast<std::size_t>(") &&
-               contains(generatedSources, "), next_reg_a_q);"),
-           "multi-chunk scalar register chunks should append only touched scalar registers at the update site");
+    expect(contains(generatedSources, "next_stateU8_->emplace_back(static_cast<std::size_t>("),
+           "multi-chunk scalar register chunks should append touched scalar registers to the sparse domain target");
 
     const std::string runner = R"CPP(
 #include "multi_chunk_reg_top.hpp"
@@ -8972,6 +9063,14 @@ int main()
                 testMultiChunkDirectEligibleWritesUseDomainNextStaging();
                 return 0;
             }
+            if (name == "multi-chunk-register-domain-next") {
+                testMultiChunkRegisterWritesUseDomainNextState();
+                return 0;
+            }
+            if (name == "multi-chunk-multi-masked-scalar") {
+                testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce();
+                return 0;
+            }
             if (name == "eq") {
                 testEqCompileAndRun();
                 return 0;
@@ -9081,6 +9180,7 @@ int main()
         testStateConditionRegisterWriteUsesNextStateBarrier();
         testRegisterWriteWithoutClockSymbolUsesClockOperand();
         testMultiMaskedScalarRegisterWritesAccumulateInNextState();
+        testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce();
         testMultiMaskedWideRegisterWritesAccumulateInNextState();
         testWideZeroMaskRegisterWriteDoesNotCommit();
         testMultiChunkRegisterWritesUseDomainNextState();

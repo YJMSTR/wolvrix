@@ -7702,9 +7702,7 @@ namespace wolvrix::lib::emit
                     os << "    bool next_" << regName << "_updated_ = false;\n";
                 } else {
                     os << "    auto next_" << regName << " = " << state.persistentStorageExpr(regName) << ";\n";
-                    if (!writeRegsToDomainNextState) {
-                        os << "    bool next_" << regName << "_updated_ = false;\n";
-                    }
+                    os << "    bool next_" << regName << "_updated_ = false;\n";
                 }
             }
             for (const auto &regName : chunk.regNames) {
@@ -7764,16 +7762,6 @@ namespace wolvrix::lib::emit
                     continue;
                 }
                 for (auto stmt : regStmtIt->second) {
-                    if (writeRegsToDomainNextState && !wideReg) {
-                        const std::string needle = "next_" + regName + "_updated_ = true; committed_ = true;";
-                        const std::string replacement = domainNextWriteStmt(regName, "next_" + regName, false) +
-                                                        "; committed_ = true;";
-                        std::size_t pos = 0;
-                        while ((pos = stmt.find(needle, pos)) != std::string::npos) {
-                            stmt.replace(pos, needle.size(), replacement);
-                            pos += replacement.size();
-                        }
-                    }
                     emitStatement(stmt, false, &regName);
                 }
             }
@@ -7826,8 +7814,6 @@ namespace wolvrix::lib::emit
                     if (wideReg) {
                         os << "        if (next_" << regName << "_updated_) { "
                            << domainNextWriteStmt(regName, "next_" + regName, true) << "; }\n";
-                    } else if (writeRegsToDomainNextState) {
-                        continue;
                     } else {
                         os << "        if (next_" << regName << "_updated_) { "
                            << domainNextWriteStmt(regName, "next_" + regName, false) << "; }\n";
