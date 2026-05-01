@@ -2739,6 +2739,32 @@ Design buildConvergentActiveReplayDesign()
     return design;
 }
 
+Design buildCrossWordShardActivationRangeDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto input = makeValue(graph, "in", 65, false);
+    graph.bindInputPort("in", input);
+
+    const auto root = makeValue(graph, "root", 65, false);
+    const auto rootOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("root_not"));
+    graph.addOperand(rootOp, input);
+    graph.addResult(rootOp, root);
+
+    for (int i = 0; i < 192; ++i)
+    {
+        const auto next = makeValue(graph, "fanout_tmp_" + std::to_string(i), 65, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("fanout_not_" + std::to_string(i)));
+        graph.addOperand(op, root);
+        graph.addResult(op, next);
+        graph.bindOutputPort("y" + std::to_string(i), next);
+    }
+
+    return design;
+}
+
 Design buildShiftDesign()
 {
     Design design;
@@ -7965,6 +7991,47 @@ int main() {
     compileAndRunHarness(dir, "active_worklist_top", runner);
 }
 
+void testGenericShardActivationPacksCrossWordRangesIndependently()
+{
+    Design design = buildCrossWordShardActivationRangeDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "shard_activation_range_packing_emit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("shard_activation_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "64";
+    options.attributes["activity_shard_watermark"] = "1";
+    options.attributes["changed_value_fanout_inline_mask_limit"] = "999";
+    options.attributes["shard_activation_inline_mask_limit"] = "0";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp shard-activation packing fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp shard-activation packing fixture should not emit diagnostics");
+
+    std::size_t shardCount = 0;
+    while (std::filesystem::exists(dir / ("shard_activation_top_sched_" + std::to_string(shardCount) + ".cpp")))
+    {
+        ++shardCount;
+    }
+    expect(shardCount > 64, "shard-activation packing fixture should emit enough shards to span active words");
+
+    const std::string source = readFile(dir / "shard_activation_top.cpp");
+    expect(contains(source, "constexpr WolvrixGsimShardActivationRange kShardActivationRanges[] = {"),
+           "generic shard activation should emit packed range tables when the inline limit is zero");
+    expect(contains(source, "void SSimTop::activate_shard_mask_range(std::uint32_t rangeId) {"),
+           "generic shard activation should emit the packed range helper");
+    expect(countOccurrences(source, "activate_shard_mask_range(") >= 2,
+           "generic shard activation should call the packed range helper from generated shards");
+    expect(!contains(source, "kChangedFanoutRanges"),
+           "generic shard activation packing should not require changed-value fanout range tables");
+}
+
 void testShiftCompileAndRun()
 {
     Design design = buildShiftDesign();
@@ -8821,6 +8888,10 @@ int main()
             }
             if (name == "active-worklist-convergent-fanout") {
                 testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout();
+                return 0;
+            }
+            if (name == "shard-activation-range-packing") {
+                testGenericShardActivationPacksCrossWordRangesIndependently();
                 return 0;
             }
             if (name == "direct-eligible-commit-barrier") {
