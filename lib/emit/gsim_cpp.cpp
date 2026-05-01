@@ -2284,6 +2284,50 @@ namespace wolvrix::lib::emit
                 }
                 return operandExprCache[idx];
             };
+            auto getScalarConstantOperandExpr = [&](size_t idx) -> std::optional<std::string> {
+                if (idx >= operands.size() || idx >= operandWidths.size() || operandWidths[idx] > 64) {
+                    return std::nullopt;
+                }
+                const auto defOpId = graph.valueDef(operands[idx]);
+                if (!defOpId.valid()) {
+                    return std::nullopt;
+                }
+                const auto defOp = graph.getOperation(defOpId);
+                if (defOp.kind() != OperationKind::kConstant) {
+                    return std::nullopt;
+                }
+                auto valueAttr = defOp.attr("constValue");
+                if (!valueAttr) {
+                    valueAttr = defOp.attr("value");
+                }
+                if (!valueAttr) {
+                    return std::nullopt;
+                }
+                if (auto *strVal = std::get_if<std::string>(&*valueAttr)) {
+                    return convertVerilogConstant(*strVal);
+                }
+                if (auto *intVal = std::get_if<int64_t>(&*valueAttr)) {
+                    return std::to_string(*intVal);
+                }
+                return std::nullopt;
+            };
+            std::vector<std::string> operandScalarExprCache(operands.size());
+            std::vector<std::uint8_t> operandScalarExprCached(operands.size(), 0);
+            auto getOperandScalarExprPreferLiteral = [&](size_t idx) -> const std::string& {
+                static const std::string zero = "0";
+                if (idx >= operands.size()) {
+                    return zero;
+                }
+                if (operandScalarExprCached[idx] == 0) {
+                    if (auto constantExpr = getScalarConstantOperandExpr(idx)) {
+                        operandScalarExprCache[idx] = std::move(*constantExpr);
+                    } else {
+                        operandScalarExprCache[idx] = getOperandExpr(idx);
+                    }
+                    operandScalarExprCached[idx] = 1;
+                }
+                return operandScalarExprCache[idx];
+            };
 
             auto recordResultMetadata = [&](size_t idx) {
                 if (idx >= results.size()) {
@@ -3507,10 +3551,10 @@ namespace wolvrix::lib::emit
 
                 case OperationKind::kRegisterWritePort: {
                     // Operands: [updateCond, nextValue, mask, ...]
-                    std::string condition = getOperandExpr(0);
+                    std::string condition = getOperandScalarExprPreferLiteral(0);
                     std::string nextValue = getOperandExpr(1);
                     const bool hasMaskOperand = operands.size() > 2;
-                    std::string mask = hasMaskOperand ? getOperandExpr(2) : std::string{};
+                    std::string mask = hasMaskOperand ? getOperandScalarExprPreferLiteral(2) : std::string{};
 
                     // Find the target register by looking at the first operand's defining op
                     // Or use regSymbol attribute if available
@@ -7635,16 +7679,16 @@ namespace wolvrix::lib::emit
                 }
                 return canDirectSequentialWrite(regName, regStmts);
             };
-            constexpr bool kAllowDelayedDirectSequentialStateWrite = false;
+            constexpr bool kAllowDelayedDirectSequentialStateWrite = true;
             std::vector<std::pair<std::string, std::string>> delayedDirectWrites;
 
             for (const auto &regName : chunk.regNames) {
                 const auto regStmtIt = chunk.regStmts.find(regName);
                 const std::vector<std::string>& regStmts = regStmtIt != chunk.regStmts.end() ? regStmtIt->second : chunk.stmts;
                 const bool wideReg = isWideReg(regName, regStmts);
-                const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && wideReg &&
+                const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && writeRegsToDomainNextState && wideReg &&
                                              canDirectWideWrite(regName, regStmts);
-                const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && !wideReg &&
+                const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && writeRegsToDomainNextState && !wideReg &&
                                                canDirectScalarWrite(regName, regStmts);
                 if (directWideWrite || directScalarWrite) {
                     continue;
@@ -7670,9 +7714,9 @@ namespace wolvrix::lib::emit
                 }
                 const bool wideReg = isWideReg(regName, regStmtIt->second);
                 const auto parsed = regStmtIt->second.size() == 1 ? parseSingleNextAssignment(regName, regStmtIt->second.front()) : std::optional<ParsedNextAssignment>{};
-                const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && wideReg &&
+                const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && writeRegsToDomainNextState && wideReg &&
                                              canDirectWideWrite(regName, regStmtIt->second);
-                const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && !wideReg &&
+                const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && writeRegsToDomainNextState && !wideReg &&
                                                 canDirectScalarWrite(regName, regStmtIt->second);
                 if (directWideWrite) {
                     const DomainNextTarget target = targetStorage(regName);
@@ -7772,9 +7816,9 @@ namespace wolvrix::lib::emit
                     const auto regStmtIt = chunk.regStmts.find(regName);
                     const std::vector<std::string>& regStmts = regStmtIt != chunk.regStmts.end() ? regStmtIt->second : chunk.stmts;
                     const bool wideReg = isWideReg(regName, regStmts);
-                    const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && wideReg &&
+                    const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && writeRegsToDomainNextState && wideReg &&
                                                  canDirectWideWrite(regName, regStmts);
-                    const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && !wideReg &&
+                    const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && writeRegsToDomainNextState && !wideReg &&
                                                    canDirectScalarWrite(regName, regStmts);
                     if (directWideWrite || directScalarWrite) {
                         continue;

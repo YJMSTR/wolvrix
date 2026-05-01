@@ -2895,6 +2895,31 @@ Design buildDirectEligibleRegisterWriteDesign()
     return design;
 }
 
+Design buildMultiChunkDirectEligibleRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    for (int i = 0; i < 4096; ++i)
+    {
+        const std::string regName = "q" + std::to_string(i);
+        (void)makeRegister(graph, regName + "_storage", regName + "_reg", 8, regName);
+        const auto qRead = makeRegisterRead(graph, regName + "_read", regName + "_read_op", 8, regName);
+        graph.bindOutputPort(regName, qRead);
+        makeRegisterWrite(graph, regName + "_write", one, inD, mask, clk, regName);
+    }
+
+    return design;
+}
+
 Design buildFullMaskNarrowRegisterWriteDesign()
 {
     Design design;
@@ -8281,6 +8306,51 @@ int main() {
     compileAndRunHarness(dir, "direct_commit_top", runner);
 }
 
+void testMultiChunkDirectEligibleWritesUseDomainNextStaging()
+{
+    Design design = buildMultiChunkDirectEligibleRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "multi_chunk_direct_domain_next";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("multi_chunk_direct_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp multi-chunk direct fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp multi-chunk direct fixture should not emit errors");
+
+    std::string generatedSources;
+    std::size_t commitChunkCount = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            const auto pathText = entry.path().filename().string();
+            if (pathText.find("_commit_chunk_") != std::string::npos) {
+                ++commitChunkCount;
+            }
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(commitChunkCount > 1,
+           "multi-chunk direct fixture should force more than one commit chunk in the same domain");
+    expect(contains(generatedSources, "std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_"),
+           "multi-chunk domains should stage scalar writes in a domain-level next-state vector");
+    expect(contains(generatedSources, "const auto delayed_direct_reg_q0 = ((input_d_) & 255)"),
+           "direct-eligible writes may skip per-register next locals only when the domain next-state vector exists");
+    expect(contains(generatedSources, "next_stateU8_->emplace_back"),
+           "direct-eligible multi-chunk writes should append to domain next-state rather than persistent state");
+    expect(!contains(generatedSources, "auto next_reg_q0 = state_->stateU8["),
+           "domain-next staged direct writes should avoid per-register next locals on the hot multi-chunk path");
+}
+
 void testFullMaskNarrowRegisterWriteMasksStorageBits()
 {
     Design design = buildFullMaskNarrowRegisterWriteDesign();
@@ -8896,6 +8966,10 @@ int main()
             }
             if (name == "direct-eligible-commit-barrier") {
                 testDirectEligibleRegisterWriteUsesCommitBarrier();
+                return 0;
+            }
+            if (name == "multi-chunk-direct-domain-next") {
+                testMultiChunkDirectEligibleWritesUseDomainNextStaging();
                 return 0;
             }
             if (name == "eq") {
