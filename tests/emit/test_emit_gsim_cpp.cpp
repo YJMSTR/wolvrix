@@ -234,6 +234,25 @@ OperationId makeRegisterWriteWithEdge(Graph &graph,
     return op;
 }
 
+OperationId makeRegisterWriteWithoutClockSymbol(Graph &graph,
+                                                const std::string &opName,
+                                                ValueId updateCond,
+                                                ValueId nextValue,
+                                                ValueId maskValue,
+                                                ValueId clk,
+                                                const std::string &regSymbol)
+{
+    const auto op = graph.createOperation(OperationKind::kRegisterWritePort,
+                                          graph.internSymbol(opName));
+    graph.addOperand(op, updateCond);
+    graph.addOperand(op, nextValue);
+    graph.addOperand(op, maskValue);
+    graph.addOperand(op, clk);
+    graph.setAttr(op, "regSymbol", regSymbol);
+    graph.setAttr(op, "eventEdge", std::vector<std::string>{"posedge"});
+    return op;
+}
+
 void addInstance(Graph &graph,
                  std::string_view instanceName,
                  std::string_view moduleName,
@@ -1135,6 +1154,46 @@ Design buildDerivedClockPostCommitReplayDesign()
     for (int i = 0; i < 140; ++i) {
         (void)makeConstant(graph, "padding_const_" + std::to_string(i),
                            "padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
+Design buildReverseOrderedDerivedClockPostCommitReplayDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto zClk = makeValue(graph, "z_clk", 1, false);
+    graph.bindInputPort("z_clk", zClk);
+
+    (void)makeRegister(graph, "gate_storage", "gate_reg", 1, "gate");
+    const auto gateRead = makeRegisterRead(graph, "gate_read", "gate_read_op", 1, "gate");
+    (void)makeRegister(graph, "data_storage", "data_reg", 8, "data");
+    const auto dataRead = makeRegisterRead(graph, "data_read", "data_read_op", 8, "data");
+    graph.bindOutputPort("data", dataRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask1 = makeConstant(graph, "mask1", "mask1_const", 1, "1'b1");
+    const auto dataValue = makeConstant(graph, "data_value", "data_value_const", 8, "8'h5a");
+    const auto mask8 = makeConstant(graph, "mask8", "mask8_const", 8, "8'hff");
+
+    const auto gateWrite = makeRegisterWrite(graph, "gate_write", one, one, mask1, zClk, "gate");
+    graph.setAttr(gateWrite, "clockSymbol", std::string("z_clk"));
+
+    const auto aGatedClk = makeValue(graph, "a_gated_clk", 1, false);
+    const auto andOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("a_gated_clk_and"));
+    graph.addOperand(andOp, zClk);
+    graph.addOperand(andOp, gateRead);
+    graph.addResult(andOp, aGatedClk);
+
+    const auto dataWrite = makeRegisterWrite(graph, "data_write", one, dataValue, mask8, aGatedClk, "data");
+    graph.setAttr(dataWrite, "clockSymbol", std::string("a_gated_clk"));
+
+    for (int i = 0; i < 140; ++i) {
+        (void)makeConstant(graph, "reverse_order_padding_const_" + std::to_string(i),
+                           "reverse_order_padding_const_op_" + std::to_string(i), 1, "1'b0");
     }
 
     return design;
@@ -2329,6 +2388,42 @@ Design buildShardedNoCommitInputOutputDesign()
     return design;
 }
 
+Design buildReplayOnlyEdgeBatchDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto a = makeValue(graph, "a", 1, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("a", a);
+
+    auto current = a;
+    for (int i = 0; i < 140; ++i)
+    {
+        const auto next = makeValue(graph, "batch_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot, graph.internSymbol("batch_not_" + std::to_string(i)));
+        graph.addOperand(op, current);
+        graph.addResult(op, next);
+        current = next;
+    }
+    graph.bindOutputPort("y", current);
+
+    const auto zeroCond = makeConstant(graph, "zero_cond", "zero_cond_const", 1, "1'b0");
+    const auto oneMask = makeConstant(graph, "one_mask", "one_mask_const", 1, "1'b1");
+    for (int i = 0; i < 3; ++i)
+    {
+        const std::string regSymbol = "empty_state_" + std::to_string(i);
+        (void)makeRegister(graph, regSymbol + "_storage", regSymbol + "_reg", 1, regSymbol);
+        makeRegisterWrite(graph, "empty_state_write_" + std::to_string(i), zeroCond, current, oneMask, clk, regSymbol);
+    }
+    const std::string activeRegSymbol = "active_state";
+    (void)makeRegister(graph, activeRegSymbol + "_storage", activeRegSymbol + "_reg", 1, activeRegSymbol);
+    makeRegisterWrite(graph, "active_state_write", a, a, oneMask, clk, activeRegSymbol);
+    return design;
+}
+
 Design buildSelectiveReplayShardedDesign()
 {
     Design design;
@@ -2359,6 +2454,157 @@ Design buildSelectiveReplayShardedDesign()
         constCurrent = next;
     }
     graph.bindOutputPort("const_out", constCurrent);
+    return design;
+}
+
+
+Design buildChangedFanoutCoalescingDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto a = makeValue(graph, "a", 1, false);
+    const auto b = makeValue(graph, "b", 1, false);
+    graph.bindInputPort("a", a);
+    graph.bindInputPort("b", b);
+
+    const auto aChanged = makeValue(graph, "a_changed", 1, false);
+    const auto aChangedOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("a_changed_not"));
+    graph.addOperand(aChangedOp, a);
+    graph.addResult(aChangedOp, aChanged);
+
+    const auto bChanged = makeValue(graph, "b_changed", 1, false);
+    const auto bChangedOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("b_changed_not"));
+    graph.addOperand(bChangedOp, b);
+    graph.addResult(bChangedOp, bChanged);
+
+    const auto constSeed = makeConstant(graph, "coalesce_const_seed", "coalesce_const_seed_op", 1, "1'b1");
+    auto constCurrent = constSeed;
+    for (int i = 0; i < 160; ++i)
+    {
+        const auto next = makeValue(graph, "coalesce_const_tmp_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("coalesce_const_not_" + std::to_string(i)));
+        graph.addOperand(op, constCurrent);
+        graph.addResult(op, next);
+        constCurrent = next;
+    }
+
+    const auto aFanout = makeValue(graph, "a_fanout", 1, false);
+    const auto aFanoutOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("a_fanout_not"));
+    graph.addOperand(aFanoutOp, aChanged);
+    graph.addResult(aFanoutOp, aFanout);
+
+    const auto bFanout = makeValue(graph, "b_fanout", 1, false);
+    const auto bFanoutOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("b_fanout_not"));
+    graph.addOperand(bFanoutOp, bChanged);
+    graph.addResult(bFanoutOp, bFanout);
+
+    const auto y = makeValue(graph, "y", 1, false);
+    const auto xorOp = graph.createOperation(OperationKind::kXor, graph.internSymbol("coalesced_y_xor"));
+    graph.addOperand(xorOp, aFanout);
+    graph.addOperand(xorOp, bFanout);
+    graph.addResult(xorOp, y);
+    graph.bindOutputPort("y", y);
+    graph.bindOutputPort("const_out", constCurrent);
+    return design;
+}
+
+Design buildChangedFanoutSpanCoalescingDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+    const auto zero = makeConstant(graph, "span_zero", "span_zero_const", 1, "1'b0");
+    const auto one = makeConstant(graph, "span_one", "span_one_const", 1, "1'b1");
+    (void)makeRegister(graph, "span_cond_storage", "span_cond_reg", 1, "span_cond");
+    const auto cond = makeRegisterRead(graph, "span_cond_q", "span_cond_read", 1, "span_cond");
+    const auto nextCond = makeValue(graph, "span_cond_next", 1, false);
+    const auto nextCondOp = graph.createOperation(OperationKind::kNot, graph.internSymbol("span_cond_toggle"));
+    graph.addOperand(nextCondOp, cond);
+    graph.addResult(nextCondOp, nextCond);
+
+    std::vector<ValueId> trueConstants;
+    std::vector<ValueId> falseConstants;
+    for (int i = 0; i < 8; ++i)
+    {
+        trueConstants.push_back(makeConstant(graph,
+                                             "span_true_lane_const_" + std::to_string(i),
+                                             "span_true_lane_const_op_" + std::to_string(i),
+                                             1,
+                                             (i % 2 == 0) ? "1'b0" : "1'b1"));
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        falseConstants.push_back(makeConstant(graph,
+                                              "span_false_lane_const_" + std::to_string(i),
+                                              "span_false_lane_const_op_" + std::to_string(i),
+                                              1,
+                                              (i % 2 == 0) ? "1'b1" : "1'b0"));
+    }
+
+    std::vector<ValueId> trueValues;
+    std::vector<ValueId> falseValues;
+    for (int i = 0; i < 8; ++i)
+    {
+        const auto next = makeValue(graph, "span_true_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kXor,
+                                              graph.internSymbol("span_true_xor_" + std::to_string(i)));
+        graph.addOperand(op, zero);
+        graph.addOperand(op, trueConstants[static_cast<std::size_t>(i)]);
+        graph.addResult(op, next);
+        trueValues.push_back(next);
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        const auto next = makeValue(graph, "span_false_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kXor,
+                                              graph.internSymbol("span_false_xor_" + std::to_string(i)));
+        graph.addOperand(op, zero);
+        graph.addOperand(op, falseConstants[static_cast<std::size_t>(i)]);
+        graph.addResult(op, next);
+        falseValues.push_back(next);
+    }
+
+    std::vector<ValueId> muxValues;
+    for (int i = 0; i < 8; ++i)
+    {
+        const auto next = makeValue(graph, "span_mux_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kMux,
+                                              graph.internSymbol("span_mux_op_" + std::to_string(i)));
+        graph.addOperand(op, cond);
+        graph.addOperand(op, trueValues[static_cast<std::size_t>(i)]);
+        graph.addOperand(op, falseValues[static_cast<std::size_t>(i)]);
+        graph.addResult(op, next);
+        muxValues.push_back(next);
+    }
+
+    auto fillerCurrent = one;
+    for (int i = 0; i < 160; ++i)
+    {
+        const auto next = makeValue(graph, "span_filler_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("span_filler_not_" + std::to_string(i)));
+        graph.addOperand(op, fillerCurrent);
+        graph.addResult(op, next);
+        fillerCurrent = next;
+    }
+
+    for (int i = 0; i < 8; ++i)
+    {
+        const auto out = makeValue(graph, "span_out_" + std::to_string(i), 1, false);
+        const auto op = graph.createOperation(OperationKind::kNot,
+                                              graph.internSymbol("span_out_not_" + std::to_string(i)));
+        graph.addOperand(op, muxValues[static_cast<std::size_t>(i)]);
+        graph.addResult(op, out);
+        graph.bindOutputPort("y" + std::to_string(i), out);
+    }
+    graph.bindOutputPort("filler", fillerCurrent);
+    makeRegisterWrite(graph, "span_cond_write", one, nextCond, one, clk, "span_cond");
     return design;
 }
 
@@ -2597,6 +2843,190 @@ Design buildThreeStageRegisterPipelineDesign()
     makeRegisterWrite(graph, "stage1_write", one, inD, mask, clk, "stage1");
     makeRegisterWrite(graph, "stage2_write", one, stage1Read, mask, clk, "stage2");
     makeRegisterWrite(graph, "stage3_write", one, stage2Read, mask, clk, "stage3");
+
+    return design;
+}
+
+Design buildDirectEligibleRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "q_write", one, inD, mask, clk, "q");
+
+    return design;
+}
+
+Design buildFullMaskNarrowRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 16, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 13, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 13, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 13, "13'h1fff");
+    makeRegisterWrite(graph, "q_write", one, inD, mask, clk, "q");
+
+    return design;
+}
+
+Design buildStateConditionRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    (void)makeRegister(graph, "guard_storage", "guard_reg", 1, "guard");
+    const auto guardRead = makeRegisterRead(graph, "guard_read", "guard_read_op", 1, "guard");
+    graph.bindOutputPort("guard", guardRead);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "q_write", guardRead, inD, mask, clk, "q");
+
+    return design;
+}
+
+Design buildNoClockSymbolRegisterClockOperandDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto aClk = makeValue(graph, "a_clk", 1, false);
+    const auto bClk = makeValue(graph, "b_clk", 1, false);
+    graph.bindInputPort("a_clk", aClk);
+    graph.bindInputPort("b_clk", bClk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto value = makeConstant(graph, "value", "value_const", 8, "8'h5a");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWriteWithoutClockSymbol(graph, "q_write", one, value, mask, bClk, "q");
+
+    for (int i = 0; i < 140; ++i)
+    {
+        (void)makeConstant(graph, "no_clock_symbol_padding_const_" + std::to_string(i),
+                           "no_clock_symbol_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
+Design buildMultiMaskedScalarRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto lowData = makeConstant(graph, "low_data", "low_data_const", 8, "8'h0a");
+    const auto lowMask = makeConstant(graph, "low_mask", "low_mask_const", 8, "8'h0f");
+    const auto highData = makeConstant(graph, "high_data", "high_data_const", 8, "8'hb0");
+    const auto highMask = makeConstant(graph, "high_mask", "high_mask_const", 8, "8'hf0");
+    makeRegisterWrite(graph, "q_low_write", one, lowData, lowMask, clk, "q");
+    makeRegisterWrite(graph, "q_high_write", one, highData, highMask, clk, "q");
+
+    return design;
+}
+
+Design buildMultiMaskedWideRegisterWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto lowData = makeValue(graph, "low_data", 130, false);
+    const auto lowMask = makeValue(graph, "low_mask", 130, false);
+    const auto highData = makeValue(graph, "high_data", 130, false);
+    const auto highMask = makeValue(graph, "high_mask", 130, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("low_data", lowData);
+    graph.bindInputPort("low_mask", lowMask);
+    graph.bindInputPort("high_data", highData);
+    graph.bindInputPort("high_mask", highMask);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 130, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 130, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    makeRegisterWrite(graph, "q_low_write", one, lowData, lowMask, clk, "q");
+    makeRegisterWrite(graph, "q_high_write", one, highData, highMask, clk, "q");
+
+    return design;
+}
+
+Design buildMultiChunkRegisterDependencyDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto padValue = makeConstant(graph, "pad_value", "pad_value_const", 8, "8'h11");
+
+    (void)makeRegister(graph, "a_q_storage", "a_q_reg", 8, "a_q");
+    const auto qRead = makeRegisterRead(graph, "a_q_read", "a_q_read_op", 8, "a_q");
+    graph.bindOutputPort("q", qRead);
+    makeRegisterWrite(graph, "a_q_write", one, inD, mask, clk, "a_q");
+
+    for (int i = 0; i < 520; ++i) {
+        const std::string sym = "m_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, mask, clk, sym);
+    }
+
+    (void)makeRegister(graph, "z_r_storage", "z_r_reg", 8, "z_r");
+    const auto rRead = makeRegisterRead(graph, "z_r_read", "z_r_read_op", 8, "z_r");
+    graph.bindOutputPort("r", rRead);
+    makeRegisterWrite(graph, "z_r_write", one, qRead, mask, clk, "z_r");
 
     return design;
 }
@@ -4604,8 +5034,8 @@ void testDerivedClockEdgesSeePriorDomainCommits()
            "committed register domains should invalidate dirty replay before later derived-clock edge checks");
     expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n        replay_pending_for_commit(dirty_replayed_, false, true);"),
            "derived-clock edge checks should replay dirty shards before evaluating the edge expression");
-    expect(countOccurrences(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_)") == 4,
-           "derived-clock edge checks should avoid emitting duplicate inner replay guards after pre-edge replay");
+    expect(countOccurrences(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_)") == 3,
+           "derived-clock edge checks should avoid emitting duplicate inner replay guards after pre-edge and replay-only batching");
     expect(contains(source, "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n}\n\nvoid SSimTop::commit_step()") &&
                contains(source, "replay_pending_for_commit(dirty_replayed_, false, true);\n    }\n    if ((!prev_gated_clk_"),
            "derived-clock edge checks should drain touched committed-state shards before evaluating the edge expression");
@@ -4630,6 +5060,53 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "derived_clock_top", runner);
+}
+
+void testReverseOrderedDerivedClockEdgesSeePriorDomainCommits()
+{
+    Design design = buildReverseOrderedDerivedClockPostCommitReplayDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "reverse_ordered_derived_clock_post_commit_replay";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("reverse_ordered_derived_clock_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "4096";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp reverse-ordered derived-clock fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp reverse-ordered derived-clock fixture should not emit errors");
+
+    const std::string source = readFile(dir / "reverse_ordered_derived_clock_top.cpp");
+    expect(contains(source, "// Direct clock domains commit before derived-clock domains"),
+           "reverse-ordered fixture should document deterministic derived-clock replay ordering");
+
+    const std::string runner = R"CPP(
+#include "reverse_ordered_derived_clock_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_z_clk(0);
+    sim.step();
+    if (sim.get_data() != 0) {
+        return 1;
+    }
+    sim.set_z_clk(1);
+    sim.step();
+    if (sim.get_data() != 0x5a) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "reverse_ordered_derived_clock_top", runner);
 }
 
 void testSettlePreservesDerivedClockInputEdges()
@@ -5759,7 +6236,19 @@ void testWideBitDynamicSliceCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp wide-bit slice-dynamic fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_bit_slice_dynamic_top.hpp");
-    const std::string source = readFile(dir / "wide_bit_slice_dynamic_top.cpp");
+    std::string generatedSources = header + readFile(dir / "wide_bit_slice_dynamic_top_internal.hpp") +
+                                   readFile(dir / "wide_bit_slice_dynamic_top.cpp");
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().filename().string().find("_sched_") != std::string::npos)
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "wolvrix_gsim_slice_dynamic_bit_to_u64("),
+           "wide 1-bit dynamic slice should emit the bit-specialized helper");
+    expect(contains(generatedSources, "wolvrix_gsim_slice_dynamic_bit_to_u64(input_in_"),
+           "wide 1-bit dynamic slice should call the bit-specialized helper for the input vector");
 
     const std::string runner = R"CPP(
 #include "wide_bit_slice_dynamic_top.hpp"
@@ -6271,6 +6760,14 @@ void testWideBitwiseCompileAndRun()
            "wide-bitwise fixture should emit allocation-free XOR helper");
     expect(contains(header, "inline void wolvrix_gsim_bitwise_not_into"),
            "wide-bitwise fixture should emit allocation-free NOT helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_and_2"),
+           "wide-bitwise fixture should emit fixed-width AND helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_or_2"),
+           "wide-bitwise fixture should emit fixed-width OR helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_xor_2"),
+           "wide-bitwise fixture should emit fixed-width XOR helper");
+    expect(contains(header, "inline void wolvrix_gsim_bitwise_not_2"),
+           "wide-bitwise fixture should emit fixed-width NOT helper");
     expect(contains(header, "inline void wolvrix_gsim_assign_bits"),
            "wide-bitwise fixture should emit allocation-free wide copy helper");
     expect(contains(header, "if (&out == &value)"),
@@ -6286,14 +6783,18 @@ void testWideBitwiseCompileAndRun()
         source += readFile(shardPath);
     }
     expect(!source.empty(), "wide-bitwise fixture should emit sharded sched files");
-    expect(contains(source, "wolvrix_gsim_bitwise_and_into("),
-           "sharded wide-bitwise fixture should lower AND into existing storage");
-    expect(contains(source, "wolvrix_gsim_bitwise_or_into("),
-           "sharded wide-bitwise fixture should lower OR into existing storage");
-    expect(contains(source, "wolvrix_gsim_bitwise_xor_into("),
-           "sharded wide-bitwise fixture should lower XOR into existing storage");
-    expect(contains(source, "wolvrix_gsim_bitwise_not_into("),
-           "sharded wide-bitwise fixture should lower NOT into existing storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_and_2(") ||
+               contains(source, "wolvrix_gsim_bitwise_and_2_fast("),
+           "sharded wide-bitwise fixture should lower two-word AND into fixed storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_or_2(") ||
+               contains(source, "wolvrix_gsim_bitwise_or_2_fast("),
+           "sharded wide-bitwise fixture should lower two-word OR into fixed storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_xor_2(") ||
+               contains(source, "wolvrix_gsim_bitwise_xor_2_fast("),
+           "sharded wide-bitwise fixture should lower two-word XOR into fixed storage");
+    expect(contains(source, "wolvrix_gsim_bitwise_not_2(") ||
+               contains(source, "wolvrix_gsim_bitwise_not_2_fast("),
+           "sharded wide-bitwise fixture should lower two-word NOT into fixed storage");
 
     const std::string runner = R"CPP(
 #include "wide_bitwise_top.hpp"
@@ -6323,6 +6824,28 @@ int main() {
     }
     if (notY[0] != 0xFF00FF00FF00FF00ULL || notY[1] != 0xFFFFFFFF0ULL) {
         return 5;
+    }
+
+    sim.set_a(std::vector<std::uint64_t>{0x00FF00FF00FF00FFULL});
+    sim.step();
+    const auto shortAndY = sim.get_and_y();
+    const auto shortOrY = sim.get_or_y();
+    const auto shortXorY = sim.get_xor_y();
+    const auto shortNotY = sim.get_not_y();
+    if (shortAndY.size() != 2 || shortOrY.size() != 2 || shortXorY.size() != 2 || shortNotY.size() != 2) {
+        return 6;
+    }
+    if (shortAndY[0] != 0x000F000F000F000FULL || shortAndY[1] != 0x0ULL) {
+        return 7;
+    }
+    if (shortOrY[0] != 0x0FFF0FFF0FFF0FFFULL || shortOrY[1] != 0x3ULL) {
+        return 8;
+    }
+    if (shortXorY[0] != 0x0FF00FF00FF00FF0ULL || shortXorY[1] != 0x3ULL) {
+        return 9;
+    }
+    if (shortNotY[0] != 0xFF00FF00FF00FF00ULL || shortNotY[1] != 0xFFFFFFFFFULL) {
+        return 10;
     }
     return 0;
 }
@@ -6585,12 +7108,18 @@ void testWideMaskedRegisterCompileAndRun()
             generatedSources += readFile(entry.path());
         }
     }
-    expect(contains(generatedSources, "wolvrix_gsim_mask_merge_in_place"),
-           "wide masked register should use direct in-place masked commit");
+    expect(contains(generatedSources, "next_reg_state_merged_ = wolvrix_gsim_mask_merge(next_reg_state"),
+           "wide masked register should compute masked next-state before the chunk commit barrier");
+    expect(contains(generatedSources, "std::vector<std::uint64_t> next_reg_state = state_->stateVec[0]"),
+           "wide masked register should initialize the staged next-state from persistent state");
+    expect(contains(generatedSources, "state_->stateVec[0] = std::move(next_reg_state)"),
+           "wide masked register should commit the next-state local after all RHS evaluation");
+    expect(!contains(generatedSources, "wolvrix_gsim_mask_merge_in_place(state_->stateVec[0]"),
+           "wide masked register should not mutate persistent state before the chunk commit barrier");
     expect(contains(generatedSources, "if (chunk_updated_)"),
-           "direct in-place commit should use one coalesced chunk activation");
+           "deferred wide masked commit should use one coalesced chunk activation");
     expect(!contains(generatedSources, "kTouchedStateFirstShards_reg_"),
-           "direct in-place commits should not emit one touched-state table per register");
+           "deferred wide masked commits should not emit one touched-state table per register");
 
     const std::string runner = R"CPP(
 #include "wide_masked_register_top.hpp"
@@ -6611,6 +7140,19 @@ int main() {
     }
     if (out[0] != 0x0123456789ABCDEFULL || out[1] != 0xFULL || out[2] != 0x0ULL) {
         return 2;
+    }
+    sim.set_d(std::vector<std::uint64_t>{0x0ULL, 0x00000000000000A0ULL, 0x0ULL});
+    sim.set_mask(std::vector<std::uint64_t>{0x0ULL, 0xF0ULL, 0x0ULL});
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    const auto out2 = sim.get_q();
+    if (out2.size() != 3) {
+        return 3;
+    }
+    if (out2[0] != 0x0123456789ABCDEFULL || out2[1] != 0xAFULL || out2[2] != 0x0ULL) {
+        return 4;
     }
     return 0;
 }
@@ -6845,6 +7387,62 @@ int main() {
     compileAndRunHarness(dir, "dirty_replay_no_commit_top", runner);
 }
 
+void testReplayOnlyEdgesBatchDirtyReplay()
+{
+    Design design = buildReplayOnlyEdgeBatchDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "replay_only_edge_batch";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("replay_only_edge_batch_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp replay-only edge batch fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp replay-only edge batch fixture should not emit errors");
+
+    const std::string source = readFile(dir / "replay_only_edge_batch_top.cpp");
+    expect(contains(source, "bool edge_replay_pending_ = false;"),
+           "commit_step should batch consecutive replay-only edge checks");
+    expect(contains(source, "edge_replay_pending_ = edge_replay_pending_ || ((!prev_clk_ && static_cast<bool>(input_clk_)))"),
+           "replay-only batch should retain the side-effect-free edge predicate");
+    expect(contains(source, "active_state_write"),
+           "fixture should keep a non-empty register commit domain outside replay-only batches");
+
+    const std::string runner = R"CPP(
+#include "replay_only_edge_batch_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0);
+    sim.set_clk(0);
+    sim.set_reset(0);
+    sim.settle();
+    const auto low = sim.get_y();
+    sim.set_a(1);
+    sim.set_clk(1);
+    sim.commit_step();
+    if (sim.get_y() == low) {
+        return 1;
+    }
+    if (sim.get_difftest__DOT__step() != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "replay_only_edge_batch_top", runner);
+}
+
 void testReplayDirtyInputShardsSkipsInputIndependentShards()
 {
     Design design = buildSelectiveReplayShardedDesign();
@@ -6861,6 +7459,7 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     options.topOverrides = {"top"};
     options.attributes["behavior_shard_max_bytes"] = "512";
     options.attributes["activity_shard_watermark"] = "1";
+    options.attributes["changed_value_fanout_inline_mask_limit"] = "0";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp selective-replay fixture should succeed");
@@ -6918,14 +7517,46 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "settle should delegate active-word shard dispatch to generated helpers");
     expect(contains(source, "void SSimTop::run_active_shard_word_0(std::uint64_t& active_bits_)"),
            "activity mode should emit a helper for active-word 0 dispatch");
-    expect(contains(source, "kShardSuccessorMask"),
-           "settle should enqueue shard successors from generated word-mask fanout metadata");
+    const std::string internalHeader = readFile(dir / "selective_replay_top_internal.hpp");
+    expect(contains(internalHeader, "wolvrix_gsim_assign_if_changed"),
+           "activity mode should expose the scalar assign-if-changed helper to sched shards");
+    bool hasChangedValueFanout = false;
+    bool hasPackedChangedValueFanout = false;
+    for (std::size_t shard = 0; shard < shardCount; ++shard) {
+        const std::string shardSource =
+            readFile(dir / ("selective_replay_top_sched_" + std::to_string(shard) + ".cpp"));
+        if (contains(shardSource, "wolvrix_gsim_assign_if_changed") &&
+            (contains(shardSource, "activate_shard_mask") || contains(shardSource, "activate_changed_fanout"))) {
+            hasChangedValueFanout = true;
+        }
+        if (contains(shardSource, "activate_changed_fanout")) {
+            hasPackedChangedValueFanout = true;
+        }
+        expect(!contains(shardSource, "WOLVRIX_GSIM_VALUE_FANOUT"),
+               "changed-value fanout placeholders should be finalized before writing generated shard sources");
+    }
+    expect(contains(source, "kShardSuccessorMask") || hasChangedValueFanout,
+           "settle should enqueue shard successors from static or changed-value fanout metadata");
+    expect(hasPackedChangedValueFanout && contains(source, "kChangedFanoutRanges"),
+           "inline-mask-limit=0 should route changed-value fanout through a packed fanout table");
+    expect(contains(source, "struct WolvrixGsimShardActivationMask") &&
+               contains(source, "struct WolvrixGsimShardActivationRange") &&
+               contains(source, "constexpr WolvrixGsimShardActivationMask kChangedFanoutMasks[]") &&
+               contains(source, "constexpr WolvrixGsimShardActivationRange kChangedFanoutRanges[]"),
+           "packed changed-value fanout should emit compact mask and range tables");
+    expect(contains(source, "void SSimTop::activate_changed_fanout(std::uint32_t fanout)") &&
+               contains(source, "const auto range = kChangedFanoutRanges[fanout];") &&
+               contains(source, "const auto entry = kChangedFanoutMasks[range.offset + i];") &&
+               contains(source, "activate_shard_mask(entry.word, entry.mask);"),
+           "packed changed-value fanout helper should replay each packed word mask");
+    expect(!contains(source, "WOLVRIX_GSIM_VALUE_FANOUT"),
+           "changed-value fanout placeholders should be finalized before writing generated sources");
     expect(contains(source, "activate_shard_mask"),
            "settle should enqueue cross-word successors as packed active-word masks");
     expect(!contains(source, "kActivityHeads_") && !contains(source, "activate_shards(kActivityHeads"),
            "input setters should activate activity heads through packed word masks instead of index tables");
-    expect(contains(source, "active_bits_ |= kShardSuccessorMask"),
-           "same-word successor activation should stay in the local active-word bitmap");
+    expect(contains(source, "active_bits_ |= kShardSuccessorMask") || hasChangedValueFanout,
+           "same-word successor activation should stay local when static, or use finalized changed-value fanout");
     expect(contains(source, "std::fill(active_shard_words_.begin(), active_shard_words_.end(), ~UINT64_C(0));"),
            "activate_all_shards should bulk-fill active shard words instead of looping per shard");
     expect(contains(source, "const std::uint32_t first_word_ = firstShard / 64U"),
@@ -6939,6 +7570,167 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     expect(!contains(replayBody, "active_word_queue_.empty()) { activate_all_shards(); }"),
            "dirty replay helper should enqueue replayed-shard successors instead of falling back to all shards");
 }
+
+void testChangedFanoutCoalescesDuplicateShardActivations()
+{
+    Design design = buildChangedFanoutCoalescingDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "changed_fanout_coalescing_emit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("coalesce_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "384";
+    options.attributes["activity_shard_watermark"] = "1";
+    options.attributes["changed_value_fanout_inline_mask_limit"] = "0";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp changed-fanout coalescing fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp changed-fanout coalescing fixture should not emit diagnostics");
+
+    bool foundCoalescedShard = false;
+    for (std::size_t shard = 0;
+         std::filesystem::exists(dir / ("coalesce_top_sched_" + std::to_string(shard) + ".cpp"));
+         ++shard)
+    {
+        const std::string shardSource = readFile(dir / ("coalesce_top_sched_" + std::to_string(shard) + ".cpp"));
+        if (!contains(shardSource, "wolvrix_gsim_changed_fanout_hit_0")) {
+            continue;
+        }
+        foundCoalescedShard = true;
+        expect(contains(shardSource, "bool wolvrix_gsim_changed_fanout_hit_0 = false;"),
+               "duplicate changed fanout activations should allocate one local hit flag");
+        expect(countOccurrences(shardSource,
+                                "wolvrix_gsim_changed_fanout_hit_0 |= wolvrix_gsim_assign_if_changed") >= 2,
+               "duplicate changed fanout assignments should accumulate into the same local hit flag");
+        expect(countOccurrences(shardSource, "if (wolvrix_gsim_changed_fanout_hit_0) {") == 1,
+               "duplicate changed fanout activations should flush once at shard end");
+        expect(!contains(shardSource, "WOLVRIX_GSIM_VALUE_FANOUT"),
+               "coalesced changed-value fanout placeholders should be finalized before writing shards");
+    }
+    expect(foundCoalescedShard,
+           "coalescing fixture should generate at least one coalesced changed-value fanout shard");
+
+    const std::string runner = R"CPP(
+#include "coalesce_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a(0);
+    sim.set_b(0);
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 1;
+    }
+    sim.set_a(1);
+    sim.step();
+    if (sim.get_y() != 1) {
+        return 2;
+    }
+    sim.set_b(1);
+    sim.step();
+    if (sim.get_y() != 0) {
+        return 3;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "coalesce_top", runner);
+}
+
+void testChangedFanoutCoalescesTempMuxSpans()
+{
+    Design design = buildChangedFanoutSpanCoalescingDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "changed_fanout_span_coalescing_emit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("span_coalesce_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "2048";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    if (!result.success || diags.hasError()) {
+        std::string messages;
+        for (const auto &diag : diags.messages()) {
+            messages += diag.message;
+            if (!diag.context.empty()) {
+                messages += " [" + diag.context + "]";
+            }
+            messages += "\n";
+        }
+        throw std::runtime_error("EmitGsimCpp changed-fanout span coalescing fixture failed: " + messages);
+    }
+
+    bool foundMuxSpan = false;
+    for (std::size_t shard = 0;
+         std::filesystem::exists(dir / ("span_coalesce_top_sched_" + std::to_string(shard) + ".cpp"));
+         ++shard)
+    {
+        const std::string shardSource = readFile(dir / ("span_coalesce_top_sched_" + std::to_string(shard) + ".cpp"));
+        if (contains(shardSource,
+                     "wolvrix_gsim_changed_fanout_hit_") &&
+            contains(shardSource,
+                     "|= wolvrix_gsim_assign_mux_span_if_changed")) {
+            foundMuxSpan = true;
+        }
+        expect(!contains(shardSource, "WOLVRIX_GSIM_VALUE_FANOUT"),
+               "changed-value fanout placeholders should be finalized before span coalescing shards are written");
+    }
+    expect(foundMuxSpan,
+           "adjacent changed-fanout temp mux assignments should coalesce into one mux span helper call");
+
+    const std::string runner = R"CPP(
+#include "span_coalesce_top.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    const std::array<std::uint8_t, 8> first{
+        sim.get_y0(), sim.get_y1(), sim.get_y2(), sim.get_y3(),
+        sim.get_y4(), sim.get_y5(), sim.get_y6(), sim.get_y7()};
+    for (std::size_t i = 0; i < first.size(); ++i) {
+        const std::uint8_t expected = static_cast<std::uint8_t>(i % 2 == 0 ? 0U : 1U);
+        if (first[i] != expected) {
+            return 1;
+        }
+    }
+    sim.set_clk(1);
+    sim.step();
+    sim.set_clk(0);
+    sim.step();
+    const std::array<std::uint8_t, 8> second{
+        sim.get_y0(), sim.get_y1(), sim.get_y2(), sim.get_y3(),
+        sim.get_y4(), sim.get_y5(), sim.get_y6(), sim.get_y7()};
+    for (std::size_t i = 0; i < second.size(); ++i) {
+        const std::uint8_t expected = static_cast<std::uint8_t>(i % 2 == 0 ? 1U : 0U);
+        if (second[i] != expected) {
+            return 2;
+        }
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "span_coalesce_top", runner);
+}
+
 
 void testMixedDirtyReplaySuccessorMasksCompileAndRun()
 {
@@ -7099,8 +7891,8 @@ void testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout()
     const std::string source = readFile(dir / "active_worklist_top.cpp");
     expect(contains(source, "switch (active_shard_)"),
            "active-worklist fixture should use switch dispatch instead of a linear active-shard scan");
-    expect(contains(source, "kShardSuccessorMask"),
-           "active-worklist fixture should emit packed successor fanout for convergent dependencies");
+    expect(contains(source, "kShardSuccessorMask") || contains(source, "; activate_shard_mask(") || contains(source, "activate_changed_fanout"),
+           "active-worklist fixture should emit packed static or changed-value successor fanout for convergent dependencies");
 
     instrumentSchedCounters(dir, "active_worklist_top", shardCount);
 
@@ -7318,7 +8110,9 @@ void testRegisterPipelineUsesNonBlockingSemantics()
     expect(!contains(generatedSources, "activate_shards(kTouchedStateFirstShards"),
            "activity watermark should avoid per-shard touched-state activation tables");
     expect(!contains(generatedSources, "activate_shards(kTouchedStateFirstShards_"),
-           "direct state writes should coalesce activity activation at the commit-chunk level");
+           "sequential state writes should coalesce activity activation at the commit-chunk level");
+    expect(!contains(generatedSources, "direct_next_"),
+           "sequential register writes should keep next-state locals until the chunk commit barrier");
     const std::string runner = R"CPP(
 #include "pipeline_top.hpp"
 #include <array>
@@ -7352,6 +8146,448 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "pipeline_top", runner);
+}
+
+void testDirectEligibleRegisterWriteUsesCommitBarrier()
+{
+    Design design = buildDirectEligibleRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "direct_eligible_commit_barrier";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("direct_commit_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp direct-eligible fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp direct-eligible fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(!contains(generatedSources, "direct_next_"),
+           "direct-eligible scalar register writes should not bypass the commit barrier");
+    expect(contains(generatedSources, "delayed_direct_reg_q") &&
+               contains(generatedSources, "state_->stateU8["),
+           "direct-eligible scalar register writes should be delayed until after RHS evaluation");
+
+    const std::string runner = R"CPP(
+#include "direct_commit_top.hpp"
+#include <cstdint>
+
+static void tick(SSimTop& sim, std::uint8_t d) {
+    sim.set_d(d);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    SSimTop sim;
+    tick(sim, 0x3c);
+    if (sim.get_q() != 0x3c) {
+        return 1;
+    }
+    tick(sim, 0xa5);
+    if (sim.get_q() != 0xa5) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "direct_commit_top", runner);
+}
+
+void testFullMaskNarrowRegisterWriteMasksStorageBits()
+{
+    Design design = buildFullMaskNarrowRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "full_mask_narrow_reg";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("full_mask_narrow_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp full-mask narrow register fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp full-mask narrow register fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "((input_d_) & 8191)"),
+           "full-mask scalar register writes should still mask non-storage-aligned widths");
+
+    const std::string runner = R"CPP(
+#include "full_mask_narrow_top.hpp"
+#include <cstdint>
+
+int main() {
+    SSimTop sim;
+    sim.set_d(0xffff);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    return sim.get_q() == 0x1fff ? 0 : 1;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "full_mask_narrow_top", runner);
+}
+
+void testStateConditionRegisterWriteUsesNextStateBarrier()
+{
+    Design design = buildStateConditionRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "state_condition_commit_barrier";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("state_condition_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp state-conditioned fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp state-conditioned fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(!contains(generatedSources, "delayed_direct_reg_q"),
+           "state-dependent register conditions should not use delayed direct writes");
+    expect(contains(generatedSources, "auto next_reg_q = state_->stateU8[") &&
+               contains(generatedSources, "if (state_->stateU8["),
+           "state-dependent register conditions should keep the next-state barrier");
+}
+
+void testRegisterWriteWithoutClockSymbolUsesClockOperand()
+{
+    Design design = buildNoClockSymbolRegisterClockOperandDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "no_clock_symbol_register_clock_operand";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("no_clock_symbol_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp no-clock-symbol fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp no-clock-symbol fixture should not emit errors");
+
+    const std::string header = readFile(dir / "no_clock_symbol_top.hpp");
+    const std::string source = readFile(dir / "no_clock_symbol_top.cpp");
+    expect(contains(header, "void set_b_clk") &&
+               contains(header, "clock_inputs_dirty_ = true;"),
+           "register writes without clockSymbol should classify the clock operand as a clock input");
+    expect(contains(source, "prev_b_clk_") &&
+               contains(source, "static_cast<bool>(input_b_clk_)") &&
+               !contains(source, "prev_a_clk_"),
+           "register writes without clockSymbol should use the actual clock operand for edge state");
+}
+
+void testMultiMaskedScalarRegisterWritesAccumulateInNextState()
+{
+    Design design = buildMultiMaskedScalarRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "multi_masked_scalar_commit_barrier";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("multi_masked_scalar_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp multi-masked scalar fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp multi-masked scalar fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "next_reg_q_merged_ = ((next_reg_q)"),
+           "multiple masked scalar writes should merge into the staged next-state local");
+    expect(contains(generatedSources, "next_reg_q_updated_ = true") &&
+               contains(generatedSources, "if (next_reg_q_updated_)"),
+           "multiple masked scalar writes should commit only the registers they actually update");
+    expect(!contains(generatedSources, "direct_next_"),
+           "multiple masked scalar writes should not use direct persistent write temporaries");
+
+    const std::string runner = R"CPP(
+#include "multi_masked_scalar_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0xba) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "multi_masked_scalar_top", runner);
+}
+
+void testMultiMaskedWideRegisterWritesAccumulateInNextState()
+{
+    Design design = buildMultiMaskedWideRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "multi_masked_wide_commit_barrier";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("multi_masked_wide_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp multi-masked wide fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp multi-masked wide fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "next_reg_q_merged_ = wolvrix_gsim_mask_merge(next_reg_q"),
+           "multiple masked wide writes should merge into the staged next-state local");
+    expect(contains(generatedSources, "std::vector<std::uint64_t> next_reg_q = state_->stateVec[0]"),
+           "multiple masked wide writes should initialize their staged base from persistent state");
+    expect(!contains(generatedSources, "wolvrix_gsim_mask_merge_in_place(state_->stateVec"),
+           "multiple masked wide writes should not mutate persistent state before the commit barrier");
+
+    const std::string runner = R"CPP(
+#include "multi_masked_wide_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_low_data(std::vector<std::uint64_t>{0x0123456789abcdefULL, 0x0ULL, 0x0ULL});
+    sim.set_low_mask(std::vector<std::uint64_t>{~0ULL, 0x0ULL, 0x0ULL});
+    sim.set_high_data(std::vector<std::uint64_t>{0x0ULL, 0x000000000000abcdULL, 0x0ULL});
+    sim.set_high_mask(std::vector<std::uint64_t>{0x0ULL, ~0ULL, 0x0ULL});
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    const auto out = sim.get_q();
+    if (out.size() != 3) {
+        return 1;
+    }
+    if (out[0] != 0x0123456789abcdefULL || out[1] != 0x000000000000abcdULL || out[2] != 0x0ULL) {
+        return 2;
+    }
+    sim.set_low_data(std::vector<std::uint64_t>{0x0ULL, 0x0ULL, 0x0ULL});
+    sim.set_low_mask(std::vector<std::uint64_t>{0x0ULL, 0x0ULL, 0x0ULL});
+    sim.set_high_data(std::vector<std::uint64_t>{0x0ULL, 0x000000000000ef00ULL, 0x0ULL});
+    sim.set_high_mask(std::vector<std::uint64_t>{0x0ULL, 0x000000000000ff00ULL, 0x0ULL});
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    const auto out2 = sim.get_q();
+    if (out2.size() != 3) {
+        return 3;
+    }
+    if (out2[0] != 0x0123456789abcdefULL || out2[1] != 0x000000000000efcdULL || out2[2] != 0x0ULL) {
+        return 4;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "multi_masked_wide_top", runner);
+}
+
+
+void testWideZeroMaskRegisterWriteDoesNotCommit()
+{
+    Design design = buildMultiMaskedWideRegisterWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "wide_zero_mask_no_commit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("wide_zero_mask_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp wide zero-mask fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp wide zero-mask fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "next_reg_q_merged_ != next_reg_q"),
+           "wide masked register writes should only commit when the merged value changes");
+
+    const std::string runner = R"CPP(
+#include "wide_zero_mask_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_low_data(std::vector<std::uint64_t>{~0ULL, ~0ULL, ~0ULL});
+    sim.set_low_mask(std::vector<std::uint64_t>{0x0ULL, 0x0ULL, 0x0ULL});
+    sim.set_high_data(std::vector<std::uint64_t>{~0ULL, ~0ULL, ~0ULL});
+    sim.set_high_mask(std::vector<std::uint64_t>{0x0ULL, 0x0ULL, 0x0ULL});
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 1;
+    }
+    const auto out = sim.get_q();
+    if (out.size() != 3 || out[0] != 0x0ULL || out[1] != 0x0ULL || out[2] != 0x0ULL) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "wide_zero_mask_top", runner);
+}
+
+void testMultiChunkRegisterWritesUseDomainNextState()
+{
+    Design design = buildMultiChunkRegisterDependencyDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "multi_chunk_register_domain_next_state";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("multi_chunk_reg_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp multi-chunk register fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp multi-chunk register fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_") &&
+               contains(generatedSources, "state_->stateU8[write_.first] = write_.second"),
+           "multi-chunk register domains should defer writes through sparse domain next-state updates");
+    expect(contains(generatedSources, "next_stateU8_->emplace_back"),
+           "multi-chunk register chunk methods should append staged writes to the sparse domain next-state target");
+    expect(contains(generatedSources, "domain_next_stateU8_.reserve("),
+           "multi-chunk register domains should reserve sparse pending storage by pool");
+    expect(contains(generatedSources, "next_stateU8_->emplace_back(static_cast<std::size_t>(") &&
+               contains(generatedSources, "), next_reg_a_q);"),
+           "multi-chunk scalar register chunks should append only touched scalar registers at the update site");
+
+    const std::string runner = R"CPP(
+#include "multi_chunk_reg_top.hpp"
+#include <cstdint>
+
+static void tick(SSimTop& sim, std::uint8_t d) {
+    sim.set_d(d);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    SSimTop sim;
+    tick(sim, 0x5a);
+    if (sim.get_q() != 0x5a) {
+        return 1;
+    }
+    if (sim.get_r() != 0x00) {
+        return 2;
+    }
+    tick(sim, 0xa5);
+    if (sim.get_q() != 0xa5) {
+        return 3;
+    }
+    if (sim.get_r() != 0x5a) {
+        return 4;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "multi_chunk_reg_top", runner);
 }
 
 void testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias()
@@ -7561,6 +8797,50 @@ int main()
 {
     try
     {
+        if (const char *filter = std::getenv("WOLVRIX_EMIT_GSIM_CPP_ONLY")) {
+            const std::string_view name(filter);
+            if (name == "changed-fanout-span-coalescing") {
+                testChangedFanoutCoalescesTempMuxSpans();
+                return 0;
+            }
+            if (name == "dirty-replay-edge-without-commit") {
+                testDirtyReplayEdgeWithoutCommitRefreshesOutputs();
+                return 0;
+            }
+            if (name == "replay-dirty-input-shards") {
+                testReplayDirtyInputShardsSkipsInputIndependentShards();
+                return 0;
+            }
+            if (name == "mixed-dirty-replay-successor-masks") {
+                testMixedDirtyReplaySuccessorMasksCompileAndRun();
+                return 0;
+            }
+            if (name == "active-worklist-convergent-fanout") {
+                testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout();
+                return 0;
+            }
+            if (name == "eq") {
+                testEqCompileAndRun();
+                return 0;
+            }
+            if (name == "logic-binary") {
+                testLogicBinaryCompileAndRun();
+                return 0;
+            }
+            if (name == "case-eq") {
+                testCaseEqCompileAndRun();
+                return 0;
+            }
+            if (name == "compare") {
+                testCompareCompileAndRun();
+                return 0;
+            }
+            if (name == "signed-compare") {
+                testSignedCompareCompileAndRun();
+                return 0;
+            }
+            return fail(std::string("unknown WOLVRIX_EMIT_GSIM_CPP_ONLY filter: ") + filter);
+        }
         testHappyPathAfterRunningGsim();
         testDifftestCompatibilityAccessorsUseTopLevelPorts();
         testFailureWithoutPriorMetadata();
@@ -7591,6 +8871,7 @@ int main()
         testDpicJtagTickMultiResultCallOnceAndConditionGated();
         testDpicJtagTickPreOnlySequentialClockDeclared();
         testDerivedClockEdgesSeePriorDomainCommits();
+        testReverseOrderedDerivedClockEdgesSeePriorDomainCommits();
         testSettlePreservesDerivedClockInputEdges();
         testDpicSamplesPreEdgeSettledState();
         testDpicUsesGlobalPreEdgeSnapshotAcrossDomains();
@@ -7632,13 +8913,24 @@ int main()
         testDualEdgeClockMetadataDeduplicatesPrevClockState();
         testMediumGraphsEnableSharding();
         testDirtyReplayEdgeWithoutCommitRefreshesOutputs();
+        testReplayOnlyEdgesBatchDirtyReplay();
         testReplayDirtyInputShardsSkipsInputIndependentShards();
+        testChangedFanoutCoalescesDuplicateShardActivations();
+        testChangedFanoutCoalescesTempMuxSpans();
         testMixedDirtyReplaySuccessorMasksCompileAndRun();
         testFirstShardFirstStatementKeepsDirtyReplayMask();
         testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout();
         testShiftCompileAndRun();
         testWideShiftCompileAndRun();
         testRegisterPipelineUsesNonBlockingSemantics();
+        testDirectEligibleRegisterWriteUsesCommitBarrier();
+        testFullMaskNarrowRegisterWriteMasksStorageBits();
+        testStateConditionRegisterWriteUsesNextStateBarrier();
+        testRegisterWriteWithoutClockSymbolUsesClockOperand();
+        testMultiMaskedScalarRegisterWritesAccumulateInNextState();
+        testMultiMaskedWideRegisterWritesAccumulateInNextState();
+        testWideZeroMaskRegisterWriteDoesNotCommit();
+        testMultiChunkRegisterWritesUseDomainNextState();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();
         testEmitMetadataToggleSkipsLargeMetadataPayload();

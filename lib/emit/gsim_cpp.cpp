@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <iomanip>
+#include <limits>
 #include <unordered_set>
 #include <utility>
 #include <array>
@@ -78,6 +79,91 @@ namespace wolvrix::lib::emit
                     text.rfind("input_", 0) == 0 ||
                     text.rfind("output_", 0) == 0) &&
                    text.find('(') == std::string::npos;
+        }
+
+        std::optional<std::size_t> parseEvalTempVecIndex(std::string_view expr)
+        {
+            constexpr std::string_view prefix = "evalTemps_->tempVec[";
+            if (expr.rfind(prefix, 0) != 0) {
+                return std::nullopt;
+            }
+            const std::size_t end = expr.find(']', prefix.size());
+            if (end == std::string_view::npos) {
+                return std::nullopt;
+            }
+            std::size_t value = 0;
+            for (std::size_t i = prefix.size(); i < end; ++i) {
+                const char ch = expr[i];
+                if (ch < '0' || ch > '9') {
+                    return std::nullopt;
+                }
+                value = value * 10U + static_cast<std::size_t>(ch - '0');
+            }
+            return value;
+        }
+
+        std::optional<std::size_t> fixedWideAssignWordCount(std::string_view lhs,
+                                                            const std::vector<int32_t>& tempVecWidths)
+        {
+            const auto index = parseEvalTempVecIndex(lhs);
+            if (!index || *index >= tempVecWidths.size()) {
+                return std::nullopt;
+            }
+            const int32_t width = tempVecWidths[*index];
+            if (width <= 0) {
+                return std::nullopt;
+            }
+            const auto wordCount = static_cast<std::size_t>((static_cast<std::uint64_t>(width) + 63ULL) / 64ULL);
+            if (wordCount == 0U || wordCount > 4U) {
+                return std::nullopt;
+            }
+            return wordCount;
+        }
+
+        bool tempVecHasAtLeastWords(std::string_view expr,
+                                    const std::vector<int32_t>& tempVecWidths,
+                                    std::size_t wordCount)
+        {
+            const auto index = parseEvalTempVecIndex(expr);
+            if (!index || *index >= tempVecWidths.size()) {
+                return false;
+            }
+            const int32_t width = tempVecWidths[*index];
+            if (width <= 0) {
+                return false;
+            }
+            const auto availableWords =
+                static_cast<std::size_t>((static_cast<std::uint64_t>(width) + 63ULL) / 64ULL);
+            return availableWords >= wordCount;
+        }
+
+        std::string wideAssignFunctionName(std::size_t wordCount)
+        {
+            if (wordCount >= 1U && wordCount <= 4U) {
+                return "wolvrix_gsim_assign_bits_" + std::to_string(wordCount);
+            }
+            return "wolvrix_gsim_assign_bits";
+        }
+
+        std::optional<std::size_t> fixedWideWordCountForWidth(std::int64_t width)
+        {
+            if (width <= 0) {
+                return std::nullopt;
+            }
+            const auto wordCount = static_cast<std::size_t>((static_cast<std::uint64_t>(width) + 63ULL) / 64ULL);
+            if (wordCount == 0U || wordCount > 4U) {
+                return std::nullopt;
+            }
+            return wordCount;
+        }
+
+        std::string fixedWideLastMaskExpr(std::int64_t width)
+        {
+            const auto usedBits = static_cast<std::uint32_t>(static_cast<std::uint64_t>(width) % 64ULL);
+            if (usedBits == 0U) {
+                return "~0ULL";
+            }
+            return "wolvrix_gsim_low_mask(" + std::to_string(usedBits) + "U)";
         }
 
         bool isWideStorageTernaryExpr(const std::string& expr)
@@ -211,6 +297,7 @@ namespace wolvrix::lib::emit
             int commitShardSize = 786432; // keep sequential commit translation units small enough for low optimization levels
             int currentShardSize = 0;
             std::uint8_t currentOpDirtyReplayMask = 0;
+            int activityBoundaryShardSoftBytes = 0;
 
             // Flag to determine if sharding should be enabled based on operation count
             bool enableSharding = false;
@@ -230,17 +317,43 @@ namespace wolvrix::lib::emit
             std::unordered_map<wolvrix::lib::grh::ValueId, int, wolvrix::lib::grh::ValueIdHash> valueActivityFirstShard;
             std::unordered_map<wolvrix::lib::grh::ValueId, int, wolvrix::lib::grh::ValueIdHash> valueProducerShard;
             std::unordered_map<wolvrix::lib::grh::ValueId, std::int64_t, wolvrix::lib::grh::ValueIdHash> valueProducerOpIndex;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> valueChangeFanoutTokens;
+            std::unordered_map<wolvrix::lib::grh::ValueId, int, wolvrix::lib::grh::ValueIdHash> valueChangeFanoutTokenShard;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> valueChangeFanoutLhs;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::string, wolvrix::lib::grh::ValueIdHash> valueChangeFanoutRhs;
+            std::unordered_map<wolvrix::lib::grh::ValueId, std::set<int>, wolvrix::lib::grh::ValueIdHash> valueChangeFanoutHeadShards;
+            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> changeTrackedValues;
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> changedFanoutMasks;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> changedFanoutRanges;
+            std::unordered_map<std::string, std::uint32_t> changedFanoutRangeIds;
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> shardActivationMasks;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> shardActivationRanges;
+            std::unordered_map<std::string, std::uint32_t> shardActivationRangeIds;
+            int changedValueFanoutInlineMaskLimit = 1;
+            int changedValueFanoutEstimateBytes = 128;
             std::vector<int> opProducerFirstShardByIndex;
             std::vector<int> opProducerLastShardByIndex;
+            std::vector<std::int32_t> opActivityOrdinalByIndex;
+            std::vector<std::uint8_t> activityClassBitsByOrdinal;
             std::vector<std::int64_t> dirtyReplayProducerOpSeeds;
             std::vector<std::set<int>> shardSuccessors;
             std::vector<std::array<std::set<int>, 4>> shardDirtyReplaySuccessors;
             std::vector<std::string> currentOpDirectActivitySources;
             int currentOpActivityFirstShard = -1;
+            int currentOpActivityOrdinal = -1;
+            std::uint8_t currentOpActivityClassBit = 0;
             int currentOpFirstEmittedShard = -1;
             int lastEmittedShard = -1;
+            int currentShardLastActivityOrdinal = -1;
+            std::uint8_t currentShardActivityClassMask = 0;
             std::unordered_map<std::string, int> activitySourceFirstShard;
             std::unordered_map<std::string, std::set<int>> activitySourceHeadShards;
+            std::size_t changeFanoutTokenCount = 0;
+
+            void resetCurrentShardActivityBoundaryState() {
+                currentShardLastActivityOrdinal = -1;
+                currentShardActivityClassMask = 0;
+            }
 
             // Helper to get next available shard buffer.
             std::string* getCurrentShardBuffer() {
@@ -260,8 +373,25 @@ namespace wolvrix::lib::emit
                     shardDirtyReplaySuccessors.emplace_back();
                     currentShard = static_cast<int>(shardBuffers.size()) - 1;
                     currentShardSize = 0;
+                    resetCurrentShardActivityBoundaryState();
                 }
                 return &shardBuffers[currentShard];
+            }
+
+            void startNewShard() {
+                if (!enableSharding) {
+                    return;
+                }
+                currentShard++;
+                currentShardSize = 0;
+                resetCurrentShardActivityBoundaryState();
+                if (currentShard >= static_cast<int>(shardBuffers.size())) {
+                    shardBuffers.emplace_back();
+                    shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
+                    shardDirtyReplayMask.push_back(0);
+                    shardSuccessors.emplace_back();
+                    shardDirtyReplaySuccessors.emplace_back();
+                }
             }
 
             // Helper to create a new shard when current one gets too large
@@ -271,16 +401,52 @@ namespace wolvrix::lib::emit
                 }
 
                 if (currentShardSize + estimatedSize > maxShardSize) {
-                    currentShard++;
-                    currentShardSize = 0;
-                    if (currentShard >= static_cast<int>(shardBuffers.size())) {
-                        shardBuffers.emplace_back();
-                        shardBuffers.back().reserve(static_cast<std::size_t>(maxShardSize) + 1024U);
-                        shardDirtyReplayMask.push_back(0);
-                        shardSuccessors.emplace_back();
-                        shardDirtyReplaySuccessors.emplace_back();
-                    }
+                    startNewShard();
                 }
+            }
+
+            void setCurrentOpActivity(std::uint32_t opIndex) {
+                currentOpActivityOrdinal = -1;
+                currentOpActivityClassBit = 0;
+                if (opIndex >= opActivityOrdinalByIndex.size()) {
+                    return;
+                }
+                const int ordinal = opActivityOrdinalByIndex[opIndex];
+                if (ordinal < 0 || ordinal >= static_cast<int>(activityClassBitsByOrdinal.size())) {
+                    return;
+                }
+                currentOpActivityOrdinal = ordinal;
+                currentOpActivityClassBit = activityClassBitsByOrdinal[static_cast<std::size_t>(ordinal)];
+            }
+
+            void maybeCutShardForCurrentOpActivity() {
+                if (!enableSharding || !enableActivityWatermark ||
+                    activityBoundaryShardSoftBytes <= 0 ||
+                    currentShardSize < activityBoundaryShardSoftBytes ||
+                    currentOpActivityOrdinal < 0 || currentOpActivityClassBit == 0) {
+                    return;
+                }
+                if (currentShardSize <= 0) {
+                    return;
+                }
+                const bool incomingNewClass =
+                    (currentShardActivityClassMask & currentOpActivityClassBit) == 0;
+                const bool currentShardAlreadyMixed =
+                    (currentShardActivityClassMask & (currentShardActivityClassMask - 1U)) != 0;
+                const bool activityChanged =
+                    currentShardLastActivityOrdinal >= 0 &&
+                    currentShardLastActivityOrdinal != currentOpActivityOrdinal;
+                if (incomingNewClass || (currentShardAlreadyMixed && activityChanged)) {
+                    startNewShard();
+                }
+            }
+
+            void addShardDirtyReplaySuccessor(int fromShard, int toShard, std::uint8_t dirtyReplayMask) {
+                if (dirtyReplayMask == 0 || fromShard < 0 || toShard < 0 ||
+                    fromShard >= static_cast<int>(shardDirtyReplaySuccessors.size())) {
+                    return;
+                }
+                shardDirtyReplaySuccessors[static_cast<std::size_t>(fromShard)][dirtyReplayMask].insert(toShard);
             }
 
             void addShardSuccessor(int fromShard, int toShard, std::uint8_t dirtyReplayMask = 0) {
@@ -288,9 +454,7 @@ namespace wolvrix::lib::emit
                     return;
                 }
                 shardSuccessors[static_cast<std::size_t>(fromShard)].insert(toShard);
-                if (dirtyReplayMask != 0 && fromShard < static_cast<int>(shardDirtyReplaySuccessors.size())) {
-                    shardDirtyReplaySuccessors[static_cast<std::size_t>(fromShard)][dirtyReplayMask].insert(toShard);
-                }
+                addShardDirtyReplaySuccessor(fromShard, toShard, dirtyReplayMask);
             }
 
             // Set result for a value ID
@@ -341,6 +505,12 @@ namespace wolvrix::lib::emit
                     lastEmittedShard = currentShard;
                 }
                 if (enableActivityWatermark && currentShard >= 0) {
+                    if (currentOpActivityClassBit != 0) {
+                        currentShardActivityClassMask |= currentOpActivityClassBit;
+                    }
+                    if (currentOpActivityOrdinal >= 0) {
+                        currentShardLastActivityOrdinal = currentOpActivityOrdinal;
+                    }
                     for (const auto& source : currentOpDirectActivitySources) {
                         auto [it, inserted] = activitySourceFirstShard.emplace(source, currentShard);
                         if (!inserted && currentShard < it->second) {
@@ -357,7 +527,7 @@ namespace wolvrix::lib::emit
                 markCurrentShardActivity();
                 shard->append(stmt);
                 shard->push_back('\n');
-                currentShardSize += static_cast<int>(stmt.length());
+                currentShardSize += static_cast<int>(stmt.length() + 1U);
             }
 
             void emitShardAssignment(const std::string& lhs, const std::string& rhs) {
@@ -366,13 +536,21 @@ namespace wolvrix::lib::emit
                 const bool simpleWideRhs = rhs.rfind("evalTemps_->tempVec[", 0) == 0 ||
                                            rhs.rfind("state_->stateVec[", 0) == 0;
                 if (tempVecLhs && simpleWideRhs && rhs.find('(') == std::string::npos) {
-                    stmt.append("wolvrix_gsim_assign_bits(");
+                    const auto fixedWordCount = fixedWideAssignWordCount(lhs, tempVecWidths);
+                    stmt.append(fixedWordCount ? wideAssignFunctionName(*fixedWordCount) : "wolvrix_gsim_assign_bits");
+                    stmt.append("(");
                     stmt.append(lhs);
                     stmt.append(", ");
                     stmt.append(rhs);
                     stmt.append(")");
                 } else if (tempVecLhs && isWideStorageTernaryExpr(rhs)) {
-                    stmt.append("wolvrix_gsim_assign_bits(");
+                    const bool ternaryUsesVariableWidthPort = rhs.find("input_") != std::string::npos ||
+                                                              rhs.find("output_") != std::string::npos;
+                    const auto fixedWordCount = ternaryUsesVariableWidthPort
+                        ? std::optional<std::size_t>{}
+                        : fixedWideAssignWordCount(lhs, tempVecWidths);
+                    stmt.append(fixedWordCount ? wideAssignFunctionName(*fixedWordCount) : "wolvrix_gsim_assign_bits");
+                    stmt.append("(");
                     stmt.append(lhs);
                     stmt.append(", ");
                     stmt.append(rhs);
@@ -397,6 +575,27 @@ namespace wolvrix::lib::emit
                 currentShardSize += static_cast<int>(stmt.size());
             }
 
+            void emitChangedScalarShardAssignment(const wolvrix::lib::grh::ValueId& valueId,
+                                                  const std::string& lhs,
+                                                  const std::string& rhs) {
+                const std::string token = "/*WOLVRIX_GSIM_VALUE_FANOUT_" + std::to_string(changeFanoutTokenCount++) + "*/";
+                valueChangeFanoutTokens[valueId] = token;
+                valueChangeFanoutLhs[valueId] = lhs;
+                valueChangeFanoutRhs[valueId] = rhs;
+                changeTrackedValues.insert(valueId);
+
+                const int estimatedSize = std::max(
+                    static_cast<int>(token.size() + 1U),
+                    static_cast<int>(lhs.size() + rhs.size() + static_cast<std::size_t>(changedValueFanoutEstimateBytes)));
+                ensureShardSpace(estimatedSize);
+                std::string* shard = getCurrentShardBuffer();
+                markCurrentShardActivity();
+                valueChangeFanoutTokenShard[valueId] = currentShard;
+                shard->append(token);
+                shard->push_back('\n');
+                currentShardSize += estimatedSize;
+            }
+
             void setResult(const wolvrix::lib::grh::ValueId& valueId,
                            const std::string& expr,
                            const std::string& cppType,
@@ -408,6 +607,10 @@ namespace wolvrix::lib::emit
                 }
 
                 const std::string resultRef = materializeResultRef(valueId, cppType, width);
+                if (enableActivityWatermark && width <= 64) {
+                    emitChangedScalarShardAssignment(valueId, resultRef, expr);
+                    return;
+                }
                 emitShardAssignment(resultRef, expr);
             }
 
@@ -503,6 +706,15 @@ namespace wolvrix::lib::emit
             bool globalPreReg = false;
         };
 
+        struct SequentialStoragePools
+        {
+            std::size_t stateU8 = 0;
+            std::size_t stateU16 = 0;
+            std::size_t stateU32 = 0;
+            std::size_t stateU64 = 0;
+            std::size_t stateVec = 0;
+        };
+
         std::map<int, std::uint64_t> shardWordMasksFor(const std::set<int>& shards)
         {
             std::map<int, std::uint64_t> masks;
@@ -522,6 +734,884 @@ namespace wolvrix::lib::emit
         {
             for (const auto& [word, mask] : masks) {
                 os << indent << "activate_shard_mask(" << word << "U, UINT64_C(" << mask << "));" << suffix;
+            }
+        }
+
+        std::string buildShardWordMaskActivation(const std::map<int, std::uint64_t>& masks)
+        {
+            std::ostringstream os;
+            emitShardWordMaskActivation(os, masks, " ", "");
+            return os.str();
+        }
+
+        std::uint32_t internChangedFanoutRange(CodegenState& state,
+                                               const std::map<int, std::uint64_t>& masks)
+        {
+            std::ostringstream key;
+            for (const auto& [word, mask] : masks) {
+                key << word << ':' << mask << ';';
+            }
+            const std::string keyText = key.str();
+            if (const auto it = state.changedFanoutRangeIds.find(keyText);
+                it != state.changedFanoutRangeIds.end()) {
+                return it->second;
+            }
+
+            const auto rangeId = static_cast<std::uint32_t>(state.changedFanoutRanges.size());
+            const auto offset = static_cast<std::uint32_t>(state.changedFanoutMasks.size());
+            const auto count = static_cast<std::uint32_t>(masks.size());
+            state.changedFanoutRanges.emplace_back(offset, count);
+            for (const auto& [word, mask] : masks) {
+                state.changedFanoutMasks.emplace_back(static_cast<std::uint32_t>(word), mask);
+            }
+            state.changedFanoutRangeIds.emplace(keyText, rangeId);
+            return rangeId;
+        }
+
+        std::uint32_t internShardActivationRange(CodegenState& state,
+                                                 const std::map<int, std::uint64_t>& masks)
+        {
+            std::ostringstream key;
+            for (const auto& [word, mask] : masks) {
+                key << word << ':' << mask << ';';
+            }
+            const std::string keyText = key.str();
+            if (const auto it = state.shardActivationRangeIds.find(keyText);
+                it != state.shardActivationRangeIds.end()) {
+                return it->second;
+            }
+
+            const auto rangeId = static_cast<std::uint32_t>(state.shardActivationRanges.size());
+            const auto offset = static_cast<std::uint32_t>(state.shardActivationMasks.size());
+            const auto count = static_cast<std::uint32_t>(masks.size());
+            state.shardActivationRanges.emplace_back(offset, count);
+            for (const auto& [word, mask] : masks) {
+                state.shardActivationMasks.emplace_back(static_cast<std::uint32_t>(word), mask);
+            }
+            state.shardActivationRangeIds.emplace(keyText, rangeId);
+            return rangeId;
+        }
+
+        std::string buildShardActivation(const CodegenState& state,
+                                         const std::map<int, std::uint64_t>& masks)
+        {
+            if (masks.empty()) {
+                return {};
+            }
+            if (static_cast<int>(masks.size()) <= state.changedValueFanoutInlineMaskLimit) {
+                return buildShardWordMaskActivation(masks);
+            }
+            std::ostringstream key;
+            for (const auto& [word, mask] : masks) {
+                key << word << ':' << mask << ';';
+            }
+            if (const auto it = state.shardActivationRangeIds.find(key.str());
+                it != state.shardActivationRangeIds.end()) {
+                return " activate_shard_mask_range(" + std::to_string(it->second) + "U);";
+            }
+            return buildShardWordMaskActivation(masks);
+        }
+
+        std::string buildChangedFanoutActivation(CodegenState& state,
+                                                 const std::map<int, std::uint64_t>& masks)
+        {
+            if (masks.empty()) {
+                return {};
+            }
+            if (static_cast<int>(masks.size()) <= state.changedValueFanoutInlineMaskLimit) {
+                return buildShardWordMaskActivation(masks);
+            }
+            const std::uint32_t rangeId = internChangedFanoutRange(state, masks);
+            return " activate_changed_fanout(" + std::to_string(rangeId) + "U);";
+        }
+
+        void precomputeShardSuccessorActivationRanges(CodegenState& state)
+        {
+            if (!state.enableSharding || !state.enableActivityWatermark ||
+                state.shardCount() <= 0 || state.shardSuccessors.empty()) {
+                return;
+            }
+            for (int shard = 0; shard < static_cast<int>(state.shardSuccessors.size()); ++shard) {
+                std::map<int, std::uint64_t> crossWordMasks;
+                const int activeWord = shard / 64;
+                for (int successor : state.shardSuccessors[static_cast<std::size_t>(shard)]) {
+                    if (successor < 0) {
+                        continue;
+                    }
+                    const int word = successor / 64;
+                    if (word == activeWord) {
+                        continue;
+                    }
+                    crossWordMasks[word] |= (std::uint64_t{1} << (successor % 64));
+                }
+                if (static_cast<int>(crossWordMasks.size()) > state.changedValueFanoutInlineMaskLimit) {
+                    internShardActivationRange(state, crossWordMasks);
+                }
+            }
+        }
+
+        void removeStaticallyCoveredFanoutMasks(CodegenState& state,
+                                                int shard,
+                                                std::map<int, std::uint64_t>& masks)
+        {
+            if (shard < 0 || shard >= static_cast<int>(state.shardSuccessors.size()) || masks.empty()) {
+                return;
+            }
+            const auto coveredMasks = shardWordMasksFor(state.shardSuccessors[static_cast<std::size_t>(shard)]);
+            for (const auto& [word, coveredMask] : coveredMasks) {
+                auto it = masks.find(word);
+                if (it == masks.end()) {
+                    continue;
+                }
+                it->second &= ~coveredMask;
+                if (it->second == 0) {
+                    masks.erase(it);
+                }
+            }
+        }
+
+        void replaceShardTokensInOnePass(
+            std::string& text,
+            const std::unordered_map<std::string, std::string>& replacements)
+        {
+            if (text.empty() || replacements.empty()) {
+                return;
+            }
+            constexpr std::string_view marker = "/*WOLVRIX_GSIM_VALUE_FANOUT_";
+            std::string result;
+            result.reserve(text.size());
+            std::size_t cursor = 0;
+            while (true) {
+                const std::size_t tokenStart = text.find(marker, cursor);
+                if (tokenStart == std::string::npos) {
+                    result.append(text, cursor, std::string::npos);
+                    break;
+                }
+                result.append(text, cursor, tokenStart - cursor);
+                const std::size_t tokenEnd = text.find("*/", tokenStart + marker.size());
+                if (tokenEnd == std::string::npos) {
+                    result.append(text, tokenStart, std::string::npos);
+                    break;
+                }
+                const std::string token = text.substr(tokenStart, tokenEnd + 2U - tokenStart);
+                if (const auto it = replacements.find(token); it != replacements.end()) {
+                    result.append(it->second);
+                } else {
+                    result.append(token);
+                }
+                cursor = tokenEnd + 2U;
+            }
+            text.swap(result);
+        }
+
+        struct ChangedStateSpanLine
+        {
+            std::string hitVar;
+            std::string typeSuffix;
+            std::size_t tempOffset = 0;
+            std::size_t stateOffset = 0;
+            std::string original;
+        };
+
+        bool parseChangedStateSpanLine(std::string_view line, ChangedStateSpanLine& parsed)
+        {
+            constexpr std::string_view opPrefix = " |= wolvrix_gsim_assign_if_changed(evalTemps_->temp";
+            constexpr std::string_view statePrefix = "], state_->state";
+            constexpr std::string_view suffix = "]);";
+            const auto opPos = line.find(opPrefix);
+            if (opPos == std::string_view::npos || opPos == 0) {
+                return false;
+            }
+            const auto typeBegin = opPos + opPrefix.size();
+            const auto typeEnd = line.find('[', typeBegin);
+            if (typeEnd == std::string_view::npos) {
+                return false;
+            }
+            const std::string_view typeSuffix = line.substr(typeBegin, typeEnd - typeBegin);
+            if (typeSuffix != "U8" && typeSuffix != "U16" && typeSuffix != "U32" && typeSuffix != "U64") {
+                return false;
+            }
+            const auto tempBegin = typeEnd + 1U;
+            const auto tempEnd = line.find(statePrefix, tempBegin);
+            if (tempEnd == std::string_view::npos) {
+                return false;
+            }
+            const auto stateTypeBegin = tempEnd + statePrefix.size();
+            const auto stateTypeEnd = line.find('[', stateTypeBegin);
+            if (stateTypeEnd == std::string_view::npos ||
+                line.substr(stateTypeBegin, stateTypeEnd - stateTypeBegin) != typeSuffix) {
+                return false;
+            }
+            const auto stateBegin = stateTypeEnd + 1U;
+            const auto stateEnd = line.find(suffix, stateBegin);
+            if (stateEnd == std::string_view::npos || stateEnd + suffix.size() != line.size()) {
+                return false;
+            }
+            auto parseUnsigned = [](std::string_view text, std::size_t& value) {
+                if (text.empty()) {
+                    return false;
+                }
+                std::size_t result = 0;
+                for (char ch : text) {
+                    if (ch < '0' || ch > '9') {
+                        return false;
+                    }
+                    result = result * 10U + static_cast<std::size_t>(ch - '0');
+                }
+                value = result;
+                return true;
+            };
+            std::size_t tempOffset = 0;
+            std::size_t stateOffset = 0;
+            if (!parseUnsigned(line.substr(tempBegin, tempEnd - tempBegin), tempOffset) ||
+                !parseUnsigned(line.substr(stateBegin, stateEnd - stateBegin), stateOffset)) {
+                return false;
+            }
+            parsed.hitVar.assign(line.substr(0, opPos));
+            parsed.typeSuffix.assign(typeSuffix);
+            parsed.tempOffset = tempOffset;
+            parsed.stateOffset = stateOffset;
+            parsed.original.assign(line);
+            return true;
+        }
+
+        void appendChangedStateSpanRun(std::string& out, const std::vector<ChangedStateSpanLine>& run)
+        {
+            constexpr std::size_t minSpan = 16;
+            if (run.size() >= minSpan) {
+                out.append(run.front().hitVar);
+                out.append(" |= wolvrix_gsim_assign_scalar_span_if_changed(&evalTemps_->temp");
+                out.append(run.front().typeSuffix);
+                out.push_back('[');
+                out.append(std::to_string(run.front().tempOffset));
+                out.append("], &state_->state");
+                out.append(run.front().typeSuffix);
+                out.push_back('[');
+                out.append(std::to_string(run.front().stateOffset));
+                out.append("], ");
+                out.append(std::to_string(run.size()));
+                out.append("U);\n");
+                return;
+            }
+            for (const auto& line : run) {
+                out.append(line.original);
+                out.push_back('\n');
+            }
+        }
+
+        void coalesceChangedStateSpanAssignments(std::string& text)
+        {
+            if (text.find("wolvrix_gsim_assign_if_changed(evalTemps_->temp") == std::string::npos ||
+                text.find("state_->state") == std::string::npos) {
+                return;
+            }
+
+            std::string result;
+            result.reserve(text.size());
+            std::vector<ChangedStateSpanLine> run;
+            auto flushRun = [&]() {
+                if (!run.empty()) {
+                    appendChangedStateSpanRun(result, run);
+                    run.clear();
+                }
+            };
+
+            std::size_t cursor = 0;
+            while (cursor < text.size()) {
+                const std::size_t newline = text.find('\n', cursor);
+                const bool hasNewline = newline != std::string::npos;
+                const std::size_t lineEnd = hasNewline ? newline : text.size();
+                const std::string_view line(text.data() + cursor, lineEnd - cursor);
+
+                ChangedStateSpanLine parsed;
+                if (parseChangedStateSpanLine(line, parsed)) {
+                    const bool extends = !run.empty() &&
+                        parsed.hitVar == run.back().hitVar &&
+                        parsed.typeSuffix == run.back().typeSuffix &&
+                        parsed.tempOffset == run.back().tempOffset + 1U &&
+                        parsed.stateOffset == run.back().stateOffset + 1U;
+                    if (!extends) {
+                        flushRun();
+                    }
+                    run.push_back(std::move(parsed));
+                } else {
+                    flushRun();
+                    result.append(line);
+                    if (hasNewline) {
+                        result.push_back('\n');
+                    }
+                }
+
+                if (!hasNewline) {
+                    break;
+                }
+                cursor = newline + 1U;
+            }
+            flushRun();
+            text.swap(result);
+        }
+
+        struct ScalarStorageRef
+        {
+            std::string storagePrefix;
+            std::string typeSuffix;
+            std::size_t offset = 0;
+        };
+
+        bool parseUnsignedSize(std::string_view text, std::size_t& value)
+        {
+            if (text.empty()) {
+                return false;
+            }
+            std::size_t result = 0;
+            for (char ch : text) {
+                if (ch < '0' || ch > '9') {
+                    return false;
+                }
+                result = result * 10U + static_cast<std::size_t>(ch - '0');
+            }
+            value = result;
+            return true;
+        }
+
+        bool parseScalarStorageRef(std::string_view expr, ScalarStorageRef& ref)
+        {
+            constexpr std::array<std::string_view, 2> prefixes = {
+                "evalTemps_->temp",
+                "state_->state",
+            };
+            for (const auto prefix : prefixes) {
+                if (expr.rfind(prefix, 0) != 0) {
+                    continue;
+                }
+                const auto typeBegin = prefix.size();
+                const auto typeEnd = expr.find('[', typeBegin);
+                if (typeEnd == std::string_view::npos) {
+                    return false;
+                }
+                const std::string_view typeSuffix = expr.substr(typeBegin, typeEnd - typeBegin);
+                if (typeSuffix != "U8" && typeSuffix != "U16" &&
+                    typeSuffix != "U32" && typeSuffix != "U64") {
+                    return false;
+                }
+                const auto indexBegin = typeEnd + 1U;
+                const auto indexEnd = expr.find(']', indexBegin);
+                if (indexEnd == std::string_view::npos || indexEnd + 1U != expr.size()) {
+                    return false;
+                }
+                std::size_t offset = 0;
+                if (!parseUnsignedSize(expr.substr(indexBegin, indexEnd - indexBegin), offset)) {
+                    return false;
+                }
+                ref.storagePrefix.assign(prefix);
+                ref.typeSuffix.assign(typeSuffix);
+                ref.offset = offset;
+                return true;
+            }
+            return false;
+        }
+
+        bool rangesOverlap(std::size_t lhsOffset, std::size_t rhsOffset, std::size_t count)
+        {
+            return lhsOffset < rhsOffset + count && rhsOffset < lhsOffset + count;
+        }
+
+        bool isChangedFanoutHitVar(std::string_view text)
+        {
+            constexpr std::string_view prefix = "wolvrix_gsim_changed_fanout_hit_";
+            if (text.rfind(prefix, 0) != 0 || text.size() == prefix.size()) {
+                return false;
+            }
+            for (std::size_t i = prefix.size(); i < text.size(); ++i) {
+                const char ch = text[i];
+                if (ch < '0' || ch > '9') {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        std::size_t minScalarCopySpan(std::string_view typeSuffix)
+        {
+            return typeSuffix == "U8" ? 8U : 4U;
+        }
+
+        std::size_t minScalarMuxSpan(std::string_view typeSuffix)
+        {
+            return typeSuffix == "U8" ? 4U : 2U;
+        }
+
+        struct ChangedTempCopySpanLine
+        {
+            std::string hitVar;
+            std::string typeSuffix;
+            std::size_t dstOffset = 0;
+            std::size_t srcOffset = 0;
+            std::string original;
+        };
+
+        bool parseChangedTempCopySpanLine(std::string_view line, ChangedTempCopySpanLine& parsed)
+        {
+            constexpr std::string_view opPrefix = " |= wolvrix_gsim_assign_if_changed(";
+            constexpr std::string_view separator = ", ";
+            constexpr std::string_view suffix = ");";
+            const auto opPos = line.find(opPrefix);
+            if (opPos == std::string_view::npos || opPos == 0) {
+                return false;
+            }
+            const auto lhsBegin = opPos + opPrefix.size();
+            const auto lhsEnd = line.find(separator, lhsBegin);
+            if (lhsEnd == std::string_view::npos) {
+                return false;
+            }
+            const auto rhsBegin = lhsEnd + separator.size();
+            const auto rhsEnd = line.find(suffix, rhsBegin);
+            if (rhsEnd == std::string_view::npos || rhsEnd + suffix.size() != line.size()) {
+                return false;
+            }
+
+            const std::string_view hitVar = line.substr(0, opPos);
+            if (!isChangedFanoutHitVar(hitVar)) {
+                return false;
+            }
+            ScalarStorageRef lhs;
+            ScalarStorageRef rhs;
+            if (!parseScalarStorageRef(line.substr(lhsBegin, lhsEnd - lhsBegin), lhs) ||
+                !parseScalarStorageRef(line.substr(rhsBegin, rhsEnd - rhsBegin), rhs)) {
+                return false;
+            }
+            if (lhs.storagePrefix != "evalTemps_->temp" ||
+                rhs.storagePrefix != "evalTemps_->temp" ||
+                lhs.typeSuffix != rhs.typeSuffix) {
+                return false;
+            }
+
+            parsed.hitVar.assign(hitVar);
+            parsed.typeSuffix = lhs.typeSuffix;
+            parsed.dstOffset = lhs.offset;
+            parsed.srcOffset = rhs.offset;
+            parsed.original.assign(line);
+            return true;
+        }
+
+        void appendChangedTempCopySpanRun(std::string& out, const std::vector<ChangedTempCopySpanLine>& run)
+        {
+            if (run.size() >= minScalarCopySpan(run.front().typeSuffix) &&
+                !rangesOverlap(run.front().dstOffset, run.front().srcOffset, run.size())) {
+                out.append(run.front().hitVar);
+                out.append(" |= wolvrix_gsim_assign_scalar_span_if_changed(&evalTemps_->temp");
+                out.append(run.front().typeSuffix);
+                out.push_back('[');
+                out.append(std::to_string(run.front().dstOffset));
+                out.append("], &evalTemps_->temp");
+                out.append(run.front().typeSuffix);
+                out.push_back('[');
+                out.append(std::to_string(run.front().srcOffset));
+                out.append("], ");
+                out.append(std::to_string(run.size()));
+                out.append("U);\n");
+                return;
+            }
+            for (const auto& line : run) {
+                out.append(line.original);
+                out.push_back('\n');
+            }
+        }
+
+        struct ChangedMuxSpanLine
+        {
+            std::string hitVar;
+            std::string typeSuffix;
+            std::size_t dstOffset = 0;
+            ScalarStorageRef condition;
+            std::string conditionExpr;
+            ScalarStorageRef trueValue;
+            ScalarStorageRef falseValue;
+            std::string original;
+        };
+
+        bool parseChangedMuxSpanLine(std::string_view line, ChangedMuxSpanLine& parsed)
+        {
+            constexpr std::string_view opPrefix = " |= wolvrix_gsim_assign_if_changed(";
+            constexpr std::string_view separator = ", ";
+            constexpr std::string_view suffix = ");";
+            const auto opPos = line.find(opPrefix);
+            if (opPos == std::string_view::npos || opPos == 0) {
+                return false;
+            }
+            const auto lhsBegin = opPos + opPrefix.size();
+            const auto lhsEnd = line.find(separator, lhsBegin);
+            if (lhsEnd == std::string_view::npos) {
+                return false;
+            }
+            const auto rhsBegin = lhsEnd + separator.size();
+            const auto rhsEnd = line.find(suffix, rhsBegin);
+            if (rhsEnd == std::string_view::npos || rhsEnd + suffix.size() != line.size()) {
+                return false;
+            }
+            const std::string_view hitVar = line.substr(0, opPos);
+            if (!isChangedFanoutHitVar(hitVar)) {
+                return false;
+            }
+            std::string_view rhs = line.substr(rhsBegin, rhsEnd - rhsBegin);
+            if (rhs.size() < 5 || rhs.front() != '(' || rhs.back() != ')') {
+                return false;
+            }
+            rhs.remove_prefix(1);
+            rhs.remove_suffix(1);
+            const auto question = rhs.find(" ? ");
+            const auto colon = question == std::string_view::npos
+                ? std::string_view::npos
+                : rhs.find(" : ", question + 3U);
+            if (question == std::string_view::npos || colon == std::string_view::npos ||
+                rhs.find(" ? ", question + 3U) != std::string_view::npos ||
+                rhs.find(" : ", colon + 3U) != std::string_view::npos) {
+                return false;
+            }
+
+            ScalarStorageRef lhs;
+            ScalarStorageRef condition;
+            ScalarStorageRef trueValue;
+            ScalarStorageRef falseValue;
+            const auto conditionExpr = rhs.substr(0, question);
+            if (!parseScalarStorageRef(line.substr(lhsBegin, lhsEnd - lhsBegin), lhs) ||
+                !parseScalarStorageRef(conditionExpr, condition) ||
+                !parseScalarStorageRef(rhs.substr(question + 3U, colon - (question + 3U)), trueValue) ||
+                !parseScalarStorageRef(rhs.substr(colon + 3U), falseValue)) {
+                return false;
+            }
+            if (lhs.storagePrefix != "evalTemps_->temp" ||
+                lhs.typeSuffix != trueValue.typeSuffix ||
+                lhs.typeSuffix != falseValue.typeSuffix) {
+                return false;
+            }
+
+            parsed.hitVar.assign(hitVar);
+            parsed.typeSuffix = lhs.typeSuffix;
+            parsed.dstOffset = lhs.offset;
+            parsed.condition = std::move(condition);
+            parsed.conditionExpr.assign(conditionExpr);
+            parsed.trueValue = std::move(trueValue);
+            parsed.falseValue = std::move(falseValue);
+            parsed.original.assign(line);
+            return true;
+        }
+
+        bool changedMuxSpanRunIsSafe(const std::vector<ChangedMuxSpanLine>& run)
+        {
+            const auto& first = run.front();
+            const auto count = run.size();
+            if ((first.trueValue.storagePrefix == "evalTemps_->temp" &&
+                 first.trueValue.typeSuffix == first.typeSuffix &&
+                 rangesOverlap(first.dstOffset, first.trueValue.offset, count)) ||
+                (first.falseValue.storagePrefix == "evalTemps_->temp" &&
+                 first.falseValue.typeSuffix == first.typeSuffix &&
+                 rangesOverlap(first.dstOffset, first.falseValue.offset, count))) {
+                return false;
+            }
+            if (first.condition.storagePrefix == "evalTemps_->temp" &&
+                first.condition.typeSuffix == first.typeSuffix &&
+                first.condition.offset >= first.dstOffset &&
+                first.condition.offset < first.dstOffset + count) {
+                return false;
+            }
+            return true;
+        }
+
+        void appendScalarRefAddress(std::string& out, const ScalarStorageRef& ref)
+        {
+            out.push_back('&');
+            out.append(ref.storagePrefix);
+            out.append(ref.typeSuffix);
+            out.push_back('[');
+            out.append(std::to_string(ref.offset));
+            out.push_back(']');
+        }
+
+        void appendChangedMuxSpanRun(std::string& out, const std::vector<ChangedMuxSpanLine>& run)
+        {
+            if (run.size() >= minScalarMuxSpan(run.front().typeSuffix) && changedMuxSpanRunIsSafe(run)) {
+                out.append(run.front().hitVar);
+                out.append(" |= wolvrix_gsim_assign_mux_span_if_changed(&evalTemps_->temp");
+                out.append(run.front().typeSuffix);
+                out.push_back('[');
+                out.append(std::to_string(run.front().dstOffset));
+                out.append("], ");
+                out.append(run.front().conditionExpr);
+                out.append(" != 0, ");
+                appendScalarRefAddress(out, run.front().trueValue);
+                out.append(", ");
+                appendScalarRefAddress(out, run.front().falseValue);
+                out.append(", ");
+                out.append(std::to_string(run.size()));
+                out.append("U);\n");
+                return;
+            }
+            for (const auto& line : run) {
+                out.append(line.original);
+                out.push_back('\n');
+            }
+        }
+
+        void coalesceChangedTempCopyAndMuxSpanAssignments(std::string& text)
+        {
+            if (text.find("wolvrix_gsim_assign_if_changed(evalTemps_->temp") == std::string::npos ||
+                text.find("evalTemps_->temp") == std::string::npos) {
+                return;
+            }
+
+            std::string result;
+            result.reserve(text.size());
+            std::vector<ChangedTempCopySpanLine> copyRun;
+            std::vector<ChangedMuxSpanLine> muxRun;
+            auto flushCopyRun = [&]() {
+                if (!copyRun.empty()) {
+                    appendChangedTempCopySpanRun(result, copyRun);
+                    copyRun.clear();
+                }
+            };
+            auto flushMuxRun = [&]() {
+                if (!muxRun.empty()) {
+                    appendChangedMuxSpanRun(result, muxRun);
+                    muxRun.clear();
+                }
+            };
+            auto flushAll = [&]() {
+                flushCopyRun();
+                flushMuxRun();
+            };
+
+            std::size_t cursor = 0;
+            while (cursor < text.size()) {
+                const std::size_t newline = text.find('\n', cursor);
+                const bool hasNewline = newline != std::string::npos;
+                const std::size_t lineEnd = hasNewline ? newline : text.size();
+                const std::string_view line(text.data() + cursor, lineEnd - cursor);
+
+                ChangedTempCopySpanLine copyLine;
+                ChangedMuxSpanLine muxLine;
+                if (parseChangedTempCopySpanLine(line, copyLine)) {
+                    flushMuxRun();
+                    const bool extends = !copyRun.empty() &&
+                        copyLine.hitVar == copyRun.back().hitVar &&
+                        copyLine.typeSuffix == copyRun.back().typeSuffix &&
+                        copyLine.dstOffset == copyRun.back().dstOffset + 1U &&
+                        copyLine.srcOffset == copyRun.back().srcOffset + 1U;
+                    if (!extends) {
+                        flushCopyRun();
+                    }
+                    copyRun.push_back(std::move(copyLine));
+                } else if (parseChangedMuxSpanLine(line, muxLine)) {
+                    flushCopyRun();
+                    const bool extends = !muxRun.empty() &&
+                        muxLine.hitVar == muxRun.back().hitVar &&
+                        muxLine.typeSuffix == muxRun.back().typeSuffix &&
+                        muxLine.conditionExpr == muxRun.back().conditionExpr &&
+                        muxLine.trueValue.storagePrefix == muxRun.back().trueValue.storagePrefix &&
+                        muxLine.falseValue.storagePrefix == muxRun.back().falseValue.storagePrefix &&
+                        muxLine.dstOffset == muxRun.back().dstOffset + 1U &&
+                        muxLine.trueValue.offset == muxRun.back().trueValue.offset + 1U &&
+                        muxLine.falseValue.offset == muxRun.back().falseValue.offset + 1U;
+                    if (!extends) {
+                        flushMuxRun();
+                    }
+                    muxRun.push_back(std::move(muxLine));
+                } else {
+                    flushAll();
+                    result.append(line);
+                    if (hasNewline) {
+                        result.push_back('\n');
+                    }
+                }
+
+                if (!hasNewline) {
+                    break;
+                }
+                cursor = newline + 1U;
+            }
+            flushAll();
+            text.swap(result);
+        }
+
+        void finalizeChangeTrackedFanout(CodegenState& state)
+        {
+            if (!state.enableSharding || !state.enableActivityWatermark ||
+                state.valueChangeFanoutTokens.empty()) {
+                return;
+            }
+
+            struct PendingFanoutReplacement {
+                std::string token;
+                std::string lhs;
+                std::string rhs;
+                std::string activation;
+                bool hasActivation = false;
+            };
+            struct FanoutActivationGroup {
+                std::string activation;
+                std::map<int, std::uint64_t> masks;
+                std::size_t count = 0;
+                std::string hitVar;
+            };
+            struct ShardFanoutReplacements {
+                std::vector<PendingFanoutReplacement> replacements;
+                std::vector<FanoutActivationGroup> groups;
+                std::unordered_map<std::string, std::size_t> groupByActivation;
+            };
+
+            std::vector<ShardFanoutReplacements> replacementsByShard(state.shardBuffers.size());
+            for (const auto& [valueId, token] : state.valueChangeFanoutTokens) {
+                const auto lhsIt = state.valueChangeFanoutLhs.find(valueId);
+                const auto rhsIt = state.valueChangeFanoutRhs.find(valueId);
+                const auto shardIt = state.valueChangeFanoutTokenShard.find(valueId);
+                if (lhsIt == state.valueChangeFanoutLhs.end() ||
+                    rhsIt == state.valueChangeFanoutRhs.end() ||
+                    shardIt == state.valueChangeFanoutTokenShard.end() ||
+                    shardIt->second < 0 ||
+                    shardIt->second >= static_cast<int>(state.shardBuffers.size())) {
+                    continue;
+                }
+
+                PendingFanoutReplacement replacement;
+                replacement.token = token;
+                replacement.lhs = lhsIt->second;
+                replacement.rhs = rhsIt->second;
+                if (const auto fanoutIt = state.valueChangeFanoutHeadShards.find(valueId);
+                    fanoutIt != state.valueChangeFanoutHeadShards.end() && !fanoutIt->second.empty()) {
+                    auto fanoutMasks = shardWordMasksFor(fanoutIt->second);
+                    removeStaticallyCoveredFanoutMasks(state, shardIt->second, fanoutMasks);
+                    replacement.activation = buildChangedFanoutActivation(state, fanoutMasks);
+                    replacement.hasActivation = !replacement.activation.empty();
+                    if (replacement.hasActivation) {
+                        auto& shardReplacements = replacementsByShard[static_cast<std::size_t>(shardIt->second)];
+                        auto groupIt = shardReplacements.groupByActivation.find(replacement.activation);
+                        if (groupIt == shardReplacements.groupByActivation.end()) {
+                            const std::size_t groupIndex = shardReplacements.groups.size();
+                            groupIt = shardReplacements.groupByActivation.emplace(replacement.activation, groupIndex).first;
+                            shardReplacements.groups.push_back({replacement.activation, fanoutMasks, 0, {}});
+                        }
+                        ++shardReplacements.groups[groupIt->second].count;
+                    }
+                }
+                replacementsByShard[static_cast<std::size_t>(shardIt->second)].replacements.push_back(std::move(replacement));
+            }
+            for (auto& shardReplacements : replacementsByShard) {
+                std::size_t localHitIndex = 0;
+                for (auto& group : shardReplacements.groups) {
+                    if (group.count > 1) {
+                        group.hitVar = "wolvrix_gsim_changed_fanout_hit_" + std::to_string(localHitIndex++);
+                    }
+                }
+            }
+            for (std::size_t shard = 0; shard < replacementsByShard.size(); ++shard) {
+                auto& shardReplacements = replacementsByShard[shard];
+                if (shardReplacements.replacements.empty()) {
+                    continue;
+                }
+                std::unordered_map<std::string, std::string> replacementsByToken;
+                replacementsByToken.reserve(shardReplacements.replacements.size());
+                for (const auto& entry : shardReplacements.replacements) {
+                    std::string replacement;
+                    if (entry.hasActivation) {
+                        const auto groupIt = shardReplacements.groupByActivation.find(entry.activation);
+                        const FanoutActivationGroup* group = nullptr;
+                        if (groupIt != shardReplacements.groupByActivation.end() &&
+                            groupIt->second < shardReplacements.groups.size()) {
+                            group = &shardReplacements.groups[groupIt->second];
+                        }
+                        if (group != nullptr && !group->hitVar.empty()) {
+                            replacement.append(group->hitVar);
+                            replacement.append(" |= wolvrix_gsim_assign_if_changed(");
+                            replacement.append(entry.lhs);
+                            replacement.append(", ");
+                            replacement.append(entry.rhs);
+                            replacement.append(");");
+                        } else {
+                            replacement.append("if (wolvrix_gsim_assign_if_changed(");
+                            replacement.append(entry.lhs);
+                            replacement.append(", ");
+                            replacement.append(entry.rhs);
+                            replacement.append(")) {");
+                            replacement.append(entry.activation);
+                            replacement.append(" }");
+                        }
+                    } else {
+                        replacement.append(entry.lhs);
+                        replacement.append(" = ");
+                        replacement.append(entry.rhs);
+                        replacement.append(";");
+                    }
+                    replacementsByToken.emplace(entry.token, std::move(replacement));
+                }
+                replaceShardTokensInOnePass(state.shardBuffers[shard], replacementsByToken);
+                coalesceChangedStateSpanAssignments(state.shardBuffers[shard]);
+                coalesceChangedTempCopyAndMuxSpanAssignments(state.shardBuffers[shard]);
+
+                std::string declarations;
+                std::string flushes;
+                std::map<int, std::size_t> batchedWordIndexes;
+                auto batchMaskName = [](std::size_t index) {
+                    return "wolvrix_gsim_changed_fanout_mask_" + std::to_string(index);
+                };
+                for (const auto& group : shardReplacements.groups) {
+                    if (group.hitVar.empty()) {
+                        continue;
+                    }
+                    declarations.append("bool ");
+                    declarations.append(group.hitVar);
+                    declarations.append(" = false;\n");
+                    for (const auto& [word, mask] : group.masks) {
+                        if (mask == 0 || batchedWordIndexes.find(word) != batchedWordIndexes.end()) {
+                            continue;
+                        }
+                        const std::size_t index = batchedWordIndexes.size();
+                        batchedWordIndexes.emplace(word, index);
+                        declarations.append("std::uint64_t ");
+                        declarations.append(batchMaskName(index));
+                        declarations.append(" = 0;\n");
+                    }
+                }
+                for (const auto& group : shardReplacements.groups) {
+                    if (group.hitVar.empty()) {
+                        continue;
+                    }
+                    flushes.append("if (");
+                    flushes.append(group.hitVar);
+                    flushes.append(") {");
+                    if (group.masks.empty()) {
+                        flushes.append(group.activation);
+                    } else {
+                        for (const auto& [word, mask] : group.masks) {
+                            if (mask == 0) {
+                                continue;
+                            }
+                            const auto batchIt = batchedWordIndexes.find(word);
+                            if (batchIt == batchedWordIndexes.end()) {
+                                continue;
+                            }
+                            flushes.append(" ");
+                            flushes.append(batchMaskName(batchIt->second));
+                            flushes.append(" |= UINT64_C(");
+                            flushes.append(std::to_string(mask));
+                            flushes.append(");");
+                        }
+                    }
+                    flushes.append(" }\n");
+                }
+                for (const auto& [word, index] : batchedWordIndexes) {
+                    const auto maskName = batchMaskName(index);
+                    flushes.append("if (");
+                    flushes.append(maskName);
+                    flushes.append(" != UINT64_C(0)) { activate_shard_mask(");
+                    flushes.append(std::to_string(word));
+                    flushes.append("U, ");
+                    flushes.append(maskName);
+                    flushes.append("); }\n");
+                }
+                if (!declarations.empty()) {
+                    state.shardBuffers[shard].insert(0, declarations);
+                    state.shardBuffers[shard].append(flushes);
+                }
             }
         }
 
@@ -717,9 +1807,96 @@ namespace wolvrix::lib::emit
             return sawDigit;
         }
 
-        bool isZeroCppScalarExpr(std::string_view text)
+        std::optional<std::uint64_t> parseUnsignedScalarLiteralExpr(std::string_view text)
         {
-            return text == "0" || text == "0U" || text == "0ULL" || text == "0x0ULL";
+            std::string value = trimCopy(std::string(text));
+            while (!value.empty() && (value.back() == 'U' || value.back() == 'u' ||
+                                      value.back() == 'L' || value.back() == 'l')) {
+                value.pop_back();
+            }
+            if (value.empty()) {
+                return std::nullopt;
+            }
+            int radix = 10;
+            std::size_t digitBegin = 0;
+            const auto apostrophe = value.find('\'');
+            if (apostrophe != std::string::npos && apostrophe + 1 < value.size()) {
+                digitBegin = apostrophe + 1;
+                const char base = value[digitBegin];
+                if (base == 'b' || base == 'B') {
+                    radix = 2;
+                    ++digitBegin;
+                } else if (base == 'h' || base == 'H') {
+                    radix = 16;
+                    ++digitBegin;
+                } else if (base == 'd' || base == 'D') {
+                    radix = 10;
+                    ++digitBegin;
+                } else if (base == 'o' || base == 'O') {
+                    radix = 8;
+                    ++digitBegin;
+                }
+            } else if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+                radix = 16;
+                digitBegin = 2;
+            }
+            bool sawDigit = false;
+            std::uint64_t result = 0;
+            auto digitValue = [](char ch) {
+                if (ch >= '0' && ch <= '9') {
+                    return ch - '0';
+                }
+                if (ch >= 'a' && ch <= 'f') {
+                    return 10 + (ch - 'a');
+                }
+                if (ch >= 'A' && ch <= 'F') {
+                    return 10 + (ch - 'A');
+                }
+                return -1;
+            };
+            for (std::size_t i = digitBegin; i < value.size(); ++i) {
+                const char ch = value[i];
+                if (ch == '_' || std::isspace(static_cast<unsigned char>(ch))) {
+                    continue;
+                }
+                if (ch == 'x' || ch == 'X' || ch == 'z' || ch == 'Z' || ch == '?') {
+                    return std::nullopt;
+                }
+                const int digit = digitValue(ch);
+                if (digit < 0 || digit >= radix) {
+                    return std::nullopt;
+                }
+                if (result > (std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(digit)) /
+                                 static_cast<std::uint64_t>(radix)) {
+                    return std::nullopt;
+                }
+                result = result * static_cast<std::uint64_t>(radix) + static_cast<std::uint64_t>(digit);
+                sawDigit = true;
+            }
+            if (!sawDigit) {
+                return std::nullopt;
+            }
+            return result;
+        }
+
+        bool isZeroScalarMaskExpr(std::string_view text)
+        {
+            const auto value = parseUnsignedScalarLiteralExpr(text);
+            return value.has_value() && *value == 0;
+        }
+
+        bool isAllOnesScalarMaskExpr(std::string_view text, int64_t width)
+        {
+            if (width <= 0 || width > 64) {
+                return false;
+            }
+            const auto value = parseUnsignedScalarLiteralExpr(text);
+            if (!value) {
+                return false;
+            }
+            const std::uint64_t allOnes = width == 64 ? std::numeric_limits<std::uint64_t>::max()
+                                                      : ((1ULL << width) - 1ULL);
+            return *value == allOnes;
         }
 
         std::string makeWideScalarLiteralExpr(int32_t width, const std::string &scalarExpr)
@@ -996,8 +2173,24 @@ namespace wolvrix::lib::emit
                 }
             };
             std::set<int> opDependencyProducerShards;
+            std::set<int> opDirtyReplayDependencyProducerShards;
+            std::unordered_set<wolvrix::lib::grh::ValueId, wolvrix::lib::grh::ValueIdHash> changeTrackedDependencyValues;
+            const bool opCanUseChangedOperandFanout =
+                !results.empty() &&
+                kind != OperationKind::kDpicCall &&
+                kind != OperationKind::kSystemTask &&
+                kind != OperationKind::kLatchWritePort &&
+                kind != OperationKind::kRegisterWritePort &&
+                kind != OperationKind::kMemoryWritePort &&
+                kind != OperationKind::kXMRWrite;
+            auto operandUsesChangeTrackedFanout = [&](const wolvrix::lib::grh::ValueId& valueId) {
+                return opCanUseChangedOperandFanout &&
+                       state.enableSharding && state.enableActivityWatermark &&
+                       state.changeTrackedValues.find(valueId) != state.changeTrackedValues.end();
+            };
             for (const auto operand : operands)
             {
+                const bool changeTrackedOperand = operandUsesChangeTrackedFanout(operand);
                 if (const auto rootIt = state.dirtyReplayRootMasks.find(operand);
                     rootIt != state.dirtyReplayRootMasks.end())
                 {
@@ -1017,7 +2210,12 @@ namespace wolvrix::lib::emit
                     if (const auto producerIt = state.valueProducerShard.find(operand);
                         producerIt != state.valueProducerShard.end() && producerIt->second >= 0)
                     {
-                        opDependencyProducerShards.insert(producerIt->second);
+                        if (changeTrackedOperand) {
+                            changeTrackedDependencyValues.insert(operand);
+                            opDirtyReplayDependencyProducerShards.insert(producerIt->second);
+                        } else {
+                            opDependencyProducerShards.insert(producerIt->second);
+                        }
                     }
                 }
                 if (state.enableActivityWatermark)
@@ -1027,7 +2225,11 @@ namespace wolvrix::lib::emit
                     {
                         mergeFirstShard(shardIt->second);
                         if (shardIt->second >= 0) {
-                            opDependencyProducerShards.insert(shardIt->second);
+                            if (changeTrackedOperand) {
+                                opDirtyReplayDependencyProducerShards.insert(shardIt->second);
+                            } else {
+                                opDependencyProducerShards.insert(shardIt->second);
+                            }
                         }
                     }
                     if (const auto producerIt = state.valueProducerShard.find(operand);
@@ -1041,7 +2243,11 @@ namespace wolvrix::lib::emit
                             const int producerFirstShard =
                                 state.opProducerFirstShardByIndex[static_cast<std::size_t>(opIt->second)];
                             if (producerFirstShard >= 0) {
-                                opDependencyProducerShards.insert(producerFirstShard);
+                                if (changeTrackedOperand) {
+                                    opDirtyReplayDependencyProducerShards.insert(producerFirstShard);
+                                } else {
+                                    opDependencyProducerShards.insert(producerFirstShard);
+                                }
                             }
                         }
                     }
@@ -1049,6 +2255,8 @@ namespace wolvrix::lib::emit
             }
             state.currentOpDirtyReplayMask = opDirtyReplayMask;
             state.currentOpFirstEmittedShard = -1;
+            state.setCurrentOpActivity(opId.index);
+            state.maybeCutShardForCurrentOpActivity();
             if (state.enableActivityWatermark) {
                 state.setCurrentActivity(std::move(directActivitySources), opActivityFirstShard);
             } else {
@@ -1113,6 +2321,20 @@ namespace wolvrix::lib::emit
                     for (const int dependencyShard : opDependencyProducerShards) {
                         if (dependencyShard >= 0 && dependencyShard < resultFirstShard) {
                             state.addShardSuccessor(dependencyShard, resultFirstShard, opDirtyReplayMask);
+                        }
+                    }
+                    if (opDirtyReplayMask != 0) {
+                        for (const int dependencyShard : opDirtyReplayDependencyProducerShards) {
+                            if (dependencyShard >= 0 && dependencyShard < resultFirstShard) {
+                                state.addShardDirtyReplaySuccessor(dependencyShard, resultFirstShard, opDirtyReplayMask);
+                            }
+                        }
+                    }
+                    for (const auto& operand : changeTrackedDependencyValues) {
+                        const auto producerIt = state.valueProducerShard.find(operand);
+                        if (producerIt != state.valueProducerShard.end() && producerIt->second >= 0 &&
+                            producerIt->second < resultFirstShard) {
+                            state.valueChangeFanoutHeadShards[operand].insert(resultFirstShard);
                         }
                     }
                 }
@@ -1268,6 +2490,18 @@ namespace wolvrix::lib::emit
                     {
                         if (state.enableSharding) {
                             setWideResultStatement(0, [&](const std::string& resultRef) {
+                                if (const auto wordCount = fixedWideWordCountForWidth(resultWidth)) {
+                                    if (tempVecHasAtLeastWords(resultRef, state.tempVecWidths, *wordCount) &&
+                                        tempVecHasAtLeastWords(getOperandExpr(0), state.tempVecWidths, *wordCount) &&
+                                        tempVecHasAtLeastWords(getOperandExpr(1), state.tempVecWidths, *wordCount)) {
+                                        return "wolvrix_gsim_bitwise_and_" + std::to_string(*wordCount) + "_fast(" +
+                                               resultRef + ", " + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                               ", " + fixedWideLastMaskExpr(resultWidth) + ");";
+                                    }
+                                    return "wolvrix_gsim_bitwise_and_" + std::to_string(*wordCount) + "(" +
+                                           resultRef + ", " + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                           ", " + fixedWideLastMaskExpr(resultWidth) + ");";
+                                }
                                 return "wolvrix_gsim_bitwise_and_into(" + resultRef + ", " +
                                        getOperandExpr(0) + ", " + getOperandExpr(1) + ", " +
                                        std::to_string(resultWidth) + "U);";
@@ -1294,6 +2528,18 @@ namespace wolvrix::lib::emit
                     {
                         if (state.enableSharding) {
                             setWideResultStatement(0, [&](const std::string& resultRef) {
+                                if (const auto wordCount = fixedWideWordCountForWidth(resultWidth)) {
+                                    if (tempVecHasAtLeastWords(resultRef, state.tempVecWidths, *wordCount) &&
+                                        tempVecHasAtLeastWords(getOperandExpr(0), state.tempVecWidths, *wordCount) &&
+                                        tempVecHasAtLeastWords(getOperandExpr(1), state.tempVecWidths, *wordCount)) {
+                                        return "wolvrix_gsim_bitwise_or_" + std::to_string(*wordCount) + "_fast(" +
+                                               resultRef + ", " + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                               ", " + fixedWideLastMaskExpr(resultWidth) + ");";
+                                    }
+                                    return "wolvrix_gsim_bitwise_or_" + std::to_string(*wordCount) + "(" +
+                                           resultRef + ", " + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                           ", " + fixedWideLastMaskExpr(resultWidth) + ");";
+                                }
                                 return "wolvrix_gsim_bitwise_or_into(" + resultRef + ", " +
                                        getOperandExpr(0) + ", " + getOperandExpr(1) + ", " +
                                        std::to_string(resultWidth) + "U);";
@@ -1320,6 +2566,18 @@ namespace wolvrix::lib::emit
                     {
                         if (state.enableSharding) {
                             setWideResultStatement(0, [&](const std::string& resultRef) {
+                                if (const auto wordCount = fixedWideWordCountForWidth(resultWidth)) {
+                                    if (tempVecHasAtLeastWords(resultRef, state.tempVecWidths, *wordCount) &&
+                                        tempVecHasAtLeastWords(getOperandExpr(0), state.tempVecWidths, *wordCount) &&
+                                        tempVecHasAtLeastWords(getOperandExpr(1), state.tempVecWidths, *wordCount)) {
+                                        return "wolvrix_gsim_bitwise_xor_" + std::to_string(*wordCount) + "_fast(" +
+                                               resultRef + ", " + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                               ", " + fixedWideLastMaskExpr(resultWidth) + ");";
+                                    }
+                                    return "wolvrix_gsim_bitwise_xor_" + std::to_string(*wordCount) + "(" +
+                                           resultRef + ", " + getOperandExpr(0) + ", " + getOperandExpr(1) +
+                                           ", " + fixedWideLastMaskExpr(resultWidth) + ");";
+                                }
                                 return "wolvrix_gsim_bitwise_xor_into(" + resultRef + ", " +
                                        getOperandExpr(0) + ", " + getOperandExpr(1) + ", " +
                                        std::to_string(resultWidth) + "U);";
@@ -1348,6 +2606,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kEq: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "1U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     if (lhsWidth > 64 || rhsWidth > 64) {
@@ -1362,6 +2624,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kCaseEq: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "1U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     if (lhsWidth > 64 || rhsWidth > 64) {
@@ -1376,6 +2642,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kCaseNe: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "0U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     if (lhsWidth > 64 || rhsWidth > 64) {
@@ -1440,6 +2710,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kLt: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "0U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     const bool signedCompare = graph.valueSigned(operands[0]) && graph.valueSigned(operands[1]);
@@ -1457,6 +2731,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kLe: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "1U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     const bool signedCompare = graph.valueSigned(operands[0]) && graph.valueSigned(operands[1]);
@@ -1474,6 +2752,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kGt: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "0U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     const bool signedCompare = graph.valueSigned(operands[0]) && graph.valueSigned(operands[1]);
@@ -1491,6 +2773,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kGe: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "1U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     const bool signedCompare = graph.valueSigned(operands[0]) && graph.valueSigned(operands[1]);
@@ -1508,6 +2794,10 @@ namespace wolvrix::lib::emit
                 }
 
                 case OperationKind::kNe: {
+                    if (operands.size() >= 2U && operands[0] == operands[1]) {
+                        setResultExpr(0, "0U");
+                        break;
+                    }
                     const auto lhsWidth = getOperandWidth(0);
                     const auto rhsWidth = getOperandWidth(1);
                     if (lhsWidth > 64 || rhsWidth > 64) {
@@ -1529,6 +2819,17 @@ namespace wolvrix::lib::emit
                         {
                             if (state.enableSharding) {
                                 setWideResultStatement(0, [&](const std::string& resultRef) {
+                                    if (const auto wordCount = fixedWideWordCountForWidth(resultValue.width())) {
+                                        if (tempVecHasAtLeastWords(resultRef, state.tempVecWidths, *wordCount) &&
+                                            tempVecHasAtLeastWords(getOperandExpr(0), state.tempVecWidths, *wordCount)) {
+                                            return "wolvrix_gsim_bitwise_not_" + std::to_string(*wordCount) + "_fast(" +
+                                                   resultRef + ", " + getOperandExpr(0) + ", " +
+                                                   fixedWideLastMaskExpr(resultValue.width()) + ");";
+                                        }
+                                        return "wolvrix_gsim_bitwise_not_" + std::to_string(*wordCount) + "(" +
+                                               resultRef + ", " + getOperandExpr(0) + ", " +
+                                               fixedWideLastMaskExpr(resultValue.width()) + ");";
+                                    }
                                     return "wolvrix_gsim_bitwise_not_into(" + resultRef + ", " +
                                            getOperandExpr(0) + ", " + std::to_string(resultValue.width()) + "U);";
                                 });
@@ -1768,6 +3069,14 @@ namespace wolvrix::lib::emit
                         break;
                     }
 
+                    if (operandWidth > 64 && *sliceWidth == 1) {
+                        const std::string slicedExpr =
+                            "wolvrix_gsim_slice_dynamic_bit_to_u64(" + getOperandExpr(0) + ", " + indexExpr + ", " +
+                            std::to_string(operandWidth) + ")";
+                        setResultExpr(0, slicedExpr);
+                        break;
+                    }
+
                     if (operandWidth > 64) {
                         const std::string slicedExpr =
                             "wolvrix_gsim_slice_dynamic_to_u64(" + getOperandExpr(0) + ", " + indexExpr + ", " +
@@ -1828,6 +3137,15 @@ namespace wolvrix::lib::emit
                         break;
                     }
 
+                    if (operandWidth > 64 && sliceWidth == 1)
+                    {
+                        const std::string slicedExpr =
+                            "wolvrix_gsim_slice_dynamic_bit_to_u64(" + getOperandExpr(0) + ", " +
+                            std::to_string(*sliceStart) + "ULL, " + std::to_string(operandWidth) + ")";
+                        setResultExpr(0, slicedExpr);
+                        break;
+                    }
+
                     if (operandWidth > 64)
                     {
                         const std::string slicedExpr =
@@ -1865,12 +3183,22 @@ namespace wolvrix::lib::emit
                     }
                     if (state.enableSharding && (operandWidth > 64 || totalWidth > 64)) {
                         setWideResultStatement(0, [&](const std::string& resultRef) {
+                            if (operandWidth == 1) {
+                                return "wolvrix_gsim_replicate_bit_into(" + resultRef + ", " + getOperandExpr(0) + ", " +
+                                       std::to_string(totalWidth) + ");";
+                            }
                             return "wolvrix_gsim_replicate_into(" + resultRef + ", " + getOperandExpr(0) + ", " +
                                    std::to_string(operandWidth) + ", " + std::to_string(*rep) + ");";
                         });
                         break;
                     }
                     if (operandWidth > 64 || totalWidth > 64) {
+                        if (operandWidth == 1) {
+                            setResultExpr(0,
+                                          "wolvrix_gsim_replicate_bit(" + getOperandExpr(0) + ", " +
+                                              std::to_string(totalWidth) + ")");
+                            break;
+                        }
                         setResultExpr(0,
                                       "wolvrix_gsim_replicate(" + getOperandExpr(0) + ", " +
                                           std::to_string(operandWidth) + ", " + std::to_string(*rep) + ")");
@@ -2142,13 +3470,18 @@ namespace wolvrix::lib::emit
                     const std::string latchExpr = state.persistentStorageExpr(latchName);
                     const std::string condition = getOperandExpr(0);
                     const std::string nextValue = getOperandExpr(1);
-                    const std::string mask = getOperandExpr(2);
+                    const bool hasMaskOperand = operands.size() > 2;
+                    const std::string mask = hasMaskOperand ? getOperandExpr(2) : std::string{};
 
                     const auto latchWidthIt = state.storageWidths.find(latchName);
-                    const bool wideLatch = latchWidthIt != state.storageWidths.end() && latchWidthIt->second > 64;
-                    const bool zeroMask = isZeroCppScalarExpr(mask);
+                    const int64_t latchWidth =
+                        latchWidthIt != state.storageWidths.end() ? latchWidthIt->second : 0;
+                    const bool wideLatch = latchWidth > 64;
+                    const bool fullMask =
+                        !hasMaskOperand || (hasMaskOperand && isZeroScalarMaskExpr(mask)) ||
+                        (!wideLatch && isAllOnesScalarMaskExpr(mask, latchWidth));
 
-                    if (!zeroMask) {
+                    if (!fullMask) {
                         if (wideLatch) {
                             state.latchStmts.push_back(
                                 "        if (" + condition + ") { wolvrix_gsim_mask_merge_in_place(" +
@@ -2175,7 +3508,8 @@ namespace wolvrix::lib::emit
                     // Operands: [updateCond, nextValue, mask, ...]
                     std::string condition = getOperandExpr(0);
                     std::string nextValue = getOperandExpr(1);
-                    std::string mask = getOperandExpr(2); // May be "0" if not present
+                    const bool hasMaskOperand = operands.size() > 2;
+                    std::string mask = hasMaskOperand ? getOperandExpr(2) : std::string{};
 
                     // Find the target register by looking at the first operand's defining op
                     // Or use regSymbol attribute if available
@@ -2203,9 +3537,14 @@ namespace wolvrix::lib::emit
                     }
 
                     std::string domainKey = "posedge:clock";
-                    auto clockSymAttr = op.attr("clockSymbol");
                     std::string clockSymbol = "clock";
-                    if (clockSymAttr) {
+                    if (operands.size() > 3) {
+                        const auto eventValue = graph.getValue(operands[3]);
+                        if (!eventValue.symbolText().empty()) {
+                            clockSymbol = std::string(eventValue.symbolText());
+                        }
+                    }
+                    if (auto clockSymAttr = op.attr("clockSymbol")) {
                         if (auto *sym = std::get_if<std::string>(&*clockSymAttr)) {
                             if (!sym->empty()) {
                                 clockSymbol = *sym;
@@ -2230,30 +3569,43 @@ namespace wolvrix::lib::emit
                         }
                     }
 
-                        if (!regName.empty()) {
-                            auto &regStmts = state.sequentialRegStmts[domainKey][regName];
-                            const std::string regExpr = state.persistentStorageExpr(regName);
-                            const std::string nextRegExpr = "next_" + regName;
-                            const auto regWidthIt = state.storageWidths.find(regName);
-                            const bool wideReg = regWidthIt != state.storageWidths.end() && regWidthIt->second > 64;
-                            const bool zeroMask = isZeroCppScalarExpr(mask);
-                            if (!zeroMask) {
-                                if (wideReg) {
-                                    regStmts.push_back(
-                                        "        if (" + condition + ") { " + nextRegExpr +
-                                        " = wolvrix_gsim_mask_merge(" + regExpr + ", " + nextValue + ", " + mask +
-                                        "); " + nextRegExpr + "_updated_ = true; committed_ = true; }");
-                                } else {
-                                    regStmts.push_back(
-                                        "        if (" + condition + ") { " + nextRegExpr + " = ((" + regExpr +
-                                        ") & ~(" + mask + ")) | ((" + nextValue + ") & (" + mask +
-                                        ")); committed_ = true; }");
-                                }
-                            } else {
-                                regStmts.push_back(
-                                    "        if (" + condition + ") { " + nextRegExpr + " = " + nextValue + "; committed_ = true; }");
-                            }
+                    if (!regName.empty()) {
+                        auto &regStmts = state.sequentialRegStmts[domainKey][regName];
+                        const std::string nextRegExpr = "next_" + regName;
+                        const auto regWidthIt = state.storageWidths.find(regName);
+                        const int64_t regWidth = regWidthIt != state.storageWidths.end() ? regWidthIt->second : 0;
+                        const bool wideReg = regWidth > 64;
+                        const bool zeroMask = hasMaskOperand && !wideReg && isZeroScalarMaskExpr(mask);
+                        const bool fullMask =
+                            !hasMaskOperand || (!wideReg && isAllOnesScalarMaskExpr(mask, regWidth));
+                        if (zeroMask) {
+                            break;
                         }
+                        if (!fullMask) {
+                            if (wideReg) {
+                                const std::string mergedExpr = nextRegExpr + "_merged_";
+                                regStmts.push_back(
+                                    "        if (" + condition + ") { auto " + mergedExpr +
+                                    " = wolvrix_gsim_mask_merge(" + nextRegExpr + ", " + nextValue + ", " + mask +
+                                    "); if (" + mergedExpr + " != " + nextRegExpr + ") { " + nextRegExpr +
+                                    " = std::move(" + mergedExpr + "); " + nextRegExpr +
+                                    "_updated_ = true; committed_ = true; } }");
+                            } else {
+                                const std::string mergedExpr = nextRegExpr + "_merged_";
+                                regStmts.push_back(
+                                    "        if (" + condition + ") { const auto " + mergedExpr + " = ((" + nextRegExpr +
+                                    ") & ~(" + mask + ")) | ((" + nextValue + ") & (" + mask +
+                                    ")); if (" + mergedExpr + " != " + nextRegExpr + ") { " + nextRegExpr +
+                                    " = " + mergedExpr + "; " + nextRegExpr + "_updated_ = true; committed_ = true; } }");
+                            }
+                        } else {
+                            const std::string cleanNextValue =
+                                wideReg ? nextValue : maskExprForWidth(nextValue, static_cast<int32_t>(regWidth));
+                            regStmts.push_back(
+                                "        if (" + condition + ") { " + nextRegExpr + " = " + cleanNextValue +
+                                "; " + nextRegExpr + "_updated_ = true; committed_ = true; }");
+                        }
+                    }
                     break;
                 }
 
@@ -3496,6 +4848,24 @@ namespace wolvrix::lib::emit
             }
         }
 
+        int parseNonNegativeIntAttr(const EmitOptions &options, std::string_view key, int defaultValue)
+        {
+            const auto value = attrValue(options, key);
+            if (!value)
+            {
+                return defaultValue;
+            }
+            try
+            {
+                const int parsed = std::stoi(*value);
+                return parsed >= 0 ? parsed : defaultValue;
+            }
+            catch (...)
+            {
+                return defaultValue;
+            }
+        }
+
         std::optional<std::pair<std::string, std::string>> parseSequentialDomain(std::string_view key)
         {
             const std::size_t pos = key.find(':');
@@ -3657,13 +5027,20 @@ namespace wolvrix::lib::emit
             os << "#include <algorithm>\n";
             os << "#include <cstdint>\n";
             os << "#include <cstddef>\n";
+            os << "#include <cstring>\n";
             os << "#include <initializer_list>\n";
             os << "#include <map>\n";
             os << "#include <memory>\n";
             os << "#include <stdexcept>\n";
             os << "#include <string>\n";
             os << "#include <type_traits>\n";
+            os << "#include <utility>\n";
             os << "#include <vector>\n\n";
+            os << "#if defined(__GNUC__) || defined(__clang__)\n";
+            os << "#define WOLVRIX_GSIM_ALWAYS_INLINE inline __attribute__((always_inline))\n";
+            os << "#else\n";
+            os << "#define WOLVRIX_GSIM_ALWAYS_INLINE inline\n";
+            os << "#endif\n\n";
             os << "inline std::uint64_t wolvrix_gsim_low_mask(std::uint32_t width) {\n";
             os << "    return width >= 64U ? ~0ULL : ((1ULL << width) - 1ULL);\n";
             os << "}\n";
@@ -3702,11 +5079,15 @@ namespace wolvrix::lib::emit
             os << "        return;\n";
             os << "    }\n";
             os << "    const auto wordCount = value.size();\n";
-            os << "    if (out.size() != wordCount) {\n";
+            os << "    const auto outWordCount = out.size();\n";
+            os << "    if (outWordCount < wordCount) {\n";
             os << "        out.resize(wordCount);\n";
             os << "    }\n";
             os << "    if (wordCount != 0U) {\n";
             os << "        std::copy(value.data(), value.data() + wordCount, out.data());\n";
+            os << "    }\n";
+            os << "    if (outWordCount > wordCount) {\n";
+            os << "        std::fill(out.begin() + static_cast<std::ptrdiff_t>(wordCount), out.end(), 0ULL);\n";
             os << "    }\n";
             os << "}\n";
             os << "inline void wolvrix_gsim_assign_bits(\n";
@@ -3720,6 +5101,47 @@ namespace wolvrix::lib::emit
             os << "        std::copy(words.begin(), words.end(), out.data());\n";
             os << "    }\n";
             os << "}\n";
+            for (std::size_t wordCount = 1; wordCount <= 4; ++wordCount) {
+                os << "inline void wolvrix_gsim_assign_bits_" << wordCount << "(\n";
+                os << "    std::vector<std::uint64_t>& out,\n";
+                os << "    const std::vector<std::uint64_t>& value) {\n";
+                os << "    if (&out == &value) { return; }\n";
+                os << "    if (out.size() != " << wordCount << "U) { out.assign(" << wordCount << "U, 0ULL); }\n";
+                for (std::size_t word = 0; word < wordCount; ++word) {
+                    os << "    out[" << word << "U] = value.size() > " << word << "U ? value[" << word << "U] : 0ULL;\n";
+                }
+                os << "}\n";
+            }
+            os << "template <typename L, typename R>\n";
+            os << "WOLVRIX_GSIM_ALWAYS_INLINE bool wolvrix_gsim_assign_if_changed(L& lhs, R&& rhs) {\n";
+            os << "    const L next = static_cast<L>(std::forward<R>(rhs));\n";
+            os << "    if (lhs != next) {\n";
+            os << "        lhs = next;\n";
+            os << "        return true;\n";
+            os << "    }\n";
+            os << "    return false;\n";
+            os << "}\n";
+            os << "template <typename T>\n";
+            os << "inline bool wolvrix_gsim_assign_scalar_span_if_changed(\n";
+            os << "    T* lhs,\n";
+            os << "    const T* rhs,\n";
+            os << "    std::size_t count) {\n";
+            os << "    const std::size_t byteCount = count * sizeof(T);\n";
+            os << "    if (count == 0U || std::memcmp(lhs, rhs, byteCount) == 0) {\n";
+            os << "        return false;\n";
+            os << "    }\n";
+            os << "    std::memcpy(lhs, rhs, byteCount);\n";
+            os << "    return true;\n";
+            os << "}\n";
+            os << "template <typename T>\n";
+            os << "inline bool wolvrix_gsim_assign_mux_span_if_changed(\n";
+            os << "    T* lhs,\n";
+            os << "    bool condition,\n";
+            os << "    const T* trueValue,\n";
+            os << "    const T* falseValue,\n";
+            os << "    std::size_t count) {\n";
+            os << "    return wolvrix_gsim_assign_scalar_span_if_changed(lhs, condition ? trueValue : falseValue, count);\n";
+            os << "}\n";
             os << "inline std::uint64_t wolvrix_gsim_load_shifted_word(\n";
             os << "    const std::vector<std::uint64_t>& value,\n";
             os << "    std::uint64_t bitIndex) {\n";
@@ -3730,6 +5152,12 @@ namespace wolvrix::lib::emit
             os << "        result |= value[wordIndex + 1U] << (64U - bitOffset);\n";
             os << "    }\n";
             os << "    return result;\n";
+            os << "}\n";
+            os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_bit_to_u64(\n";
+            os << "    const std::vector<std::uint64_t>& value,\n";
+            os << "    std::uint64_t bitIndex,\n";
+            os << "    std::uint32_t operandWidth) {\n";
+            os << "    return bitIndex < operandWidth ? (wolvrix_gsim_load_shifted_word(value, bitIndex) & 1ULL) : 0ULL;\n";
             os << "}\n";
             os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_to_u64(\n";
             os << "    const std::vector<std::uint64_t>& value,\n";
@@ -3881,6 +5309,101 @@ namespace wolvrix::lib::emit
             os << "        out.back() &= wolvrix_gsim_low_mask(width % 64U);\n";
             os << "    }\n";
             os << "}\n";
+            os << "template <std::size_t WordCount, typename L, typename R, typename Op>\n";
+            os << "inline void wolvrix_gsim_bitwise_fixed(\n";
+            os << "    std::vector<std::uint64_t>& out,\n";
+            os << "    const L& lhs,\n";
+            os << "    const R& rhs,\n";
+            os << "    std::uint64_t lastMask,\n";
+            os << "    Op op) {\n";
+            os << "    static_assert(WordCount >= 1U && WordCount <= 4U);\n";
+            os << "    if (out.size() != WordCount) { out.assign(WordCount, 0ULL); }\n";
+            os << "    for (std::size_t i = 0; i + 1U < WordCount; ++i) {\n";
+            os << "        out[i] = op(wolvrix_gsim_word_at(lhs, i), wolvrix_gsim_word_at(rhs, i));\n";
+            os << "    }\n";
+            os << "    constexpr std::size_t last = WordCount - 1U;\n";
+            os << "    out[last] = op(wolvrix_gsim_word_at(lhs, last), wolvrix_gsim_word_at(rhs, last)) & lastMask;\n";
+            os << "}\n";
+            os << "template <std::size_t WordCount, typename T, typename Op>\n";
+            os << "inline void wolvrix_gsim_bitwise_fixed_unary(\n";
+            os << "    std::vector<std::uint64_t>& out,\n";
+            os << "    const T& value,\n";
+            os << "    std::uint64_t lastMask,\n";
+            os << "    Op op) {\n";
+            os << "    static_assert(WordCount >= 1U && WordCount <= 4U);\n";
+            os << "    if (out.size() != WordCount) { out.assign(WordCount, 0ULL); }\n";
+            os << "    for (std::size_t i = 0; i + 1U < WordCount; ++i) {\n";
+            os << "        out[i] = op(wolvrix_gsim_word_at(value, i));\n";
+            os << "    }\n";
+            os << "    constexpr std::size_t last = WordCount - 1U;\n";
+            os << "    out[last] = op(wolvrix_gsim_word_at(value, last)) & lastMask;\n";
+            os << "}\n";
+            for (std::size_t wordCount = 1; wordCount <= 4; ++wordCount) {
+                os << "template <typename L, typename R>\n";
+                os << "inline void wolvrix_gsim_bitwise_and_" << wordCount
+                   << "(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint64_t lastMask) {\n";
+                os << "    wolvrix_gsim_bitwise_fixed<" << wordCount
+                   << ">(out, lhs, rhs, lastMask, [](std::uint64_t a, std::uint64_t b) { return a & b; });\n";
+                os << "}\n";
+                os << "inline void wolvrix_gsim_bitwise_and_" << wordCount
+                   << "_fast(std::vector<std::uint64_t>& out, const std::vector<std::uint64_t>& lhs, const std::vector<std::uint64_t>& rhs, std::uint64_t lastMask) {\n";
+                for (std::size_t i = 0; i < wordCount; ++i) {
+                    os << "    out[" << i << "] = (lhs[" << i << "] & rhs[" << i << "])";
+                    if (i + 1 == wordCount) {
+                        os << " & lastMask";
+                    }
+                    os << ";\n";
+                }
+                os << "}\n";
+                os << "template <typename L, typename R>\n";
+                os << "inline void wolvrix_gsim_bitwise_or_" << wordCount
+                   << "(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint64_t lastMask) {\n";
+                os << "    wolvrix_gsim_bitwise_fixed<" << wordCount
+                   << ">(out, lhs, rhs, lastMask, [](std::uint64_t a, std::uint64_t b) { return a | b; });\n";
+                os << "}\n";
+                os << "inline void wolvrix_gsim_bitwise_or_" << wordCount
+                   << "_fast(std::vector<std::uint64_t>& out, const std::vector<std::uint64_t>& lhs, const std::vector<std::uint64_t>& rhs, std::uint64_t lastMask) {\n";
+                for (std::size_t i = 0; i < wordCount; ++i) {
+                    os << "    out[" << i << "] = (lhs[" << i << "] | rhs[" << i << "])";
+                    if (i + 1 == wordCount) {
+                        os << " & lastMask";
+                    }
+                    os << ";\n";
+                }
+                os << "}\n";
+                os << "template <typename L, typename R>\n";
+                os << "inline void wolvrix_gsim_bitwise_xor_" << wordCount
+                   << "(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint64_t lastMask) {\n";
+                os << "    wolvrix_gsim_bitwise_fixed<" << wordCount
+                   << ">(out, lhs, rhs, lastMask, [](std::uint64_t a, std::uint64_t b) { return a ^ b; });\n";
+                os << "}\n";
+                os << "inline void wolvrix_gsim_bitwise_xor_" << wordCount
+                   << "_fast(std::vector<std::uint64_t>& out, const std::vector<std::uint64_t>& lhs, const std::vector<std::uint64_t>& rhs, std::uint64_t lastMask) {\n";
+                for (std::size_t i = 0; i < wordCount; ++i) {
+                    os << "    out[" << i << "] = (lhs[" << i << "] ^ rhs[" << i << "])";
+                    if (i + 1 == wordCount) {
+                        os << " & lastMask";
+                    }
+                    os << ";\n";
+                }
+                os << "}\n";
+                os << "template <typename T>\n";
+                os << "inline void wolvrix_gsim_bitwise_not_" << wordCount
+                   << "(std::vector<std::uint64_t>& out, const T& value, std::uint64_t lastMask) {\n";
+                os << "    wolvrix_gsim_bitwise_fixed_unary<" << wordCount
+                   << ">(out, value, lastMask, [](std::uint64_t a) { return ~a; });\n";
+                os << "}\n";
+                os << "inline void wolvrix_gsim_bitwise_not_" << wordCount
+                   << "_fast(std::vector<std::uint64_t>& out, const std::vector<std::uint64_t>& value, std::uint64_t lastMask) {\n";
+                for (std::size_t i = 0; i < wordCount; ++i) {
+                    os << "    out[" << i << "] = ~value[" << i << "]";
+                    if (i + 1 == wordCount) {
+                        os << " & lastMask";
+                    }
+                    os << ";\n";
+                }
+                os << "}\n";
+            }
             os << "template <typename L, typename R>\n";
             os << "inline void wolvrix_gsim_bitwise_and_into(std::vector<std::uint64_t>& out, const L& lhs, const R& rhs, std::uint32_t width) {\n";
             os << "    wolvrix_gsim_bitwise_into(out, lhs, rhs, width, [](std::uint64_t a, std::uint64_t b) { return a & b; });\n";
@@ -4155,6 +5678,26 @@ namespace wolvrix::lib::emit
             os << "    return result;\n";
             os << "}\n\n";
             os << "template <typename T>\n";
+            os << "inline void wolvrix_gsim_replicate_bit_into(\n";
+            os << "    std::vector<std::uint64_t>& result,\n";
+            os << "    const T& value,\n";
+            os << "    std::uint32_t width) {\n";
+            os << "    const auto requiredWords = static_cast<std::size_t>((width + 63U) / 64U);\n";
+            os << "    if (result.size() != requiredWords) { result.resize(requiredWords); }\n";
+            os << "    if (requiredWords == 0U) { return; }\n";
+            os << "    const std::uint64_t fillWord = (wolvrix_gsim_to_u64(value) & 1ULL) != 0ULL ? ~UINT64_C(0) : UINT64_C(0);\n";
+            os << "    std::fill(result.begin(), result.end(), fillWord);\n";
+            os << "    if ((width % 64U) != 0U) { result.back() &= wolvrix_gsim_low_mask(width % 64U); }\n";
+            os << "}\n";
+            os << "template <typename T>\n";
+            os << "inline std::vector<std::uint64_t> wolvrix_gsim_replicate_bit(\n";
+            os << "    const T& value,\n";
+            os << "    std::uint32_t width) {\n";
+            os << "    std::vector<std::uint64_t> result((width + 63U) / 64U, 0ULL);\n";
+            os << "    wolvrix_gsim_replicate_bit_into(result, value, width);\n";
+            os << "    return result;\n";
+            os << "}\n";
+            os << "template <typename T>\n";
             os << "inline std::vector<std::uint64_t> wolvrix_gsim_replicate(\n";
             os << "    const T& value,\n";
             os << "    std::uint32_t operandWidth,\n";
@@ -4326,10 +5869,12 @@ namespace wolvrix::lib::emit
             const std::string structName = "GsimMetadata_" + ns;
 
             os << "#pragma once\n\n";
+            os << "#include <cstddef>\n";
             os << "#include <cstdint>\n";
             os << "#include <map>\n";
             os << "#include <memory>\n";
             os << "#include <string>\n";
+            os << "#include <utility>\n";
             os << "#include <vector>\n\n";
             os << "struct SSimTopState;\n";
             os << "struct SSimTopEvalTemps;\n\n";
@@ -4400,7 +5945,7 @@ namespace wolvrix::lib::emit
                 if (sanitizedName == "reset") {
                     continue;
                 }
-                const bool isSequentialClockInput = sequentialClockInputs.count(name) > 0;
+                const bool isSequentialClockInput = sequentialClockInputs.count(sanitizedName) > 0;
                 std::string methodName = "set_" + sanitizedName;
                 os << "    void " << methodName << "(" << type << " value) { if (!(input_"
                    << sanitizedName << "_ == value)) { input_" << sanitizedName << "_ = value; ";
@@ -4477,7 +6022,13 @@ namespace wolvrix::lib::emit
                     os << "    void activate_shards(const std::uint32_t* indices, std::size_t count);\n";
                     os << "    void activate_shard(std::uint32_t shard);\n";
                     os << "    void activate_shard_mask(std::uint32_t word, std::uint64_t mask);\n";
+                    if (!state.shardActivationRanges.empty()) {
+                        os << "    void activate_shard_mask_range(std::uint32_t rangeId);\n";
+                    }
                     os << "    void activate_shard_range(std::uint32_t firstShard);\n";
+                    if (!state.changedFanoutRanges.empty()) {
+                        os << "    void activate_changed_fanout(std::uint32_t fanout);\n";
+                    }
                     const int activeWordCount = (state.shardCount() + 63) / 64;
                     for (int word = 0; word < activeWordCount; ++word) {
                         os << "    void run_active_shard_word_" << word << "(std::uint64_t& active_bits_);\n";
@@ -4537,7 +6088,13 @@ namespace wolvrix::lib::emit
                 os << "    std::vector<std::uint32_t> active_word_queue_;\n";
             }
             for (const auto &chunk : sequentialChunks) {
-                os << "    void " << chunk.methodName << "(bool& committed_, bool& dirty_on_commit_);\n";
+                os << "    void " << chunk.methodName
+                   << "(bool& committed_, bool& dirty_on_commit_, "
+                   << "std::vector<std::pair<std::size_t, std::uint8_t>>* next_stateU8_, "
+                   << "std::vector<std::pair<std::size_t, std::uint16_t>>* next_stateU16_, "
+                   << "std::vector<std::pair<std::size_t, std::uint32_t>>* next_stateU32_, "
+                   << "std::vector<std::pair<std::size_t, std::uint64_t>>* next_stateU64_, "
+                   << "std::vector<std::pair<std::size_t, std::vector<std::uint64_t>>>* next_stateVec_);\n";
             }
             std::set<std::string> prevClockNames;
             for (const auto &domainKey : headerSequentialDomains) {
@@ -4608,7 +6165,31 @@ namespace wolvrix::lib::emit
             std::map<std::string, std::vector<std::string>> sequentialRegChunkMethods;
             std::map<std::string, std::vector<std::string>> sequentialGlobalPreChunkMethods;
             std::map<std::string, std::vector<std::string>> sequentialStmtChunkMethods;
-            std::set<std::string> sequentialDomains;
+            std::map<std::string, bool> sequentialChunkHasRegs;
+            std::map<std::string, std::size_t> sequentialRegChunkCounts;
+            std::map<std::string, SequentialStoragePools> sequentialRegDomainPools;
+            auto isDerivedSequentialDomain = [&](const std::string &domainKey) {
+                const auto parsedDomain = parseSequentialDomain(domainKey);
+                if (!parsedDomain) {
+                    return false;
+                }
+                const std::string resolvedClock =
+                    resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                const auto exprIt = state.sequentialClockExprs.find(domainKey);
+                if (exprIt == state.sequentialClockExprs.end()) {
+                    return false;
+                }
+                return exprIt->second != "input_" + resolvedClock + "_";
+            };
+            auto sequentialDomainLess = [&](const std::string &lhs, const std::string &rhs) {
+                const bool lhsDerived = isDerivedSequentialDomain(lhs);
+                const bool rhsDerived = isDerivedSequentialDomain(rhs);
+                if (lhsDerived != rhsDerived) {
+                    return !lhsDerived && rhsDerived;
+                }
+                return lhs < rhs;
+            };
+            std::set<std::string, decltype(sequentialDomainLess)> sequentialDomains(sequentialDomainLess);
             for (const auto &domain : state.sequentialGlobalPreStmts) {
                 sequentialDomains.insert(domain.first);
             }
@@ -4619,6 +6200,25 @@ namespace wolvrix::lib::emit
                 sequentialDomains.insert(domain.first);
             }
             for (const auto &chunk : sequentialChunks) {
+                sequentialChunkHasRegs[chunk.methodName] = !chunk.regNames.empty();
+                if (!chunk.regNames.empty()) {
+                    ++sequentialRegChunkCounts[chunk.domainKey];
+                    auto &pools = sequentialRegDomainPools[chunk.domainKey];
+                    for (const auto &regName : chunk.regNames) {
+                        const std::string expr = state.persistentStorageExpr(regName);
+                        if (expr.rfind("state_->stateU8[", 0) == 0) {
+                            ++pools.stateU8;
+                        } else if (expr.rfind("state_->stateU16[", 0) == 0) {
+                            ++pools.stateU16;
+                        } else if (expr.rfind("state_->stateU32[", 0) == 0) {
+                            ++pools.stateU32;
+                        } else if (expr.rfind("state_->stateU64[", 0) == 0) {
+                            ++pools.stateU64;
+                        } else if (expr.rfind("state_->stateVec[", 0) == 0) {
+                            ++pools.stateVec;
+                        }
+                    }
+                }
                 if (chunk.globalPreReg) {
                     sequentialGlobalPreChunkMethods[chunk.domainKey].push_back(chunk.methodName);
                 } else if (chunk.preReg) {
@@ -4653,6 +6253,37 @@ namespace wolvrix::lib::emit
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "#include <set>\n\n";
+            if (state.enableSharding && state.enableActivityWatermark &&
+                (!state.changedFanoutRanges.empty() || !state.shardActivationRanges.empty())) {
+                os << "namespace {\n";
+                os << "struct WolvrixGsimShardActivationMask { std::uint32_t word; std::uint64_t mask; };\n";
+                os << "struct WolvrixGsimShardActivationRange { std::uint32_t offset; std::uint32_t count; };\n";
+                if (!state.changedFanoutRanges.empty()) {
+                    os << "constexpr WolvrixGsimShardActivationMask kChangedFanoutMasks[] = {\n";
+                    for (const auto& [word, mask] : state.changedFanoutMasks) {
+                        os << "    {" << word << "U, UINT64_C(" << mask << ")},\n";
+                    }
+                    os << "};\n";
+                    os << "constexpr WolvrixGsimShardActivationRange kChangedFanoutRanges[] = {\n";
+                    for (const auto& [offset, count] : state.changedFanoutRanges) {
+                        os << "    {" << offset << "U, " << count << "U},\n";
+                    }
+                    os << "};\n";
+                }
+                if (!state.shardActivationRanges.empty()) {
+                    os << "constexpr WolvrixGsimShardActivationMask kShardActivationMasks[] = {\n";
+                    for (const auto& [word, mask] : state.shardActivationMasks) {
+                        os << "    {" << word << "U, UINT64_C(" << mask << ")},\n";
+                    }
+                    os << "};\n";
+                    os << "constexpr WolvrixGsimShardActivationRange kShardActivationRanges[] = {\n";
+                    for (const auto& [offset, count] : state.shardActivationRanges) {
+                        os << "    {" << offset << "U, " << count << "U},\n";
+                    }
+                    os << "};\n";
+                }
+                os << "} // namespace\n\n";
+            }
             auto emitPoolCtor = [&](std::string_view ctorName,
                                     std::size_t u8Count,
                                     std::size_t u16Count,
@@ -4789,25 +6420,24 @@ namespace wolvrix::lib::emit
                     os << "        case " << i << "U: { sched_" << i << "();";
                     const auto& succ = (i < static_cast<int>(state.shardSuccessors.size())) ? state.shardSuccessors[static_cast<std::size_t>(i)] : std::set<int>{};
                     if (!succ.empty()) {
-                        std::map<int, std::uint64_t> successorWordMasks;
+                        std::uint64_t localSuccessorMask = 0;
+                        std::map<int, std::uint64_t> crossWordMasks;
                         for (int successor : succ) {
                             if (successor < 0) {
                                 continue;
                             }
                             const int word = successor / 64;
                             const int bit = successor % 64;
-                            successorWordMasks[word] |= (std::uint64_t{1} << bit);
-                        }
-                        for (const auto& [word, mask] : successorWordMasks) {
-                            os << " const std::uint64_t kShardSuccessorMask" << i << "_" << word
-                               << " = UINT64_C(" << mask << ");";
                             if (word == activeWord) {
-                                os << " active_bits_ |= kShardSuccessorMask" << i << "_" << word << ";";
+                                localSuccessorMask |= (std::uint64_t{1} << bit);
                             } else {
-                                os << " activate_shard_mask(" << word << "U, kShardSuccessorMask"
-                                   << i << "_" << word << ");";
+                                crossWordMasks[word] |= (std::uint64_t{1} << bit);
                             }
                         }
+                        if (localSuccessorMask != 0U) {
+                            os << " active_bits_ |= UINT64_C(" << localSuccessorMask << ");";
+                        }
+                        os << buildShardActivation(state, crossWordMasks);
                     }
                     os << " break; }\n";
                 }
@@ -4817,7 +6447,6 @@ namespace wolvrix::lib::emit
                 os << "        if (local_bits_ != UINT64_C(0)) {\n";
                 os << "            active_bits_ |= local_bits_;\n";
                 os << "            active_shard_words_[" << activeWord << "U] = UINT64_C(0);\n";
-                os << "            active_word_queued_[" << activeWord << "U] = 0;\n";
                 os << "        }\n";
                 os << "    }\n";
                 os << "}\n\n";
@@ -4855,6 +6484,16 @@ namespace wolvrix::lib::emit
                 os << "    active_shard_words_[word] = new_bits_;\n";
                 os << "    if (active_word_queued_[word] == 0) { active_word_queued_[word] = 1; active_word_queue_.push_back(word); }\n";
                 os << "}\n\n";
+                if (!state.shardActivationRanges.empty()) {
+                    os << "void SSimTop::activate_shard_mask_range(std::uint32_t rangeId) {\n";
+                    os << "    if (rangeId >= (sizeof(kShardActivationRanges) / sizeof(kShardActivationRanges[0]))) { return; }\n";
+                    os << "    const auto range = kShardActivationRanges[rangeId];\n";
+                    os << "    for (std::uint32_t i = 0; i < range.count; ++i) {\n";
+                    os << "        const auto entry = kShardActivationMasks[range.offset + i];\n";
+                    os << "        activate_shard_mask(entry.word, entry.mask);\n";
+                    os << "    }\n";
+                    os << "}\n\n";
+                }
                 os << "void SSimTop::activate_shard_range(std::uint32_t firstShard) {\n";
                 os << "    if (firstShard >= " << state.shardCount() << "U) { return; }\n";
                 os << "    const std::uint32_t first_word_ = firstShard / 64U;\n";
@@ -4871,6 +6510,16 @@ namespace wolvrix::lib::emit
                 os << "        activate_shard_mask(word, range_mask_);\n";
                 os << "    }\n";
                 os << "}\n\n";
+                if (!state.changedFanoutRanges.empty()) {
+                    os << "void SSimTop::activate_changed_fanout(std::uint32_t fanout) {\n";
+                    os << "    if (fanout >= (sizeof(kChangedFanoutRanges) / sizeof(kChangedFanoutRanges[0]))) { return; }\n";
+                    os << "    const auto range = kChangedFanoutRanges[fanout];\n";
+                    os << "    for (std::uint32_t i = 0; i < range.count; ++i) {\n";
+                    os << "        const auto entry = kChangedFanoutMasks[range.offset + i];\n";
+                    os << "        activate_shard_mask(entry.word, entry.mask);\n";
+                    os << "    }\n";
+                    os << "}\n\n";
+                }
                 const int activeWordCount = (state.shardCount() + 63) / 64;
                 for (int activeWord = 0; activeWord < activeWordCount; ++activeWord) {
                     emitActiveShardWordDispatch(activeWord);
@@ -4925,7 +6574,6 @@ namespace wolvrix::lib::emit
                     os << "    while (active_cursor_ < active_word_queue_.size()) {\n";
                     os << "        const std::uint32_t active_word_ = active_word_queue_[active_cursor_++];\n";
                     os << "        if (active_word_ >= active_shard_words_.size()) { continue; }\n";
-                    os << "        active_word_queued_[active_word_] = 0;\n";
                     os << "        std::uint64_t active_bits_ = active_shard_words_[active_word_];\n";
                     os << "        active_shard_words_[active_word_] = UINT64_C(0);\n";
                     os << "        switch (active_word_) {\n";
@@ -4935,6 +6583,7 @@ namespace wolvrix::lib::emit
                     }
                     os << "        default: break;\n";
                     os << "        }\n";
+                    os << "        active_word_queued_[active_word_] = 0;\n";
                     os << "    }\n";
                     os << "    active_word_queue_.clear();\n";
                     os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
@@ -5092,6 +6741,44 @@ namespace wolvrix::lib::emit
                 }
                 return expr;
             };
+            auto commitStepEdgeExpr = [&](const std::string &domainKey) {
+                const auto parsedDomain = parseSequentialDomain(domainKey);
+                const std::string edge = parsedDomain->first;
+                std::string currClockExpr;
+                auto exprIt = state.sequentialClockExprs.find(domainKey);
+                if (exprIt != state.sequentialClockExprs.end()) {
+                    currClockExpr = exprIt->second;
+                } else {
+                    const std::string resolvedClock =
+                        resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
+                    currClockExpr = "input_" + resolvedClock + "_";
+                }
+                const bool clockNeedsPreEdgeReplay = exprIt != state.sequentialClockExprs.end();
+                const std::string prevClockState = prevClockStateNameForDomain(domainKey);
+                const std::string prevClock = "prev_" + prevClockState + "_";
+                currClockExpr = commitStepClockExpr(std::move(currClockExpr));
+                const std::string edgeExpr = edge == "posedge"
+                                                 ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
+                                                 : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
+                return std::pair<std::string, bool>{edgeExpr, clockNeedsPreEdgeReplay};
+            };
+            auto emitReplayOnlyEdgeBatch = [&](const std::vector<std::string> &edgeExprs) {
+                if (edgeExprs.empty()) {
+                    return;
+                }
+                os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                os << "        bool edge_replay_pending_ = false;\n";
+                for (const auto &edgeExpr : edgeExprs) {
+                    os << "        edge_replay_pending_ = edge_replay_pending_ || (" << edgeExpr << ");\n";
+                }
+                os << "        if (edge_replay_pending_) {\n";
+                if (!state.latchStmts.empty()) {
+                    os << "            settle();\n";
+                }
+                emitPendingReplay("            ", false, true, true);
+                os << "        }\n";
+                os << "    }\n";
+            };
             if (!sequentialDomains.empty()) {
                 std::vector<std::pair<std::string, std::string>> domainClockExprs;
                 domainClockExprs.reserve(sequentialDomains.size());
@@ -5122,6 +6809,10 @@ namespace wolvrix::lib::emit
                 if (!domainMetadataOk) {
                     os << "    throw std::runtime_error(\"GSIM emitted runtime encountered unsupported clock-domain metadata\");\n";
                 } else {
+                    if (state.enableSharding && state.shardCount() > 0) {
+                        os << "    // Direct clock domains commit before derived-clock domains so a same-step\n";
+                        os << "    // register update can replay and expose a derived clock edge deterministically.\n";
+                    }
                     os << "    if (reset_) {\n";
                     if (!state.outputPorts.empty()) {
                         os << "        settle();\n";
@@ -5232,32 +6923,30 @@ namespace wolvrix::lib::emit
                         os << "        bool domain_pre_committed_ = false;\n";
                         os << "        bool domain_pre_dirty_ = false;\n";
                         for (const auto &methodName : globalPreIt->second) {
-                            os << "        " << methodName << "(domain_pre_committed_, domain_pre_dirty_);\n";
+                            os << "        " << methodName << "(domain_pre_committed_, domain_pre_dirty_, nullptr, nullptr, nullptr, nullptr, nullptr);\n";
                         }
                         os << "        if (domain_pre_committed_) {\n";
                         os << "            committed_ = true;\n";
                         os << "        }\n";
                         os << "    }\n";
                     }
+                    std::vector<std::string> replayOnlyRegEdgeBatch;
+                    auto flushReplayOnlyRegEdgeBatch = [&]() {
+                        emitReplayOnlyEdgeBatch(replayOnlyRegEdgeBatch);
+                        replayOnlyRegEdgeBatch.clear();
+                    };
                     for (const auto &domainKey : sequentialDomains) {
-                        const auto parsedDomain = parseSequentialDomain(domainKey);
-                        const std::string edge = parsedDomain->first;
-                        std::string currClockExpr;
-                        auto exprIt = state.sequentialClockExprs.find(domainKey);
-                        if (exprIt != state.sequentialClockExprs.end()) {
-                            currClockExpr = exprIt->second;
-                        } else {
-                            const std::string resolvedClock =
-                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                            currClockExpr = "input_" + resolvedClock + "_";
+                        const auto [edgeExpr, clockNeedsPreEdgeReplay] = commitStepEdgeExpr(domainKey);
+                        const auto regChunkIt = sequentialRegChunkMethods.find(domainKey);
+                        const bool hasRegBody = regChunkIt != sequentialRegChunkMethods.end();
+                        const bool canBatchReplayOnlyEdge =
+                            state.enableSharding && state.shardCount() > 0 && !hasRegBody &&
+                            !clockNeedsPreEdgeReplay;
+                        if (canBatchReplayOnlyEdge) {
+                            replayOnlyRegEdgeBatch.push_back(edgeExpr);
+                            continue;
                         }
-                        const bool clockNeedsPreEdgeReplay = exprIt != state.sequentialClockExprs.end();
-                        const std::string prevClockState = prevClockStateNameForDomain(domainKey);
-                        const std::string prevClock = "prev_" + prevClockState + "_";
-                        currClockExpr = commitStepClockExpr(std::move(currClockExpr));
-                        const std::string edgeExpr = edge == "posedge"
-                                                         ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
-                                                         : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
+                        flushReplayOnlyRegEdgeBatch();
                         if (state.enableSharding && state.shardCount() > 0 && clockNeedsPreEdgeReplay) {
                             os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
                             if (!state.latchStmts.empty()) {
@@ -5279,11 +6968,73 @@ namespace wolvrix::lib::emit
                             }
                             os << "        }\n";
                         }
-                        if (auto regChunkIt = sequentialRegChunkMethods.find(domainKey); regChunkIt != sequentialRegChunkMethods.end()) {
+                        if (regChunkIt != sequentialRegChunkMethods.end()) {
                             os << "        bool domain_reg_committed_ = false;\n";
                             os << "        bool domain_reg_dirty_ = false;\n";
-                            for (const auto &methodName : regChunkIt->second) {
-                                os << "        " << methodName << "(domain_reg_committed_, domain_reg_dirty_);\n";
+                            const bool domainNeedsNextState = sequentialRegChunkCounts[domainKey] > 1;
+                            std::string domainNextArgs = "nullptr, nullptr, nullptr, nullptr, nullptr";
+                            if (domainNeedsNextState) {
+                                const auto poolsIt = sequentialRegDomainPools.find(domainKey);
+                                const SequentialStoragePools pools =
+                                    poolsIt != sequentialRegDomainPools.end() ? poolsIt->second
+                                                                              : SequentialStoragePools{};
+                                std::vector<std::string> args;
+                                std::string commitLine = "        if (domain_reg_committed_) {";
+                                if (pools.stateU8) {
+                                    os << "        std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_;\n";
+                                    os << "        domain_next_stateU8_.reserve(" << pools.stateU8 << ");\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU8_) { state_->stateU8[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU8_");
+                                } else {
+                                    args.push_back("nullptr");
+                                }
+                                if (pools.stateU16) {
+                                    os << "        std::vector<std::pair<std::size_t, std::uint16_t>> domain_next_stateU16_;\n";
+                                    os << "        domain_next_stateU16_.reserve(" << pools.stateU16 << ");\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU16_) { state_->stateU16[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU16_");
+                                } else {
+                                    args.push_back("nullptr");
+                                }
+                                if (pools.stateU32) {
+                                    os << "        std::vector<std::pair<std::size_t, std::uint32_t>> domain_next_stateU32_;\n";
+                                    os << "        domain_next_stateU32_.reserve(" << pools.stateU32 << ");\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU32_) { state_->stateU32[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU32_");
+                                } else {
+                                    args.push_back("nullptr");
+                                }
+                                if (pools.stateU64) {
+                                    os << "        std::vector<std::pair<std::size_t, std::uint64_t>> domain_next_stateU64_;\n";
+                                    os << "        domain_next_stateU64_.reserve(" << pools.stateU64 << ");\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU64_) { state_->stateU64[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU64_");
+                                } else {
+                                    args.push_back("nullptr");
+                                }
+                                if (pools.stateVec) {
+                                    os << "        std::vector<std::pair<std::size_t, std::vector<std::uint64_t>>> domain_next_stateVec_;\n";
+                                    os << "        domain_next_stateVec_.reserve(" << pools.stateVec << ");\n";
+                                    commitLine += " for (auto& write_ : domain_next_stateVec_) { state_->stateVec[write_.first] = std::move(write_.second); }";
+                                    args.push_back("&domain_next_stateVec_");
+                                } else {
+                                    args.push_back("nullptr");
+                                }
+                                domainNextArgs = args[0] + ", " + args[1] + ", " + args[2] + ", " + args[3] + ", " + args[4];
+                                commitLine += " }";
+                                for (const auto &methodName : regChunkIt->second) {
+                                    const bool methodHasRegs = sequentialChunkHasRegs[methodName];
+                                    if (methodHasRegs) {
+                                        os << "        " << methodName << "(domain_reg_committed_, domain_reg_dirty_, " << domainNextArgs << ");\n";
+                                    } else {
+                                        os << "        " << methodName << "(domain_reg_committed_, domain_reg_dirty_, nullptr, nullptr, nullptr, nullptr, nullptr);\n";
+                                    }
+                                }
+                                os << commitLine << "\n";
+                            } else {
+                                for (const auto &methodName : regChunkIt->second) {
+                                    os << "        " << methodName << "(domain_reg_committed_, domain_reg_dirty_, nullptr, nullptr, nullptr, nullptr, nullptr);\n";
+                                }
                             }
                             os << "        if (domain_reg_committed_) {\n";
                             os << "            committed_ = true;\n";
@@ -5296,6 +7047,7 @@ namespace wolvrix::lib::emit
                         }
                         os << "    }\n";
                     }
+                    flushReplayOnlyRegEdgeBatch();
                     os << "    if (any_domain_reg_committed_) {\n";
                     if (state.emitsNoDiffGuardedDpicCalls && !state.emitsRuntimeDpicCalls) {
                         os << "#ifndef CONFIG_NO_DIFFTEST\n";
@@ -5333,24 +7085,23 @@ namespace wolvrix::lib::emit
                         os << "#endif\n";
                     }
                     os << "    }\n";
+                    std::vector<std::string> replayOnlyStmtEdgeBatch;
+                    auto flushReplayOnlyStmtEdgeBatch = [&]() {
+                        emitReplayOnlyEdgeBatch(replayOnlyStmtEdgeBatch);
+                        replayOnlyStmtEdgeBatch.clear();
+                    };
                     for (const auto &domainKey : sequentialDomains) {
-                        const auto parsedDomain = parseSequentialDomain(domainKey);
-                        const std::string edge = parsedDomain->first;
-                        std::string currClockExpr;
-                        auto exprIt = state.sequentialClockExprs.find(domainKey);
-                        if (exprIt != state.sequentialClockExprs.end()) {
-                            currClockExpr = exprIt->second;
-                        } else {
-                            const std::string resolvedClock =
-                                resolveSequentialClockStateName(parsedDomain->second, state.inputPorts);
-                            currClockExpr = "input_" + resolvedClock + "_";
+                        const auto [edgeExpr, clockNeedsPreEdgeReplay] = commitStepEdgeExpr(domainKey);
+                        (void)clockNeedsPreEdgeReplay;
+                        const auto stmtChunkIt = sequentialStmtChunkMethods.find(domainKey);
+                        const auto stmtIt = state.sequentialStmts.find(domainKey);
+                        const bool hasStmtBody =
+                            stmtChunkIt != sequentialStmtChunkMethods.end() || stmtIt != state.sequentialStmts.end();
+                        if (state.enableSharding && state.shardCount() > 0 && !hasStmtBody) {
+                            replayOnlyStmtEdgeBatch.push_back(edgeExpr);
+                            continue;
                         }
-                        const std::string prevClockState = prevClockStateNameForDomain(domainKey);
-                        const std::string prevClock = "prev_" + prevClockState + "_";
-                        currClockExpr = commitStepClockExpr(std::move(currClockExpr));
-                        const std::string edgeExpr = edge == "posedge"
-                                                         ? "(!" + prevClock + " && static_cast<bool>(" + currClockExpr + "))"
-                                                         : "(" + prevClock + " && !static_cast<bool>(" + currClockExpr + "))";
+                        flushReplayOnlyStmtEdgeBatch();
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0) {
                             os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
@@ -5362,11 +7113,11 @@ namespace wolvrix::lib::emit
                             }
                             os << "        }\n";
                         }
-                        if (auto stmtChunkIt = sequentialStmtChunkMethods.find(domainKey); stmtChunkIt != sequentialStmtChunkMethods.end()) {
+                        if (stmtChunkIt != sequentialStmtChunkMethods.end()) {
                             os << "        bool domain_stmt_committed_ = false;\n";
                             os << "        bool domain_stmt_dirty_ = false;\n";
                             for (const auto &methodName : stmtChunkIt->second) {
-                                os << "        " << methodName << "(domain_stmt_committed_, domain_stmt_dirty_);\n";
+                                os << "        " << methodName << "(domain_stmt_committed_, domain_stmt_dirty_, nullptr, nullptr, nullptr, nullptr, nullptr);\n";
                             }
                             os << "        if (domain_stmt_committed_) {\n";
                             os << "            committed_ = true;\n";
@@ -5377,7 +7128,7 @@ namespace wolvrix::lib::emit
                                 os << "            dirty_replayed_ = false;\n";
                                 os << "        }\n";
                             }
-                        } else if (auto stmtIt = state.sequentialStmts.find(domainKey); stmtIt != state.sequentialStmts.end()) {
+                        } else if (stmtIt != state.sequentialStmts.end()) {
                             const auto dirtyIt = state.sequentialStmtDirtyOnCommit.find(domainKey);
                             const std::vector<bool>* dirtyOnCommit =
                                 dirtyIt != state.sequentialStmtDirtyOnCommit.end() ? &dirtyIt->second : nullptr;
@@ -5414,6 +7165,7 @@ namespace wolvrix::lib::emit
                         }
                         os << "    }\n";
                     }
+                    flushReplayOnlyStmtEdgeBatch();
                     {
                         std::set<std::string> postDomainClockAssignments;
                         for (const auto &domainState : domainClockExprs) {
@@ -5656,7 +7408,8 @@ namespace wolvrix::lib::emit
         void writeSequentialChunkSource(std::ostream &os,
                                         const CodegenState& state,
                                         const SequentialChunkPlan& chunk,
-                                        std::string_view internalHeaderFilename)
+                                        std::string_view internalHeaderFilename,
+                                        bool writeRegsToDomainNextState)
         {
             os << "#include \"" << internalHeaderFilename << "\"\n";
             if (state.emitsDpicCalls) {
@@ -5667,7 +7420,20 @@ namespace wolvrix::lib::emit
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "\n";
-            os << "void SSimTop::" << chunk.methodName << "(bool& committed_, bool& dirty_on_commit_) {\n";
+            os << "void SSimTop::" << chunk.methodName
+               << "(bool& committed_, bool& dirty_on_commit_, "
+               << "std::vector<std::pair<std::size_t, std::uint8_t>>* next_stateU8_, "
+               << "std::vector<std::pair<std::size_t, std::uint16_t>>* next_stateU16_, "
+               << "std::vector<std::pair<std::size_t, std::uint32_t>>* next_stateU32_, "
+               << "std::vector<std::pair<std::size_t, std::uint64_t>>* next_stateU64_, "
+               << "std::vector<std::pair<std::size_t, std::vector<std::uint64_t>>>* next_stateVec_) {\n";
+            if (!writeRegsToDomainNextState) {
+                os << "    (void)next_stateU8_;\n";
+                os << "    (void)next_stateU16_;\n";
+                os << "    (void)next_stateU32_;\n";
+                os << "    (void)next_stateU64_;\n";
+                os << "    (void)next_stateVec_;\n";
+            }
             const bool tracksStatementDirty =
                 !chunk.stmts.empty() && chunk.stmtDirtyOnCommit.size() == chunk.stmts.size();
             if (!tracksStatementDirty) {
@@ -5679,13 +7445,50 @@ namespace wolvrix::lib::emit
             if (!chunk.regNames.empty()) {
                 os << "    bool chunk_updated_ = false;\n";
             }
+            struct DomainNextTarget {
+                std::string expr;
+                std::string pendingWrites;
+                std::string index;
+            };
+            auto targetStorage = [&](const std::string& regName) {
+                std::string expr = state.persistentStorageExpr(regName);
+                DomainNextTarget target{expr, "", ""};
+                if (writeRegsToDomainNextState) {
+                    if (expr.rfind("state_->stateU8[", 0) == 0) {
+                        target.pendingWrites = "next_stateU8_";
+                        target.index = expr.substr(std::string("state_->stateU8[").size());
+                    } else if (expr.rfind("state_->stateU16[", 0) == 0) {
+                        target.pendingWrites = "next_stateU16_";
+                        target.index = expr.substr(std::string("state_->stateU16[").size());
+                    } else if (expr.rfind("state_->stateU32[", 0) == 0) {
+                        target.pendingWrites = "next_stateU32_";
+                        target.index = expr.substr(std::string("state_->stateU32[").size());
+                    } else if (expr.rfind("state_->stateU64[", 0) == 0) {
+                        target.pendingWrites = "next_stateU64_";
+                        target.index = expr.substr(std::string("state_->stateU64[").size());
+                    } else if (expr.rfind("state_->stateVec[", 0) == 0) {
+                        target.pendingWrites = "next_stateVec_";
+                        target.index = expr.substr(std::string("state_->stateVec[").size());
+                    }
+                    if (!target.index.empty() && target.index.back() == ']') {
+                        target.index.pop_back();
+                    }
+                }
+                return target;
+            };
+            auto domainNextWriteStmt = [&](const std::string& regName, const std::string& valueExpr, bool moveValue) {
+                const DomainNextTarget target = targetStorage(regName);
+                if (target.pendingWrites.empty()) {
+                    return target.expr + " = " + (moveValue ? "std::move(" + valueExpr + ")" : valueExpr);
+                }
+                return target.pendingWrites + "->emplace_back(static_cast<std::size_t>(" + target.index + "), " +
+                       (moveValue ? "std::move(" + valueExpr + ")" : valueExpr) + ")";
+            };
             auto isWideReg = [&](const std::string& regName, const std::vector<std::string>& regStmts) {
                 const auto regWidthIt = state.storageWidths.find(regName);
-                const std::string updateFlag = "next_" + regName + "_updated_";
                 return (regWidthIt != state.storageWidths.end() && regWidthIt->second > 64) ||
                        std::any_of(regStmts.begin(), regStmts.end(), [&](const std::string& stmt) {
-                           return stmt.find(updateFlag) != std::string::npos ||
-                                  stmt.find("wolvrix_gsim_mask_merge") != std::string::npos;
+                           return stmt.find("wolvrix_gsim_mask_merge") != std::string::npos;
                        });
             };
             auto emitActivitySourceTouches = [&](const std::vector<std::string>& sources, std::string_view indent) {
@@ -5710,7 +7513,27 @@ namespace wolvrix::lib::emit
                     os << indent << "activate_all_shards(); ";
                 }
             };
-            auto emitStatement = [&](std::string s, bool dirtyOnCommit = false) {
+            auto activitySourceTouchText = [&](const std::string& source, std::string_view indent = "") {
+                std::ostringstream touch;
+                if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
+                    return touch.str();
+                }
+                std::set<int> firstShards;
+                if (const auto headsIt = state.activitySourceHeadShards.find(source);
+                    headsIt != state.activitySourceHeadShards.end()) {
+                    firstShards.insert(headsIt->second.begin(), headsIt->second.end());
+                } else if (const auto shardIt = state.activitySourceFirstShard.find(source);
+                           shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
+                    firstShards.insert(shardIt->second);
+                }
+                if (!firstShards.empty()) {
+                    emitShardWordMaskActivation(touch, shardWordMasksFor(firstShards), indent, " ");
+                } else {
+                    touch << indent << "activate_all_shards(); ";
+                }
+                return touch.str();
+            };
+            auto emitStatement = [&](std::string s, bool dirtyOnCommit = false, const std::string* touchSource = nullptr) {
                 if (s.rfind("        ", 0) == 0) s.erase(0, 8);
                 if (dirtyOnCommit) {
                     const std::string needle = "committed_ = true;";
@@ -5723,7 +7546,11 @@ namespace wolvrix::lib::emit
                 }
                 if (!chunk.regNames.empty()) {
                     const std::string needle = "committed_ = true;";
-                    const std::string replacement = "chunk_updated_ = true; committed_ = true;";
+                    std::string replacement = "chunk_updated_ = true; ";
+                    if (touchSource != nullptr) {
+                        replacement += activitySourceTouchText(*touchSource);
+                    }
+                    replacement += "committed_ = true;";
                     std::size_t pos = 0;
                     while ((pos = s.find(needle, pos)) != std::string::npos) {
                         s.replace(pos, needle.size(), replacement);
@@ -5752,43 +7579,6 @@ namespace wolvrix::lib::emit
                 std::string condition;
                 std::string rhs;
             };
-            auto splitTopLevelArgs = [](std::string_view text) {
-                auto trim = [](std::string arg) {
-                    const auto first = arg.find_first_not_of(" \\t\\n\\r");
-                    if (first == std::string::npos) {
-                        return std::string{};
-                    }
-                    const auto last = arg.find_last_not_of(" \\t\\n\\r");
-                    return arg.substr(first, last - first + 1);
-                };
-                std::vector<std::string> args;
-                std::size_t start = 0;
-                int depth = 0;
-                for (std::size_t i = 0; i < text.size(); ++i) {
-                    const char ch = text[i];
-                    if (ch == '(' || ch == '[' || ch == '{') {
-                        ++depth;
-                    } else if (ch == ')' || ch == ']' || ch == '}') {
-                        --depth;
-                    } else if (ch == ',' && depth == 0) {
-                        args.push_back(trim(std::string(text.substr(start, i - start))));
-                        start = i + 1;
-                    }
-                }
-                args.push_back(trim(std::string(text.substr(start))));
-                return args;
-            };
-            auto parseMaskMergeArgs = [&](const std::string& rhs) -> std::optional<std::vector<std::string>> {
-                constexpr std::string_view prefix = "wolvrix_gsim_mask_merge(";
-                if (rhs.rfind(prefix, 0) != 0 || rhs.empty() || rhs.back() != ')') {
-                    return std::nullopt;
-                }
-                auto args = splitTopLevelArgs(std::string_view(rhs).substr(prefix.size(), rhs.size() - prefix.size() - 1));
-                if (args.size() != 3) {
-                    return std::nullopt;
-                }
-                return args;
-            };
             auto isSimpleWideLvalue = [](const std::string& rhs) {
                 return rhs.rfind("evalTemps_->tempVec[", 0) == 0 ||
                        rhs.rfind("state_->stateVec[", 0) == 0 ||
@@ -5806,7 +7596,12 @@ namespace wolvrix::lib::emit
                     return std::nullopt;
                 }
                 const auto rhsBegin = markerPos + marker.size();
-                const auto rhsEnd = s.find(";", rhsBegin);
+                const std::string updatedMarker = "; next_" + regName + "_updated_ = true; committed_ = true;";
+                const auto updatedPos = s.find(updatedMarker, rhsBegin);
+                const auto committedPos = s.find("; committed_ = true;", rhsBegin);
+                const auto rhsEnd = updatedPos != std::string::npos
+                                        ? updatedPos
+                                        : (committedPos != std::string::npos ? committedPos : s.find(";", rhsBegin));
                 if (rhsEnd == std::string::npos) {
                     return std::nullopt;
                 }
@@ -5815,28 +7610,56 @@ namespace wolvrix::lib::emit
                 parsed.rhs = s.substr(rhsBegin, rhsEnd - rhsBegin);
                 return parsed;
             };
-            auto canDirectScalarWrite = [&](const std::string& regName, const std::vector<std::string>& regStmts) {
+            auto canDirectSequentialWrite = [&](const std::string& regName, const std::vector<std::string>& regStmts) {
                 if (regStmts.size() != 1) {
                     return false;
                 }
                 const auto parsed = parseSingleNextAssignment(regName, regStmts.front());
-                return parsed.has_value() && parsed->rhs.find("state_->") == std::string::npos;
+                return parsed.has_value() && parsed->condition.find("state_->") == std::string::npos &&
+                       parsed->condition.find("next_" + regName) == std::string::npos &&
+                       parsed->rhs.find("state_->") == std::string::npos &&
+                       parsed->rhs.find("next_" + regName) == std::string::npos;
             };
+            auto canDirectScalarWrite = [&](const std::string& regName, const std::vector<std::string>& regStmts) {
+                return canDirectSequentialWrite(regName, regStmts);
+            };
+            auto wideNeedsPersistentBase = [](const std::vector<std::string>& regStmts) {
+                return std::any_of(regStmts.begin(), regStmts.end(), [](const std::string& stmt) {
+                    return stmt.find("wolvrix_gsim_mask_merge(") != std::string::npos;
+                });
+            };
+            auto canDirectWideWrite = [&](const std::string& regName, const std::vector<std::string>& regStmts) {
+                if (regStmts.size() != 1 || wideNeedsPersistentBase(regStmts)) {
+                    return false;
+                }
+                return canDirectSequentialWrite(regName, regStmts);
+            };
+            constexpr bool kAllowDelayedDirectSequentialStateWrite = true;
+            std::vector<std::pair<std::string, std::string>> delayedDirectWrites;
 
             for (const auto &regName : chunk.regNames) {
                 const auto regStmtIt = chunk.regStmts.find(regName);
                 const std::vector<std::string>& regStmts = regStmtIt != chunk.regStmts.end() ? regStmtIt->second : chunk.stmts;
                 const bool wideReg = isWideReg(regName, regStmts);
-                const bool directWideWrite = wideReg && regStmts.size() == 1 && parseSingleNextAssignment(regName, regStmts.front()).has_value();
-                const bool directScalarWrite = !wideReg && canDirectScalarWrite(regName, regStmts);
+                const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && wideReg &&
+                                             canDirectWideWrite(regName, regStmts);
+                const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && !wideReg &&
+                                               canDirectScalarWrite(regName, regStmts);
                 if (directWideWrite || directScalarWrite) {
                     continue;
                 }
                 if (wideReg) {
-                    os << "    std::vector<std::uint64_t> next_" << regName << ";\n";
+                    os << "    std::vector<std::uint64_t> next_" << regName;
+                    if (wideNeedsPersistentBase(regStmts)) {
+                        os << " = " << state.persistentStorageExpr(regName);
+                    }
+                    os << ";\n";
                     os << "    bool next_" << regName << "_updated_ = false;\n";
                 } else {
                     os << "    auto next_" << regName << " = " << state.persistentStorageExpr(regName) << ";\n";
+                    if (!writeRegsToDomainNextState) {
+                        os << "    bool next_" << regName << "_updated_ = false;\n";
+                    }
                 }
             }
             for (const auto &regName : chunk.regNames) {
@@ -5846,43 +7669,75 @@ namespace wolvrix::lib::emit
                 }
                 const bool wideReg = isWideReg(regName, regStmtIt->second);
                 const auto parsed = regStmtIt->second.size() == 1 ? parseSingleNextAssignment(regName, regStmtIt->second.front()) : std::optional<ParsedNextAssignment>{};
-                const bool directWideWrite = wideReg && parsed.has_value();
-                const bool directScalarWrite = !wideReg && parsed.has_value() && parsed->rhs.find("state_->") == std::string::npos;
+                const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && wideReg &&
+                                             canDirectWideWrite(regName, regStmtIt->second);
+                const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && !wideReg &&
+                                                canDirectScalarWrite(regName, regStmtIt->second);
                 if (directWideWrite) {
-                    const std::string stateExpr = state.persistentStorageExpr(regName);
-                    if (const auto maskMergeArgs = parseMaskMergeArgs(parsed->rhs);
-                        maskMergeArgs && (*maskMergeArgs)[0] == stateExpr) {
-                        os << "    if (" << parsed->condition << ") { if (wolvrix_gsim_mask_merge_in_place("
-                           << stateExpr << ", " << (*maskMergeArgs)[1] << ", " << (*maskMergeArgs)[2]
-                           << ")) { chunk_updated_ = true; committed_ = true; } }\n";
+                    const DomainNextTarget target = targetStorage(regName);
+                    if (!target.pendingWrites.empty()) {
+                        if (isSimpleWideLvalue(parsed->rhs)) {
+                            delayedDirectWrites.emplace_back(
+                                regName,
+                                "if (" + parsed->condition + ") { if (" + target.expr + " != " + parsed->rhs +
+                                ") { " + domainNextWriteStmt(regName, parsed->rhs, false) +
+                                "; committed_ = true; } }");
+                        } else {
+                            const std::string tempName = "delayed_direct_" + regName;
+                            delayedDirectWrites.emplace_back(
+                                regName,
+                                "if (" + parsed->condition + ") { auto " + tempName + " = " + parsed->rhs +
+                                "; if (" + target.expr + " != " + tempName + ") { " +
+                                domainNextWriteStmt(regName, tempName, true) +
+                                "; committed_ = true; } }");
+                        }
                     } else if (isSimpleWideLvalue(parsed->rhs)) {
-                        os << "    if (" << parsed->condition << ") { if (" << stateExpr << " != " << parsed->rhs
-                           << ") { wolvrix_gsim_assign_bits(" << stateExpr << ", " << parsed->rhs << ")"
-                           << "; chunk_updated_ = true; committed_ = true; } }\n";
+                        delayedDirectWrites.emplace_back(
+                            regName,
+                            "if (" + parsed->condition + ") { if (" + target.expr + " != " + parsed->rhs +
+                            ") { wolvrix_gsim_assign_bits(" + target.expr + ", " + parsed->rhs +
+                            "); committed_ = true; } }");
                     } else {
-                        const std::string tempName = "direct_next_" + regName;
-                        os << "    if (" << parsed->condition << ") { auto " << tempName << " = " << parsed->rhs
-                           << "; if (" << stateExpr << " != " << tempName << ") { " << stateExpr
-                           << " = std::move(" << tempName
-                           << "); chunk_updated_ = true; committed_ = true; } }\n";
+                        const std::string tempName = "delayed_direct_" + regName;
+                        delayedDirectWrites.emplace_back(
+                            regName,
+                            "if (" + parsed->condition + ") { auto " + tempName + " = " + parsed->rhs +
+                            "; if (" + target.expr + " != " + tempName + ") { " + target.expr +
+                            " = std::move(" + tempName +
+                            "); committed_ = true; } }");
                     }
                     continue;
                 }
                 if (directScalarWrite) {
-                    const std::string stateExpr = state.persistentStorageExpr(regName);
-                    const std::string tempName = "direct_next_" + regName;
-                    os << "    if (" << parsed->condition << ") { const auto " << tempName << " = " << parsed->rhs
-                       << "; if (" << stateExpr << " != " << tempName << ") { " << stateExpr
-                       << " = " << tempName << "; chunk_updated_ = true; committed_ = true; } }\n";
+                    const DomainNextTarget target = targetStorage(regName);
+                    const std::string tempName = "delayed_direct_" + regName;
+                    delayedDirectWrites.emplace_back(
+                        regName,
+                        "if (" + parsed->condition + ") { const auto " + tempName + " = " + parsed->rhs +
+                        "; if (" + target.expr + " != " + tempName + ") { " +
+                        domainNextWriteStmt(regName, tempName, false) + "; committed_ = true; } }");
                     continue;
                 }
-                for (const auto &stmt : regStmtIt->second) {
-                    emitStatement(stmt);
+                for (auto stmt : regStmtIt->second) {
+                    if (writeRegsToDomainNextState && !wideReg) {
+                        const std::string needle = "next_" + regName + "_updated_ = true; committed_ = true;";
+                        const std::string replacement = domainNextWriteStmt(regName, "next_" + regName, false) +
+                                                        "; committed_ = true;";
+                        std::size_t pos = 0;
+                        while ((pos = stmt.find(needle, pos)) != std::string::npos) {
+                            stmt.replace(pos, needle.size(), replacement);
+                            pos += replacement.size();
+                        }
+                    }
+                    emitStatement(stmt, false, &regName);
                 }
             }
             for (std::size_t stmtIndex = 0; stmtIndex < chunk.stmts.size(); ++stmtIndex) {
                 emitStatement(chunk.stmts[stmtIndex],
                               tracksStatementDirty && chunk.stmtDirtyOnCommit[stmtIndex]);
+            }
+            for (const auto& [regName, stmt] : delayedDirectWrites) {
+                emitStatement(stmt, false, &regName);
             }
             if (tracksStatementDirty && state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                 std::vector<std::string> dirtyActivitySources;
@@ -5912,37 +7767,25 @@ namespace wolvrix::lib::emit
             }
             if (!chunk.regNames.empty()) {
                 os << "    if (chunk_updated_) {\n";
-                if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                    std::set<int> firstShards;
-                    for (const auto &regName : chunk.regNames) {
-                        if (const auto headsIt = state.activitySourceHeadShards.find(regName);
-                            headsIt != state.activitySourceHeadShards.end()) {
-                            firstShards.insert(headsIt->second.begin(), headsIt->second.end());
-                            continue;
-                        }
-                        if (const auto shardIt = state.activitySourceFirstShard.find(regName);
-                            shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
-                            firstShards.insert(shardIt->second);
-                        }
-                    }
-                    if (!firstShards.empty()) {
-                        emitShardWordMaskActivation(os, shardWordMasksFor(firstShards), "        ", "\n");
-                    } else {
-                        os << "        activate_all_shards();\n";
-                    }
-                }
                 for (const auto &regName : chunk.regNames) {
                     const auto regStmtIt = chunk.regStmts.find(regName);
                     const std::vector<std::string>& regStmts = regStmtIt != chunk.regStmts.end() ? regStmtIt->second : chunk.stmts;
                     const bool wideReg = isWideReg(regName, regStmts);
-                    if ((wideReg && regStmts.size() == 1) || (!wideReg && canDirectScalarWrite(regName, regStmts))) {
+                    const bool directWideWrite = kAllowDelayedDirectSequentialStateWrite && wideReg &&
+                                                 canDirectWideWrite(regName, regStmts);
+                    const bool directScalarWrite = kAllowDelayedDirectSequentialStateWrite && !wideReg &&
+                                                   canDirectScalarWrite(regName, regStmts);
+                    if (directWideWrite || directScalarWrite) {
                         continue;
                     }
                     if (wideReg) {
                         os << "        if (next_" << regName << "_updated_) { "
-                           << state.persistentStorageExpr(regName) << " = std::move(next_" << regName << "); }\n";
+                           << domainNextWriteStmt(regName, "next_" + regName, true) << "; }\n";
+                    } else if (writeRegsToDomainNextState) {
+                        continue;
                     } else {
-                        os << "        " << state.persistentStorageExpr(regName) << " = next_" << regName << ";\n";
+                        os << "        if (next_" << regName << "_updated_) { "
+                           << domainNextWriteStmt(regName, "next_" + regName, false) << "; }\n";
                     }
                 }
                 os << "    }\n";
@@ -6082,6 +7925,12 @@ namespace wolvrix::lib::emit
         state.maxShardSize = parsePositiveIntAttr(options, "behavior_shard_max_bytes", state.maxShardSize);
         state.commitShardSize = parsePositiveIntAttr(options, "commit_shard_max_bytes", state.commitShardSize);
         state.enableActivityWatermark = attrEnabled(options, "activity_shard_watermark", false);
+        state.activityBoundaryShardSoftBytes =
+            parseNonNegativeIntAttr(options, "activity_boundary_shard_soft_bytes",
+                                    state.activityBoundaryShardSoftBytes);
+        state.changedValueFanoutInlineMaskLimit =
+            parseNonNegativeIntAttr(options, "changed_value_fanout_inline_mask_limit",
+                                    state.changedValueFanoutInlineMaskLimit);
         state.enableDpicTrace = attrEnabled(options, "dpic_trace", false);
         state.enableXsZeroRetireTrace =
             state.enableDpicTrace && attrEnabled(options, "xs_zero_retire_trace", false);
@@ -6131,6 +7980,59 @@ namespace wolvrix::lib::emit
         }
 
         std::set<std::string> sequentialClockInputs;
+        auto recordSequentialClockInput = [&](std::string_view clockSymbol) {
+            sequentialClockInputs.insert(resolveSequentialClockStateName(clockSymbol, state.inputPorts));
+        };
+        for (const auto& opId : target->graph->operations()) {
+            const auto op = target->graph->getOperation(opId);
+            const auto operands = op.operands();
+            switch (op.kind()) {
+                case wolvrix::lib::grh::OperationKind::kMemoryWritePort: {
+                    if (operands.size() < 5) {
+                        break;
+                    }
+                    const auto eventValue = target->graph->getValue(operands[4]);
+                    recordSequentialClockInput(eventValue.symbolText().empty()
+                                                   ? std::string_view("clock")
+                                                   : eventValue.symbolText());
+                    break;
+                }
+                case wolvrix::lib::grh::OperationKind::kRegisterWritePort: {
+                    std::string clockSymbol = "clock";
+                    if (operands.size() > 3) {
+                        const auto eventValue = target->graph->getValue(operands[3]);
+                        if (!eventValue.symbolText().empty()) {
+                            clockSymbol = std::string(eventValue.symbolText());
+                        }
+                    }
+                    if (auto clockSymAttr = op.attr("clockSymbol")) {
+                        if (auto *sym = std::get_if<std::string>(&*clockSymAttr); sym != nullptr && !sym->empty()) {
+                            clockSymbol = *sym;
+                        }
+                    }
+                    recordSequentialClockInput(clockSymbol);
+                    break;
+                }
+                case wolvrix::lib::grh::OperationKind::kDpicCall: {
+                    auto eventEdgeAttr = op.attr("eventEdge");
+                    const auto *eventEdges =
+                        eventEdgeAttr ? std::get_if<std::vector<std::string>>(&*eventEdgeAttr) : nullptr;
+                    const std::size_t eventCount =
+                        eventEdges != nullptr && !eventEdges->empty() ? eventEdges->size() : 1U;
+                    if (operands.size() < 1U + eventCount) {
+                        break;
+                    }
+                    const std::size_t eventStart = operands.size() - eventCount;
+                    const auto eventValue = target->graph->getValue(operands[eventStart]);
+                    recordSequentialClockInput(eventValue.symbolText().empty()
+                                                   ? std::string_view("clock")
+                                                   : eventValue.symbolText());
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
         std::set<std::string> sequentialDomains;
         for (const auto &domain : state.sequentialGlobalPreStmts) {
             sequentialDomains.insert(domain.first);
@@ -6152,7 +8054,7 @@ namespace wolvrix::lib::emit
             sequentialClockInputs.insert(resolveSequentialClockStateName(parsedDomain->second, state.inputPorts));
         }
         for (const auto &port : target->graph->inputPorts()) {
-            const std::uint8_t replayMask = sequentialClockInputs.count(port.name) > 0
+            const std::uint8_t replayMask = sequentialClockInputs.count(sanitizeIdentifier(port.name)) > 0
                 ? kDirtyReplayClock
                 : kDirtyReplayNonClock;
             state.dirtyReplayRootMasks[port.value] = replayMask;
@@ -6175,6 +8077,40 @@ namespace wolvrix::lib::emit
             state.opProducerFirstShardByIndex.assign(opIdByIndex.size(), -1);
             state.opProducerLastShardByIndex.assign(opIdByIndex.size(), -1);
         }
+        if (state.enableSharding && state.enableActivityWatermark &&
+            state.activityBoundaryShardSoftBytes > 0) {
+            state.opActivityOrdinalByIndex.assign(opIdByIndex.size(), -1);
+            state.activityClassBitsByOrdinal.assign(metadata->scheduleActivityOrder.size(), 0);
+            std::unordered_map<std::string, std::uint8_t> classBits;
+            std::uint8_t nextClassBit = 1;
+            for (std::size_t ordinal = 0; ordinal < metadata->scheduleActivityOrder.size(); ++ordinal) {
+                const auto& activityName = metadata->scheduleActivityOrder[ordinal];
+                const auto classIt = metadata->scheduleActivityClasses.find(activityName);
+                const std::string className =
+                    classIt != metadata->scheduleActivityClasses.end() ? classIt->second : std::string();
+                auto bitIt = classBits.find(className);
+                if (bitIt == classBits.end()) {
+                    const std::uint8_t bit = nextClassBit != 0 ? nextClassBit : std::uint8_t{0x80};
+                    bitIt = classBits.emplace(className, bit).first;
+                    if (nextClassBit != 0 && nextClassBit < 0x80U) {
+                        nextClassBit = static_cast<std::uint8_t>(nextClassBit << 1U);
+                    } else {
+                        nextClassBit = 0;
+                    }
+                }
+                state.activityClassBitsByOrdinal[ordinal] = bitIt->second;
+                const auto membersIt = metadata->scheduleActivityMembers.find(activityName);
+                if (membersIt == metadata->scheduleActivityMembers.end()) {
+                    continue;
+                }
+                for (const auto opIndex : membersIt->second) {
+                    if (opIndex >= 0 && static_cast<std::size_t>(opIndex) < state.opActivityOrdinalByIndex.size()) {
+                        state.opActivityOrdinalByIndex[static_cast<std::size_t>(opIndex)] =
+                            static_cast<std::int32_t>(ordinal);
+                    }
+                }
+            }
+        }
 
         // Traverse operations in topo order. Operation indices are dense after graph
         // freeze, so a flat vector avoids millions of unordered_map lookups during
@@ -6190,6 +8126,7 @@ namespace wolvrix::lib::emit
             auto op = target->graph->getOperation(opId);
             lowerOperation(*target->graph, op, *metadata, state, diagnostics());
         }
+        finalizeChangeTrackedFanout(state);
 
         if (state.enableSharding && !state.dirtyReplayProducerOpSeeds.empty()) {
             std::vector<std::int64_t> replayOps;
@@ -6248,6 +8185,7 @@ namespace wolvrix::lib::emit
         }
 
         const auto sequentialChunks = buildSequentialChunkPlans(state);
+        precomputeShardSuccessorActivationRanges(state);
 
         auto header = openOutputFile(headerPath);
         auto internalHeader = openOutputFile(internalHeaderPath);
@@ -6265,6 +8203,13 @@ namespace wolvrix::lib::emit
         std::vector<std::string> manifestEntries;
         manifestEntries.push_back(sourcePath.filename().string());
 
+        std::map<std::string, std::size_t> sequentialRegChunkCounts;
+        for (const auto& chunk : sequentialChunks) {
+            if (!chunk.regNames.empty()) {
+                ++sequentialRegChunkCounts[chunk.domainKey];
+            }
+        }
+
         for (const auto &chunk : sequentialChunks) {
             std::string chunkFileName = baseName + "_" + chunk.methodName + ".cpp";
             std::filesystem::path chunkPath = outputDir / chunkFileName;
@@ -6273,7 +8218,10 @@ namespace wolvrix::lib::emit
                 result.success = false;
                 return result;
             }
-            writeSequentialChunkSource(*chunkFile, state, chunk, internalHeaderPath.filename().string());
+            const bool writeRegsToDomainNextState = !chunk.regNames.empty() &&
+                sequentialRegChunkCounts[chunk.domainKey] > 1;
+            writeSequentialChunkSource(*chunkFile, state, chunk, internalHeaderPath.filename().string(),
+                                       writeRegsToDomainNextState);
             result.artifacts.push_back(chunkPath.string());
             manifestEntries.push_back(chunkFileName);
         }
