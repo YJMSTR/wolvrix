@@ -968,6 +968,81 @@ namespace wolvrix::lib::emit
             text.swap(result);
         }
 
+        struct ParsedLatchStatement
+        {
+            std::string condition;
+            std::string body;
+        };
+
+        std::optional<ParsedLatchStatement> parseGeneratedLatchStatement(std::string_view stmt)
+        {
+            const std::string trimmed = trimCopy(std::string(stmt));
+            constexpr std::string_view prefix = "if (";
+            constexpr std::string_view separator = ") { ";
+            constexpr std::string_view suffix = " }";
+            if (trimmed.rfind(prefix, 0) != 0 ||
+                trimmed.rfind(suffix) != trimmed.size() - suffix.size()) {
+                return std::nullopt;
+            }
+            const std::size_t separatorPos = trimmed.find(separator, prefix.size());
+            if (separatorPos == std::string::npos || separatorPos <= prefix.size()) {
+                return std::nullopt;
+            }
+            const std::size_t bodyBegin = separatorPos + separator.size();
+            ParsedLatchStatement parsed;
+            parsed.condition = trimmed.substr(prefix.size(), separatorPos - prefix.size());
+            parsed.body = trimmed.substr(bodyBegin, trimmed.size() - suffix.size() - bodyBegin);
+            if (parsed.condition.empty() || parsed.body.empty()) {
+                return std::nullopt;
+            }
+            return parsed;
+        }
+
+        void emitCoalescedLatchStatements(std::ostream& os,
+                                          const std::vector<std::string>& latchStmts,
+                                          std::string_view indent)
+        {
+            std::string activeCondition;
+            std::vector<std::string> activeBodies;
+            auto flush = [&]() {
+                if (activeBodies.empty()) {
+                    return;
+                }
+                if (activeBodies.size() == 1U) {
+                    os << indent << "if (" << activeCondition << ") { " << activeBodies.front() << " }\n";
+                } else {
+                    os << indent << "if (" << activeCondition << ") {\n";
+                    for (const auto& body : activeBodies) {
+                        os << indent << "    " << body << "\n";
+                    }
+                    os << indent << "}\n";
+                }
+                activeCondition.clear();
+                activeBodies.clear();
+            };
+
+            for (const auto& stmt : latchStmts) {
+                std::string body = stmt;
+                if (body.rfind("        ", 0) == 0) {
+                    body.erase(0, 8);
+                }
+                const auto parsed = parseGeneratedLatchStatement(body);
+                if (!parsed) {
+                    flush();
+                    os << indent << trimCopy(std::move(body)) << "\n";
+                    continue;
+                }
+                if (activeBodies.empty()) {
+                    activeCondition = parsed->condition;
+                } else if (parsed->condition != activeCondition) {
+                    flush();
+                    activeCondition = parsed->condition;
+                }
+                activeBodies.push_back(parsed->body);
+            }
+            flush();
+        }
+
         struct ChangedStateSpanLine
         {
             std::string hitVar;
@@ -6767,11 +6842,7 @@ namespace wolvrix::lib::emit
             }
             if (!state.latchStmts.empty()) {
                 os << "    if (!reset_) {\n";
-                for (const auto &stmt : state.latchStmts) {
-                    std::string s = stmt;
-                    if (s.rfind("        ", 0) == 0) s.erase(0, 8);
-                    os << "        " << s << "\n";
-                }
+                emitCoalescedLatchStatements(os, state.latchStmts, "        ");
                 os << "    }\n";
             }
             if (!state.outputPorts.empty()) {

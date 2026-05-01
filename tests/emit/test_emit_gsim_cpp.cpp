@@ -1349,6 +1349,41 @@ Design buildLatchWriteDesign()
     return design;
 }
 
+Design buildCoalescedLatchWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto en = makeValue(graph, "en", 1, false);
+    const auto d0 = makeValue(graph, "d0", 4, false);
+    const auto d1 = makeValue(graph, "d1", 4, false);
+    graph.bindInputPort("en", en);
+    graph.bindInputPort("d0", d0);
+    graph.bindInputPort("d1", d1);
+
+    (void)makeLatch(graph, "state_latch0_decl", 4, "state_latch0");
+    (void)makeLatch(graph, "state_latch1_decl", 4, "state_latch1");
+    const auto latchRead0 = makeLatchRead(graph, "state_latch0_q", "state_latch0_read", 4, "state_latch0");
+    const auto latchRead1 = makeLatchRead(graph, "state_latch1_q", "state_latch1_read", 4, "state_latch1");
+    graph.bindOutputPort("y0", latchRead0);
+    graph.bindOutputPort("y1", latchRead1);
+
+    const auto mask = makeConstant(graph, "mask", "mask_const", 4, "4'hF");
+    const auto latchWrite0 = graph.createOperation(OperationKind::kLatchWritePort, graph.internSymbol("state_latch0_write"));
+    graph.addOperand(latchWrite0, en);
+    graph.addOperand(latchWrite0, d0);
+    graph.addOperand(latchWrite0, mask);
+    graph.setAttr(latchWrite0, "latchSymbol", std::string("state_latch0"));
+    const auto latchWrite1 = graph.createOperation(OperationKind::kLatchWritePort, graph.internSymbol("state_latch1_write"));
+    graph.addOperand(latchWrite1, en);
+    graph.addOperand(latchWrite1, d1);
+    graph.addOperand(latchWrite1, mask);
+    graph.setAttr(latchWrite1, "latchSymbol", std::string("state_latch1"));
+
+    return design;
+}
+
 Design buildWideLatchWriteDesign()
 {
     Design design;
@@ -5747,6 +5782,58 @@ int main() {
     compileAndRunHarness(dir, "latch_write_top", runner);
 }
 
+void testCoalescedLatchWritesCompileAndRun()
+{
+    Design design = buildCoalescedLatchWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "coalesced_latch_write_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("coalesced_latch_write_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp coalesced latch-write fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp coalesced latch-write fixture should not emit errors");
+
+    const std::string source = readFile(dir / "coalesced_latch_write_top.cpp");
+    expect(countOccurrences(source, "if (input_en_)") == 1,
+           "latch writes sharing a condition should emit one grouped condition");
+    expect(contains(source, "if (input_en_) {\n"),
+           "grouped latch writes should use a braced condition block");
+
+    const std::string runner = R"CPP(
+#include "coalesced_latch_write_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_reset(0);
+    sim.set_en(1);
+    sim.set_d0(0x3);
+    sim.set_d1(0xA);
+    sim.step();
+    if (sim.get_y0() != 0x3 || sim.get_y1() != 0xA) {
+        return 1;
+    }
+    sim.set_en(0);
+    sim.set_d0(0x5);
+    sim.set_d1(0x6);
+    sim.step();
+    if (sim.get_y0() != 0x3 || sim.get_y1() != 0xA) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "coalesced_latch_write_top", runner);
+}
+
 void testWideLatchWriteCompileAndRun()
 {
     Design design = buildWideLatchWriteDesign();
@@ -9231,6 +9318,10 @@ int main()
                 testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce();
                 return 0;
             }
+            if (name == "coalesced-latch-writes") {
+                testCoalescedLatchWritesCompileAndRun();
+                return 0;
+            }
             if (name == "eq") {
                 testEqCompileAndRun();
                 return 0;
@@ -9289,6 +9380,7 @@ int main()
         testDpicUsesGlobalPreEdgeSnapshotAcrossDomains();
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
+        testCoalescedLatchWritesCompileAndRun();
         testMemoryReadCompileAndRun();
         testMemoryWriteCompileAndRun();
         testMemoryZeroMaskWriteCompileAndRun();
