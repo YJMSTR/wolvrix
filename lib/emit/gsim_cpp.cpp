@@ -6523,7 +6523,7 @@ namespace wolvrix::lib::emit
                 os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()) { reset(); }\n";
             }
             os << "SSimTop::~SSimTop() { delete evalTemps_; delete state_; }\n\n";
-            auto emitDomainNextScalarHelpers = [&](std::string_view suffix, std::string_view typeName, std::string_view statePool) {
+            auto emitDomainNextScalarHelpers = [&](std::string_view suffix, std::string_view statePool) {
                 os << "void SSimTop::prepare_domain_next_state" << suffix << "(std::size_t capacity) {\n";
                 os << "    domain_next_state" << suffix << "_scratch_.clear();\n";
                 os << "    if (domain_next_state" << suffix << "_scratch_.capacity() < capacity) {\n";
@@ -6535,19 +6535,18 @@ namespace wolvrix::lib::emit
                 os << "        state_->" << statePool << "[write_.first] = write_.second;\n";
                 os << "    }\n";
                 os << "}\n\n";
-                (void)typeName;
             };
             if (state.stateU8Count > 0) {
-                emitDomainNextScalarHelpers("U8", "std::uint8_t", "stateU8");
+                emitDomainNextScalarHelpers("U8", "stateU8");
             }
             if (state.stateU16Count > 0) {
-                emitDomainNextScalarHelpers("U16", "std::uint16_t", "stateU16");
+                emitDomainNextScalarHelpers("U16", "stateU16");
             }
             if (state.stateU32Count > 0) {
-                emitDomainNextScalarHelpers("U32", "std::uint32_t", "stateU32");
+                emitDomainNextScalarHelpers("U32", "stateU32");
             }
             if (state.stateU64Count > 0) {
-                emitDomainNextScalarHelpers("U64", "std::uint64_t", "stateU64");
+                emitDomainNextScalarHelpers("U64", "stateU64");
             }
             if (!state.stateVecWidths.empty()) {
                 os << "void SSimTop::prepare_domain_next_stateVec(std::size_t capacity) {\n";
