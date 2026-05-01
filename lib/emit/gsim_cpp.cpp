@@ -851,6 +851,69 @@ namespace wolvrix::lib::emit
             }
         }
 
+        void precomputeActivitySourceActivationRange(CodegenState& state,
+                                                     const std::vector<std::string>& sources)
+        {
+            if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
+                return;
+            }
+            std::set<int> firstShards;
+            for (const auto& source : sources) {
+                if (const auto headsIt = state.activitySourceHeadShards.find(source);
+                    headsIt != state.activitySourceHeadShards.end()) {
+                    firstShards.insert(headsIt->second.begin(), headsIt->second.end());
+                    continue;
+                }
+                if (const auto shardIt = state.activitySourceFirstShard.find(source);
+                    shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
+                    firstShards.insert(shardIt->second);
+                }
+            }
+            const auto masks = shardWordMasksFor(firstShards);
+            if (static_cast<int>(masks.size()) > state.shardActivationInlineMaskLimit) {
+                internShardActivationRange(state, masks);
+            }
+        }
+
+        void precomputeSequentialChunkActivityActivationRanges(CodegenState& state,
+                                                              const std::vector<SequentialChunkPlan>& sequentialChunks)
+        {
+            if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
+                return;
+            }
+            for (const auto& chunk : sequentialChunks) {
+                if (!chunk.regNames.empty()) {
+                    precomputeActivitySourceActivationRange(state, chunk.regNames);
+                }
+                const bool tracksStatementDirty =
+                    !chunk.stmts.empty() && chunk.stmtDirtyOnCommit.size() == chunk.stmts.size();
+                if (!tracksStatementDirty) {
+                    continue;
+                }
+                std::vector<std::string> dirtyActivitySources;
+                std::set<std::string> seenSources;
+                bool hasDirtyStatementWithoutSources = false;
+                for (std::size_t stmtIndex = 0; stmtIndex < chunk.stmts.size(); ++stmtIndex) {
+                    if (!chunk.stmtDirtyOnCommit[stmtIndex]) {
+                        continue;
+                    }
+                    if (stmtIndex >= chunk.stmtActivitySources.size() ||
+                        chunk.stmtActivitySources[stmtIndex].empty()) {
+                        hasDirtyStatementWithoutSources = true;
+                        continue;
+                    }
+                    for (const auto& source : chunk.stmtActivitySources[stmtIndex]) {
+                        if (seenSources.insert(source).second) {
+                            dirtyActivitySources.push_back(source);
+                        }
+                    }
+                }
+                if (!hasDirtyStatementWithoutSources) {
+                    precomputeActivitySourceActivationRange(state, dirtyActivitySources);
+                }
+            }
+        }
+
         void removeStaticallyCoveredFanoutMasks(CodegenState& state,
                                                 int shard,
                                                 std::map<int, std::uint64_t>& masks)
@@ -7573,7 +7636,7 @@ namespace wolvrix::lib::emit
                     }
                 }
                 if (!firstShards.empty()) {
-                    emitShardWordMaskActivation(os, shardWordMasksFor(firstShards), indent, " ");
+                    os << indent << buildShardActivation(state, shardWordMasksFor(firstShards)) << " ";
                 } else {
                     os << indent << "activate_all_shards(); ";
                 }
@@ -8224,6 +8287,7 @@ namespace wolvrix::lib::emit
 
         const auto sequentialChunks = buildSequentialChunkPlans(state);
         precomputeShardSuccessorActivationRanges(state);
+        precomputeSequentialChunkActivityActivationRanges(state, sequentialChunks);
 
         auto header = openOutputFile(headerPath);
         auto internalHeader = openOutputFile(internalHeaderPath);

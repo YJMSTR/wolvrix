@@ -2908,7 +2908,7 @@ Design buildMultiChunkDirectEligibleRegisterWriteDesign()
 
     const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
     const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
-    for (int i = 0; i < 4096; ++i)
+    for (int i = 0; i < 256; ++i)
     {
         const std::string regName = "q" + std::to_string(i);
         (void)makeRegister(graph, regName + "_storage", regName + "_reg", 8, regName);
@@ -8382,6 +8382,34 @@ void testMultiChunkDirectEligibleWritesUseDomainNextStaging()
            "direct-eligible multi-chunk writes should append to domain next-state rather than persistent state");
     expect(!contains(generatedSources, "auto next_reg_q0 = state_->stateU8["),
            "domain-next staged direct writes should avoid per-register next locals on the hot multi-chunk path");
+
+    const std::string runner = R"CPP(
+#include "multi_chunk_direct_top.hpp"
+#include <cstdint>
+
+static void tick(SSimTop& sim, std::uint8_t d) {
+    sim.set_d(d);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    SSimTop sim;
+    tick(sim, 0x12);
+    if (sim.get_q0() != 0x12 || sim.get_q128() != 0x12 || sim.get_q255() != 0x12) {
+        return 1;
+    }
+    tick(sim, 0xa5);
+    if (sim.get_q0() != 0xa5 || sim.get_q128() != 0xa5 || sim.get_q255() != 0xa5) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "multi_chunk_direct_top", runner);
 }
 
 void testFullMaskNarrowRegisterWriteMasksStorageBits()
