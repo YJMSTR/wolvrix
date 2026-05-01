@@ -3114,6 +3114,42 @@ Design buildMultiChunkRegisterDependencyDesign()
     return design;
 }
 
+Design buildMultiChunkWideRegisterDependencyDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 130, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    const auto one = makeConstant(graph, "wide_one", "wide_one_const", 1, "1'b1");
+    const auto fullMask =
+        makeConstant(graph, "wide_full_mask", "wide_full_mask_const", 130, "130'h3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+    const auto padValue = makeConstant(graph, "wide_pad_value", "wide_pad_value_const", 8, "8'h22");
+    const auto padMask = makeConstant(graph, "wide_pad_mask", "wide_pad_mask_const", 8, "8'hff");
+
+    (void)makeRegister(graph, "a_wq_storage", "a_wq_reg", 130, "a_wq");
+    const auto qRead = makeRegisterRead(graph, "a_wq_read", "a_wq_read_op", 130, "a_wq");
+    graph.bindOutputPort("q", qRead);
+    makeRegisterWrite(graph, "a_wq_write", one, inD, fullMask, clk, "a_wq");
+
+    for (int i = 0; i < 256; ++i) {
+        const std::string sym = "w_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, padMask, clk, sym);
+    }
+
+    (void)makeRegister(graph, "z_wr_storage", "z_wr_reg", 130, "z_wr");
+    const auto rRead = makeRegisterRead(graph, "z_wr_read", "z_wr_read_op", 130, "z_wr");
+    graph.bindOutputPort("r", rRead);
+    makeRegisterWrite(graph, "z_wr_write", one, qRead, fullMask, clk, "z_wr");
+
+    return design;
+}
+
 Design buildKeyClockCarrierDesign()
 {
     Design design;
@@ -8814,9 +8850,12 @@ void testMultiChunkRegisterWritesUseDomainNextState()
             generatedSources += readFile(entry.path());
         }
     }
-    expect(contains(generatedSources, "domain_next_stateU8_scratch_.clear()") &&
+    expect(contains(generatedSources, "prepare_domain_next_stateU8(") &&
+               contains(generatedSources, "apply_domain_next_stateU8();"),
+           "multi-chunk register domains should prepare and apply sparse scalar next-state through helpers");
+    expect(contains(generatedSources, "void SSimTop::apply_domain_next_stateU8()") &&
                contains(generatedSources, "state_->stateU8[write_.first] = write_.second"),
-           "multi-chunk register domains should defer writes through sparse domain next-state updates");
+           "scalar domain next-state helper should preserve sparse writeback semantics");
     expect(contains(generatedSources, "next_stateU8_->emplace_back"),
            "multi-chunk register chunk methods should append staged writes to the sparse domain next-state target");
     expect(contains(generatedSources, "domain_next_stateU8_scratch_.reserve("),
@@ -8857,6 +8896,86 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "multi_chunk_reg_top", runner);
+}
+
+void testMultiChunkWideRegisterWritesUseDomainNextStateHelpers()
+{
+    Design design = buildMultiChunkWideRegisterDependencyDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "multi_chunk_wide_domain_next_helpers";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("multi_chunk_wide_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp multi-chunk wide fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp multi-chunk wide fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "prepare_domain_next_stateVec(") &&
+               contains(generatedSources, "apply_domain_next_stateVec();"),
+           "multi-chunk wide register domains should prepare and apply vector next-state through helpers");
+    expect(contains(generatedSources, "void SSimTop::apply_domain_next_stateVec()") &&
+               contains(generatedSources, "state_->stateVec[write_.first] = std::move(write_.second)"),
+           "vector domain next-state helper should preserve move writeback semantics");
+    expect(contains(generatedSources, "next_stateVec_->emplace_back"),
+           "multi-chunk wide chunk methods should append staged vector writes");
+
+    const std::string runner = R"CPP(
+#include "multi_chunk_wide_top.hpp"
+#include <cstdint>
+#include <vector>
+
+static void tick(SSimTop& sim, const std::vector<std::uint64_t>& d) {
+    sim.set_d(d);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    SSimTop sim;
+    tick(sim, std::vector<std::uint64_t>{0x0123456789abcdefULL, 0x1fULL, 0x0ULL});
+    const auto q0 = sim.get_q();
+    const auto r0 = sim.get_r();
+    if (q0.size() != 3 || r0.size() != 3) {
+        return 1;
+    }
+    if (q0[0] != 0x0123456789abcdefULL || q0[1] != 0x1fULL || q0[2] != 0x0ULL) {
+        return 2;
+    }
+    if (r0[0] != 0x0ULL || r0[1] != 0x0ULL || r0[2] != 0x0ULL) {
+        return 3;
+    }
+    tick(sim, std::vector<std::uint64_t>{0xfedcba9876543210ULL, 0x2aULL, 0x0ULL});
+    const auto q1 = sim.get_q();
+    const auto r1 = sim.get_r();
+    if (q1[0] != 0xfedcba9876543210ULL || q1[1] != 0x2aULL || q1[2] != 0x0ULL) {
+        return 4;
+    }
+    if (r1[0] != 0x0123456789abcdefULL || r1[1] != 0x1fULL || r1[2] != 0x0ULL) {
+        return 5;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "multi_chunk_wide_top", runner);
 }
 
 void testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias()
@@ -9104,6 +9223,10 @@ int main()
                 testMultiChunkRegisterWritesUseDomainNextState();
                 return 0;
             }
+            if (name == "multi-chunk-wide-domain-next") {
+                testMultiChunkWideRegisterWritesUseDomainNextStateHelpers();
+                return 0;
+            }
             if (name == "multi-chunk-multi-masked-scalar") {
                 testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce();
                 return 0;
@@ -9221,6 +9344,7 @@ int main()
         testMultiMaskedWideRegisterWritesAccumulateInNextState();
         testWideZeroMaskRegisterWriteDoesNotCommit();
         testMultiChunkRegisterWritesUseDomainNextState();
+        testMultiChunkWideRegisterWritesUseDomainNextStateHelpers();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();
         testEmitMetadataToggleSkipsLargeMetadataPayload();
