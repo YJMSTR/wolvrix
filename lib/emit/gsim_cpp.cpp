@@ -330,6 +330,7 @@ namespace wolvrix::lib::emit
             std::vector<std::pair<std::uint32_t, std::uint32_t>> shardActivationRanges;
             std::unordered_map<std::string, std::uint32_t> shardActivationRangeIds;
             int changedValueFanoutInlineMaskLimit = 1;
+            int shardActivationInlineMaskLimit = 1;
             int changedValueFanoutEstimateBytes = 128;
             std::vector<int> opProducerFirstShardByIndex;
             std::vector<int> opProducerLastShardByIndex;
@@ -798,7 +799,7 @@ namespace wolvrix::lib::emit
             if (masks.empty()) {
                 return {};
             }
-            if (static_cast<int>(masks.size()) <= state.changedValueFanoutInlineMaskLimit) {
+            if (static_cast<int>(masks.size()) <= state.shardActivationInlineMaskLimit) {
                 return buildShardWordMaskActivation(masks);
             }
             std::ostringstream key;
@@ -844,7 +845,7 @@ namespace wolvrix::lib::emit
                     }
                     crossWordMasks[word] |= (std::uint64_t{1} << (successor % 64));
                 }
-                if (static_cast<int>(crossWordMasks.size()) > state.changedValueFanoutInlineMaskLimit) {
+                if (static_cast<int>(crossWordMasks.size()) > state.shardActivationInlineMaskLimit) {
                     internShardActivationRange(state, crossWordMasks);
                 }
             }
@@ -7634,7 +7635,7 @@ namespace wolvrix::lib::emit
                 }
                 return canDirectSequentialWrite(regName, regStmts);
             };
-            constexpr bool kAllowDelayedDirectSequentialStateWrite = true;
+            constexpr bool kAllowDelayedDirectSequentialStateWrite = false;
             std::vector<std::pair<std::string, std::string>> delayedDirectWrites;
 
             for (const auto &regName : chunk.regNames) {
@@ -7931,6 +7932,9 @@ namespace wolvrix::lib::emit
         state.changedValueFanoutInlineMaskLimit =
             parseNonNegativeIntAttr(options, "changed_value_fanout_inline_mask_limit",
                                     state.changedValueFanoutInlineMaskLimit);
+        state.shardActivationInlineMaskLimit =
+            parseNonNegativeIntAttr(options, "shard_activation_inline_mask_limit",
+                                    state.shardActivationInlineMaskLimit);
         state.enableDpicTrace = attrEnabled(options, "dpic_trace", false);
         state.enableXsZeroRetireTrace =
             state.enableDpicTrace && attrEnabled(options, "xs_zero_retire_trace", false);

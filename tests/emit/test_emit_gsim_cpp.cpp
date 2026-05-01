@@ -7460,6 +7460,7 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
     options.attributes["behavior_shard_max_bytes"] = "512";
     options.attributes["activity_shard_watermark"] = "1";
     options.attributes["changed_value_fanout_inline_mask_limit"] = "0";
+    options.attributes["shard_activation_inline_mask_limit"] = "999";
 
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp selective-replay fixture should succeed");
@@ -7539,6 +7540,8 @@ void testReplayDirtyInputShardsSkipsInputIndependentShards()
            "settle should enqueue shard successors from static or changed-value fanout metadata");
     expect(hasPackedChangedValueFanout && contains(source, "kChangedFanoutRanges"),
            "inline-mask-limit=0 should route changed-value fanout through a packed fanout table");
+    expect(!contains(source, "kShardActivationRanges"),
+           "generic shard activation inline threshold should be independent from changed-value fanout range packing");
     expect(contains(source, "struct WolvrixGsimShardActivationMask") &&
                contains(source, "struct WolvrixGsimShardActivationRange") &&
                contains(source, "constexpr WolvrixGsimShardActivationMask kChangedFanoutMasks[]") &&
@@ -7876,7 +7879,6 @@ void testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout()
     options.topOverrides = {"top"};
     options.attributes["behavior_shard_max_bytes"] = "64";
     options.attributes["activity_shard_watermark"] = "1";
-
     const EmitResult result = emitter.emit(design, options);
     expect(result.success, "EmitGsimCpp convergent active-worklist fixture should succeed");
     expect(!diags.hasError(), "EmitGsimCpp convergent active-worklist fixture should not emit diagnostics");
@@ -8177,9 +8179,11 @@ void testDirectEligibleRegisterWriteUsesCommitBarrier()
     }
     expect(!contains(generatedSources, "direct_next_"),
            "direct-eligible scalar register writes should not bypass the commit barrier");
-    expect(contains(generatedSources, "delayed_direct_reg_q") &&
-               contains(generatedSources, "state_->stateU8["),
-           "direct-eligible scalar register writes should be delayed until after RHS evaluation");
+    expect(!contains(generatedSources, "delayed_direct_reg_q"),
+           "sequential writes should not use delayed direct writes that can skew commit-chunk freshness");
+    expect(contains(generatedSources, "auto next_reg_q = state_->stateU8[") &&
+               contains(generatedSources, "next_reg_q_updated_"),
+           "direct-eligible scalar register writes should keep the next-state commit barrier");
 
     const std::string runner = R"CPP(
 #include "direct_commit_top.hpp"
@@ -8817,6 +8821,10 @@ int main()
             }
             if (name == "active-worklist-convergent-fanout") {
                 testActiveWorklistSkipsIndependentBranchAndRunsConvergentFanout();
+                return 0;
+            }
+            if (name == "direct-eligible-commit-barrier") {
+                testDirectEligibleRegisterWriteUsesCommitBarrier();
                 return 0;
             }
             if (name == "eq") {
