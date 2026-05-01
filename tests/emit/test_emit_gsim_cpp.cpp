@@ -8373,8 +8373,9 @@ void testMultiChunkDirectEligibleWritesUseDomainNextStaging()
     }
     expect(commitChunkCount > 1,
            "multi-chunk direct fixture should force more than one commit chunk in the same domain");
-    expect(contains(generatedSources, "std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_"),
-           "multi-chunk domains should stage scalar writes in a domain-level next-state vector");
+    expect(contains(generatedSources, "domain_next_stateU8_scratch_.clear()") &&
+               contains(generatedSources, "&domain_next_stateU8_scratch_"),
+           "multi-chunk domains should stage scalar writes in a reusable domain-level next-state vector");
     expect(contains(generatedSources, "const auto delayed_direct_reg_q0 = ((input_d_) & 255)"),
            "direct-eligible writes may skip per-register next locals only when the domain next-state vector exists");
     expect(contains(generatedSources, "next_stateU8_->emplace_back"),
@@ -8785,13 +8786,13 @@ void testMultiChunkRegisterWritesUseDomainNextState()
             generatedSources += readFile(entry.path());
         }
     }
-    expect(contains(generatedSources, "std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_") &&
+    expect(contains(generatedSources, "domain_next_stateU8_scratch_.clear()") &&
                contains(generatedSources, "state_->stateU8[write_.first] = write_.second"),
            "multi-chunk register domains should defer writes through sparse domain next-state updates");
     expect(contains(generatedSources, "next_stateU8_->emplace_back"),
            "multi-chunk register chunk methods should append staged writes to the sparse domain next-state target");
-    expect(contains(generatedSources, "domain_next_stateU8_.reserve("),
-           "multi-chunk register domains should reserve sparse pending storage by pool");
+    expect(contains(generatedSources, "domain_next_stateU8_scratch_.reserve("),
+           "multi-chunk register domains should reserve reusable sparse pending storage by pool");
     expect(contains(generatedSources, "next_stateU8_->emplace_back(static_cast<std::size_t>("),
            "multi-chunk scalar register chunks should append touched scalar registers to the sparse domain target");
 

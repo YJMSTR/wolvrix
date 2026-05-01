@@ -6122,6 +6122,21 @@ namespace wolvrix::lib::emit
             os << "    std::uint64_t log_end_ = 0;\n";
             os << "    SSimTopState* state_;\n";
             os << "    SSimTopEvalTemps* evalTemps_;\n";
+            if (state.stateU8Count > 0) {
+                os << "    std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_scratch_;\n";
+            }
+            if (state.stateU16Count > 0) {
+                os << "    std::vector<std::pair<std::size_t, std::uint16_t>> domain_next_stateU16_scratch_;\n";
+            }
+            if (state.stateU32Count > 0) {
+                os << "    std::vector<std::pair<std::size_t, std::uint32_t>> domain_next_stateU32_scratch_;\n";
+            }
+            if (state.stateU64Count > 0) {
+                os << "    std::vector<std::pair<std::size_t, std::uint64_t>> domain_next_stateU64_scratch_;\n";
+            }
+            if (!state.stateVecWidths.empty()) {
+                os << "    std::vector<std::pair<std::size_t, std::vector<std::uint64_t>>> domain_next_stateVec_scratch_;\n";
+            }
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    bool clock_inputs_dirty_ = true;\n";
                 os << "    bool committed_state_dirty_ = true;\n";
@@ -7026,42 +7041,47 @@ namespace wolvrix::lib::emit
                                 std::vector<std::string> args;
                                 std::string commitLine = "        if (domain_reg_committed_) {";
                                 if (pools.stateU8) {
-                                    os << "        std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_;\n";
-                                    os << "        domain_next_stateU8_.reserve(" << pools.stateU8 << ");\n";
-                                    commitLine += " for (const auto& write_ : domain_next_stateU8_) { state_->stateU8[write_.first] = write_.second; }";
-                                    args.push_back("&domain_next_stateU8_");
+                                    os << "        domain_next_stateU8_scratch_.clear();\n";
+                                    os << "        if (domain_next_stateU8_scratch_.capacity() < " << pools.stateU8
+                                       << "U) domain_next_stateU8_scratch_.reserve(" << pools.stateU8 << "U);\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU8_scratch_) { state_->stateU8[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU8_scratch_");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateU16) {
-                                    os << "        std::vector<std::pair<std::size_t, std::uint16_t>> domain_next_stateU16_;\n";
-                                    os << "        domain_next_stateU16_.reserve(" << pools.stateU16 << ");\n";
-                                    commitLine += " for (const auto& write_ : domain_next_stateU16_) { state_->stateU16[write_.first] = write_.second; }";
-                                    args.push_back("&domain_next_stateU16_");
+                                    os << "        domain_next_stateU16_scratch_.clear();\n";
+                                    os << "        if (domain_next_stateU16_scratch_.capacity() < " << pools.stateU16
+                                       << "U) domain_next_stateU16_scratch_.reserve(" << pools.stateU16 << "U);\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU16_scratch_) { state_->stateU16[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU16_scratch_");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateU32) {
-                                    os << "        std::vector<std::pair<std::size_t, std::uint32_t>> domain_next_stateU32_;\n";
-                                    os << "        domain_next_stateU32_.reserve(" << pools.stateU32 << ");\n";
-                                    commitLine += " for (const auto& write_ : domain_next_stateU32_) { state_->stateU32[write_.first] = write_.second; }";
-                                    args.push_back("&domain_next_stateU32_");
+                                    os << "        domain_next_stateU32_scratch_.clear();\n";
+                                    os << "        if (domain_next_stateU32_scratch_.capacity() < " << pools.stateU32
+                                       << "U) domain_next_stateU32_scratch_.reserve(" << pools.stateU32 << "U);\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU32_scratch_) { state_->stateU32[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU32_scratch_");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateU64) {
-                                    os << "        std::vector<std::pair<std::size_t, std::uint64_t>> domain_next_stateU64_;\n";
-                                    os << "        domain_next_stateU64_.reserve(" << pools.stateU64 << ");\n";
-                                    commitLine += " for (const auto& write_ : domain_next_stateU64_) { state_->stateU64[write_.first] = write_.second; }";
-                                    args.push_back("&domain_next_stateU64_");
+                                    os << "        domain_next_stateU64_scratch_.clear();\n";
+                                    os << "        if (domain_next_stateU64_scratch_.capacity() < " << pools.stateU64
+                                       << "U) domain_next_stateU64_scratch_.reserve(" << pools.stateU64 << "U);\n";
+                                    commitLine += " for (const auto& write_ : domain_next_stateU64_scratch_) { state_->stateU64[write_.first] = write_.second; }";
+                                    args.push_back("&domain_next_stateU64_scratch_");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateVec) {
-                                    os << "        std::vector<std::pair<std::size_t, std::vector<std::uint64_t>>> domain_next_stateVec_;\n";
-                                    os << "        domain_next_stateVec_.reserve(" << pools.stateVec << ");\n";
-                                    commitLine += " for (auto& write_ : domain_next_stateVec_) { state_->stateVec[write_.first] = std::move(write_.second); }";
-                                    args.push_back("&domain_next_stateVec_");
+                                    os << "        domain_next_stateVec_scratch_.clear();\n";
+                                    os << "        if (domain_next_stateVec_scratch_.capacity() < " << pools.stateVec
+                                       << "U) domain_next_stateVec_scratch_.reserve(" << pools.stateVec << "U);\n";
+                                    commitLine += " for (auto& write_ : domain_next_stateVec_scratch_) { state_->stateVec[write_.first] = std::move(write_.second); }";
+                                    args.push_back("&domain_next_stateVec_scratch_");
                                 } else {
                                     args.push_back("nullptr");
                                 }
