@@ -7177,8 +7177,10 @@ namespace wolvrix::lib::emit
                         emitReplayOnlyEdgeBatch(replayOnlyRegEdgeBatch);
                         replayOnlyRegEdgeBatch.clear();
                     };
+                    bool emittedDerivedRegReplayBarrier = false;
                     for (const auto &domainKey : sequentialDomains) {
                         const auto [edgeExpr, clockNeedsPreEdgeReplay] = commitStepEdgeExpr(domainKey);
+                        const bool domainIsDerived = isDerivedSequentialDomain(domainKey);
                         const auto regChunkIt = sequentialRegChunkMethods.find(domainKey);
                         const bool hasRegBody = regChunkIt != sequentialRegChunkMethods.end();
                         const bool canBatchReplayOnlyEdge =
@@ -7189,7 +7191,19 @@ namespace wolvrix::lib::emit
                             continue;
                         }
                         flushReplayOnlyRegEdgeBatch();
-                        if (state.enableSharding && state.shardCount() > 0 && clockNeedsPreEdgeReplay) {
+                        if (state.enableSharding && state.shardCount() > 0 &&
+                            domainIsDerived && !emittedDerivedRegReplayBarrier) {
+                            os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "        settle();\n";
+                                emitPendingReplay("        ", false, true, true);
+                            } else {
+                                emitPendingReplay("        ", false, true, true);
+                            }
+                            os << "    }\n";
+                            emittedDerivedRegReplayBarrier = true;
+                        } else if (state.enableSharding && state.shardCount() > 0 &&
+                                   clockNeedsPreEdgeReplay && !domainIsDerived) {
                             os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
                             if (!state.latchStmts.empty()) {
                                 os << "        settle();\n";
@@ -7327,9 +7341,11 @@ namespace wolvrix::lib::emit
                         emitReplayOnlyEdgeBatch(replayOnlyStmtEdgeBatch);
                         replayOnlyStmtEdgeBatch.clear();
                     };
+                    bool emittedDerivedStmtReplayBarrier = false;
                     for (const auto &domainKey : sequentialDomains) {
                         const auto [edgeExpr, clockNeedsPreEdgeReplay] = commitStepEdgeExpr(domainKey);
                         (void)clockNeedsPreEdgeReplay;
+                        const bool domainIsDerived = isDerivedSequentialDomain(domainKey);
                         const auto stmtChunkIt = sequentialStmtChunkMethods.find(domainKey);
                         const auto stmtIt = state.sequentialStmts.find(domainKey);
                         const bool hasStmtBody =
@@ -7339,8 +7355,20 @@ namespace wolvrix::lib::emit
                             continue;
                         }
                         flushReplayOnlyStmtEdgeBatch();
+                        if (state.enableSharding && state.shardCount() > 0 &&
+                            domainIsDerived && !emittedDerivedStmtReplayBarrier) {
+                            os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                            if (!state.latchStmts.empty()) {
+                                os << "        settle();\n";
+                                emitPendingReplay("        ", false, true, true);
+                            } else {
+                                emitPendingReplay("        ", false, true, true);
+                            }
+                            os << "    }\n";
+                            emittedDerivedStmtReplayBarrier = true;
+                        }
                         os << "    if (" << edgeExpr << ") {\n";
-                        if (state.enableSharding && state.shardCount() > 0) {
+                        if (state.enableSharding && state.shardCount() > 0 && !domainIsDerived) {
                             os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
                             if (!state.latchStmts.empty()) {
                                 os << "            settle();\n";
