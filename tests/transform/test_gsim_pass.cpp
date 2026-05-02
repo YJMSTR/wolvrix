@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -617,6 +618,23 @@ void testGraphOnlyPathWritesMetadata()
                return batch >= 0 && batch < *batchCount;
            }),
            "gsim batch successor targets should only reference valid batch ordinals");
+    auto batchIndex = [&](std::string_view name) -> int64_t {
+        const auto it = std::find(batchNames->begin(), batchNames->end(), std::string(name));
+        expect(it != batchNames->end(), "expected deterministic batch name should exist");
+        return static_cast<int64_t>(std::distance(batchNames->begin(), it));
+    };
+    const int64_t combBatch = batchIndex("batch.combinational");
+    const int64_t regBatch = batchIndex("batch.reg:clk");
+    const int64_t sidefxBatch = batchIndex("batch.system-task");
+    std::set<int64_t> combTargets;
+    for (int64_t cursor = (*batchSuccOffsets)[static_cast<std::size_t>(combBatch)];
+         cursor < (*batchSuccOffsets)[static_cast<std::size_t>(combBatch + 1)]; ++cursor) {
+        combTargets.insert((*batchSuccTargets)[static_cast<std::size_t>(cursor)]);
+    }
+    expect(combTargets.count(regBatch) == 1 && combTargets.count(sidefxBatch) == 1,
+           "combinational batch should deterministically fan out to register and system-task batches");
+    expect(combTargets.size() == 2,
+           "transform-owned batch CSR should canonicalize duplicate fanout targets");
     expect(hyperKind != nullptr && *hyperKind == "activity-connectivity-v1",
            "gsim should write concrete hypergraph metadata kind");
     expect(hyperContract != nullptr && *hyperContract == "gsim.activity.hypergraph.v1",

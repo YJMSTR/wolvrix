@@ -283,6 +283,7 @@ namespace wolvrix::lib::emit
             bool activityBatchMetadataPresent = false;
             bool activityBatchMetadataValid = false;
             bool activityBatchDispatchEnabled = false;
+            bool activityBatchStrictDispatch = false;
             int64_t activityBatchCount = 0;
             int64_t activityBatchAvgOps = 0;
             int64_t activityBatchMaxOps = 0;
@@ -844,6 +845,16 @@ namespace wolvrix::lib::emit
                 return " activate_shard_mask_range(" + std::to_string(it->second) + "U);";
             }
             return buildShardWordMaskActivation(masks);
+        }
+
+        void emitBatchWordMaskActivation(std::ostream& os,
+                                         const std::map<int, std::uint64_t>& masks,
+                                         std::string_view indent,
+                                         std::string_view suffix)
+        {
+            for (const auto& [word, mask] : masks) {
+                os << indent << "activate_batch_mask(" << word << "U, UINT64_C(" << mask << "));" << suffix;
+            }
         }
 
         std::string buildChangedFanoutActivation(CodegenState& state,
@@ -3806,6 +3817,13 @@ namespace wolvrix::lib::emit
                     }
 
                     if (!regName.empty()) {
+                        if (state.storageWidths.find(regName) == state.storageWidths.end()) {
+                            const int32_t inferredWidth = operands.size() > 1 ? getOperandWidth(1) : 32;
+                            const int32_t storageWidth = inferredWidth > 0 ? inferredWidth : 32;
+                            const std::string storageType = getCppTypeForWidth(storageWidth);
+                            state.allocatePersistentStorage(regName, storageType, storageWidth);
+                            state.storageWidths[regName] = storageWidth;
+                        }
                         auto &regStmts = state.sequentialRegStmts[domainKey][regName];
                         const std::string nextRegExpr = "next_" + regName;
                         const auto regWidthIt = state.storageWidths.find(regName);
@@ -6424,9 +6442,7 @@ namespace wolvrix::lib::emit
                 if (state.activityBatchDispatchEnabled) {
                     if (const auto headsIt = state.activitySourceHeadBatches.find(sourceKey);
                         headsIt != state.activitySourceHeadBatches.end() && !headsIt->second.empty()) {
-                        for (const auto& [word, mask] : shardWordMasksFor(headsIt->second)) {
-                            os << " activate_batch_mask(" << word << "U, UINT64_C(" << mask << "));";
-                        }
+                        emitBatchWordMaskActivation(os, shardWordMasksFor(headsIt->second), " ", "");
                     } else {
                         os << " activate_all_batches();";
                     }
@@ -6524,7 +6540,9 @@ namespace wolvrix::lib::emit
                 os << "    void replay_non_clock_input_shards();\n";
                 os << "    void replay_pending_for_commit(bool& dirty_replayed_, bool include_clock_, bool include_non_clock_);\n";
                 if (state.enableActivityWatermark) {
-                    os << "    void activate_all_shards();\n";
+                    if (!state.activityBatchStrictDispatch) {
+                        os << "    void activate_all_shards();\n";
+                    }
                     os << "    void activate_shards(const std::uint32_t* indices, std::size_t count);\n";
                     os << "    void activate_shard(std::uint32_t shard);\n";
                     os << "    void activate_shard_mask(std::uint32_t word, std::uint64_t mask);\n";
@@ -7244,9 +7262,7 @@ namespace wolvrix::lib::emit
                 if (state.activityBatchDispatchEnabled) {
                     if (const auto headsIt = state.activitySourceHeadBatches.find("input_reset");
                         headsIt != state.activitySourceHeadBatches.end() && !headsIt->second.empty()) {
-                        for (const auto& [word, mask] : shardWordMasksFor(headsIt->second)) {
-                            os << " activate_batch_mask(" << word << "U, UINT64_C(" << mask << "));";
-                        }
+                        emitBatchWordMaskActivation(os, shardWordMasksFor(headsIt->second), " ", "");
                     } else {
                         os << " activate_all_batches();";
                     }
@@ -7309,21 +7325,23 @@ namespace wolvrix::lib::emit
                 os << "}\n\n";
             };
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                os << "void SSimTop::activate_all_shards() {\n";
-                os << "    active_word_queue_.clear();\n";
-                os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), ~UINT64_C(0));\n";
-                if ((state.shardCount() % 64U) == 0U) {
-                    os << "    if (!active_shard_words_.empty()) { active_shard_words_.back() = ~UINT64_C(0); }\n";
-                } else {
-                    const std::uint64_t lastActiveShardWordMask =
-                        (UINT64_C(1) << (state.shardCount() % 64U)) - UINT64_C(1);
-                    os << "    if (!active_shard_words_.empty()) { active_shard_words_.back() = UINT64_C("
-                       << lastActiveShardWordMask << "); }\n";
+                if (!state.activityBatchStrictDispatch) {
+                    os << "void SSimTop::activate_all_shards() {\n";
+                    os << "    active_word_queue_.clear();\n";
+                    os << "    std::fill(active_shard_words_.begin(), active_shard_words_.end(), ~UINT64_C(0));\n";
+                    if ((state.shardCount() % 64U) == 0U) {
+                        os << "    if (!active_shard_words_.empty()) { active_shard_words_.back() = ~UINT64_C(0); }\n";
+                    } else {
+                        const std::uint64_t lastActiveShardWordMask =
+                            (UINT64_C(1) << (state.shardCount() % 64U)) - UINT64_C(1);
+                        os << "    if (!active_shard_words_.empty()) { active_shard_words_.back() = UINT64_C("
+                           << lastActiveShardWordMask << "); }\n";
+                    }
+                    os << "    std::fill(active_word_queued_.begin(), active_word_queued_.end(), 1);\n";
+                    os << "    active_word_queue_.reserve(active_shard_words_.size());\n";
+                    os << "    for (std::uint32_t word = 0; word < active_shard_words_.size(); ++word) { active_word_queue_.push_back(word); }\n";
+                    os << "}\n\n";
                 }
-                os << "    std::fill(active_word_queued_.begin(), active_word_queued_.end(), 1);\n";
-                os << "    active_word_queue_.reserve(active_shard_words_.size());\n";
-                os << "    for (std::uint32_t word = 0; word < active_shard_words_.size(); ++word) { active_word_queue_.push_back(word); }\n";
-                os << "}\n\n";
                 os << "void SSimTop::activate_shards(const std::uint32_t* indices, std::size_t count) {\n";
                 os << "    for (std::size_t i = 0; i < count; ++i) { activate_shard(indices[i]); }\n";
                 os << "}\n\n";
@@ -7568,27 +7586,29 @@ namespace wolvrix::lib::emit
                     os << "    active_batch_word_queue_.clear();\n";
                     os << "    std::fill(active_batch_words_.begin(), active_batch_words_.end(), UINT64_C(0));\n";
                     os << "    std::fill(active_batch_word_queued_.begin(), active_batch_word_queued_.end(), 0);\n";
-                    os << "    if (!active_word_queue_.empty()) {\n";
-                    os << "        if (activity_batch_stats_enabled_) { ++activity_batch_suffix_fallbacks_step_; }\n";
-                    os << "        std::size_t active_cursor_ = 0;\n";
-                    os << "        while (active_cursor_ < active_word_queue_.size()) {\n";
-                    os << "            const std::uint32_t active_word_ = active_word_queue_[active_cursor_++];\n";
-                    os << "            if (active_word_ >= active_shard_words_.size()) { continue; }\n";
-                    os << "            std::uint64_t active_bits_ = active_shard_words_[active_word_];\n";
-                    os << "            active_shard_words_[active_word_] = UINT64_C(0);\n";
-                    os << "            switch (active_word_) {\n";
-                    const int activeWordCount = (state.shardCount() + 63) / 64;
-                    for (int word = 0; word < activeWordCount; ++word) {
-                        os << "            case " << word << "U: run_active_shard_word_" << word << "(active_bits_); break;\n";
+                    if (!state.activityBatchStrictDispatch) {
+                        os << "    if (!active_word_queue_.empty()) {\n";
+                        os << "        if (activity_batch_stats_enabled_) { ++activity_batch_suffix_fallbacks_step_; }\n";
+                        os << "        std::size_t active_cursor_ = 0;\n";
+                        os << "        while (active_cursor_ < active_word_queue_.size()) {\n";
+                        os << "            const std::uint32_t active_word_ = active_word_queue_[active_cursor_++];\n";
+                        os << "            if (active_word_ >= active_shard_words_.size()) { continue; }\n";
+                        os << "            std::uint64_t active_bits_ = active_shard_words_[active_word_];\n";
+                        os << "            active_shard_words_[active_word_] = UINT64_C(0);\n";
+                        os << "            switch (active_word_) {\n";
+                        const int activeWordCount = (state.shardCount() + 63) / 64;
+                        for (int word = 0; word < activeWordCount; ++word) {
+                            os << "            case " << word << "U: run_active_shard_word_" << word << "(active_bits_); break;\n";
+                        }
+                        os << "            default: break;\n";
+                        os << "            }\n";
+                        os << "            active_word_queued_[active_word_] = 0;\n";
+                        os << "        }\n";
+                        os << "        active_word_queue_.clear();\n";
+                        os << "        std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
+                        os << "        std::fill(active_word_queued_.begin(), active_word_queued_.end(), 0);\n";
+                        os << "    }\n";
                     }
-                    os << "            default: break;\n";
-                    os << "            }\n";
-                    os << "            active_word_queued_[active_word_] = 0;\n";
-                    os << "        }\n";
-                    os << "        active_word_queue_.clear();\n";
-                    os << "        std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
-                    os << "        std::fill(active_word_queued_.begin(), active_word_queued_.end(), 0);\n";
-                    os << "    }\n";
                 } else if (state.enableActivityWatermark) {
                     os << "    std::size_t active_cursor_ = 0;\n";
                     os << "    while (active_cursor_ < active_word_queue_.size()) {\n";
@@ -7856,7 +7876,11 @@ namespace wolvrix::lib::emit
                         }
                         os << "        non_clock_inputs_dirty_ = true;\n";
                         if (state.enableSharding && state.enableActivityWatermark) {
-                            os << "        activate_all_shards();\n";
+                            if (state.activityBatchDispatchEnabled) {
+                                os << "        activate_all_batches();\n";
+                            } else {
+                                os << "        activate_all_shards();\n";
+                            }
                         }
                         os << "        return;\n";
                         os << "    }\n";
@@ -8092,7 +8116,11 @@ namespace wolvrix::lib::emit
                     if (state.enableSharding && state.enableActivityWatermark && state.emitsDpicCalls &&
                         state.dpicGlobalWarmupSteps > 0) {
                         os << "        if (gsim_pre_dpic_steps_ < " << state.dpicGlobalWarmupSteps << "U) {\n";
-                        os << "            activate_all_shards();\n";
+                        if (state.activityBatchStrictDispatch) {
+                            os << "            activate_all_batches();\n";
+                        } else {
+                            os << "            activate_all_shards();\n";
+                        }
                         os << "        } else {\n";
                         if (!state.dpicPreSettleShards.empty()) {
                             os << "            static constexpr std::uint32_t kDpicPreSettleShards[] = {";
@@ -8217,7 +8245,11 @@ namespace wolvrix::lib::emit
                                 os << "            committed_state_dirty_ = true;\n";
                                 os << "            dirty_replayed_ = false;\n";
                                 if (state.enableActivityWatermark) {
-                                    os << "            activate_all_shards();\n";
+                                    if (state.activityBatchDispatchEnabled) {
+                                        os << "            activate_all_batches();\n";
+                                    } else {
+                                        os << "            activate_all_shards();\n";
+                                    }
                                 }
                                 os << "        }\n";
                             }
@@ -8248,7 +8280,11 @@ namespace wolvrix::lib::emit
                     }
                     os << "        non_clock_inputs_dirty_ = true;\n";
                     if (state.enableSharding && state.enableActivityWatermark) {
-                        os << "        activate_all_shards();\n";
+                        if (state.activityBatchDispatchEnabled) {
+                            os << "        activate_all_batches();\n";
+                        } else {
+                            os << "        activate_all_shards();\n";
+                        }
                     }
                     os << "        return;\n";
                     os << "    }\n";
@@ -8623,7 +8659,15 @@ namespace wolvrix::lib::emit
                     return;
                 }
                 std::set<int> firstShards;
+                std::set<int> firstBatches;
                 for (const auto& source : sources) {
+                    if (state.activityBatchDispatchEnabled) {
+                        if (const auto headsIt = state.activitySourceHeadBatches.find(source);
+                            headsIt != state.activitySourceHeadBatches.end()) {
+                            firstBatches.insert(headsIt->second.begin(), headsIt->second.end());
+                        }
+                        continue;
+                    }
                     if (const auto headsIt = state.activitySourceHeadShards.find(source);
                         headsIt != state.activitySourceHeadShards.end()) {
                         firstShards.insert(headsIt->second.begin(), headsIt->second.end());
@@ -8633,6 +8677,15 @@ namespace wolvrix::lib::emit
                         shardIt != state.activitySourceFirstShard.end() && shardIt->second >= 0) {
                         firstShards.insert(shardIt->second);
                     }
+                }
+                if (state.activityBatchDispatchEnabled) {
+                    if (!firstBatches.empty()) {
+                        os << indent;
+                        emitBatchWordMaskActivation(os, shardWordMasksFor(firstBatches), "", " ");
+                    } else {
+                        os << indent << "activate_all_batches(); ";
+                    }
+                    return;
                 }
                 if (!firstShards.empty()) {
                     os << indent << buildShardActivation(state, shardWordMasksFor(firstShards)) << " ";
@@ -9065,6 +9118,7 @@ namespace wolvrix::lib::emit
         state.activityBatchMetadataValid = metadata->scheduleBatch.has_value();
         state.activityBatchDispatchEnabled = metadata->scheduleBatch.has_value() &&
                                              (state.activityBatchMode == "dispatch" || state.activityBatchMode == "strict_dispatch");
+        state.activityBatchStrictDispatch = state.activityBatchMode == "strict_dispatch";
         if (state.activityBatchDispatchEnabled) {
             state.enableActivityWatermark = true;
         }
@@ -9440,7 +9494,6 @@ namespace wolvrix::lib::emit
                 ++sequentialRegChunkCounts[chunk.domainKey];
             }
         }
-
         for (const auto &chunk : sequentialChunks) {
             std::string chunkFileName = baseName + "_" + chunk.methodName + ".cpp";
             std::filesystem::path chunkPath = outputDir / chunkFileName;

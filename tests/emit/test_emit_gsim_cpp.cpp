@@ -10,6 +10,8 @@
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <set>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -3649,6 +3651,39 @@ void compileAndRunHarness(const std::filesystem::path &dir,
 }
 
 
+void compileGeneratedSources(const std::filesystem::path &dir,
+                             const std::string &baseName,
+                             const std::string &extraCxxFlags = {})
+{
+    const auto manifestPath = dir / (baseName + ".manifest");
+    expect(std::filesystem::exists(manifestPath), "generated manifest should exist");
+    const char *compiler = std::getenv("CXX");
+    const std::string cxx = (compiler && *compiler) ? compiler : "c++";
+    std::ifstream manifest(manifestPath);
+    std::string rel;
+    std::size_t compiled = 0;
+    while (std::getline(manifest, rel)) {
+        if (!rel.ends_with(".cpp")) {
+            continue;
+        }
+        const auto input = dir / rel;
+        const auto object = dir / (rel + ".o");
+        std::string cmd = cxx + " -std=c++20";
+        if (!extraCxxFlags.empty()) {
+            cmd += " " + extraCxxFlags;
+        }
+        cmd += " -I " + dir.string() + " -c " + input.string() + " -o " + object.string();
+        if (std::system(cmd.c_str()) != 0) {
+            throw std::runtime_error("failed to compile generated source: " + rel);
+        }
+        ++compiled;
+    }
+    expect(compiled > 0, "manifest should contain generated cpp sources");
+}
+
+
+
+
 void instrumentSchedCounters(const std::filesystem::path &dir,
                              const std::string &baseName,
                              std::size_t shardCount)
@@ -3897,6 +3932,58 @@ void testFailureOnStaleMetadataAfterDestructiveMutation()
     expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
 }
 
+
+void testActivityBatchRejectsBadContract()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+    design.setScratchpad(std::string("gsim.top.schedule.batch.contract"), std::string("bad.contract"));
+
+    const auto dir = artifactRoot() / "activity_batch_bad_contract";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+    options.attributes["activity_batch_mode"] = "dispatch";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "bad activity batch contract should fail in explicit batch mode");
+    expect(diags.hasError(), "bad activity batch contract should produce diagnostics");
+    expectDiagnosticsContain(diags, "schedule batch metadata contract mismatch");
+}
+
+void testActivityBatchRejectsStaleGraphIdentity()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    auto *graph = design.findGraph("top");
+    expect(graph != nullptr, "batch stale metadata fixture should resolve top graph");
+    const auto staleInput = makeValue(*graph, "batch_stale_in", 8, false);
+    const auto staleOutput = makeValue(*graph, "batch_stale_out", 8, false);
+    const auto staleOp = graph->createOperation(OperationKind::kNot, graph->internSymbol("batch_stale_not"));
+    graph->addOperand(staleOp, staleInput);
+    graph->addResult(staleOp, staleOutput);
+
+    const auto dir = artifactRoot() / "activity_batch_stale";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+    options.attributes["activity_batch_mode"] = "dispatch";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "stale activity batch metadata should fail in explicit batch mode");
+    expect(diags.hasError(), "stale activity batch metadata should produce diagnostics");
+    expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
+}
+
 void testActivityBatchStatsModeEmitsStaticPlanFields()
 {
     Design design = buildSingleGraphDesign();
@@ -4009,6 +4096,98 @@ void testActivityBatchDispatchEmitsParityQueue()
            "parity batch bodies should project batches onto existing sched shard calls");
     expect(contains(source, "activate_batch_mask(") && contains(source, "activity_batch_successor_edges_step_"),
            "batch dispatch should activate successors from batch CSR and update runtime counters");
+    const std::string manifest = readFile(dir / "activity_batch_dispatch_top.manifest");
+    std::string allGenerated = source;
+    std::istringstream lines(manifest);
+    std::string rel;
+    while (std::getline(lines, rel)) {
+        if (rel.ends_with(".cpp") && rel != "activity_batch_dispatch_top.cpp") {
+            allGenerated += readFile(dir / rel);
+        }
+    }
+    expect(!contains(allGenerated, "state_->reg_state"),
+           "dispatch chunk sources should use allocated persistent register storage");
+    compileGeneratedSources(dir, "activity_batch_dispatch_top");
+}
+
+void testActivityBatchStrictDispatchAvoidsShardFallback()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "activity_batch_strict_dispatch";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("activity_batch_strict_top");
+    options.topOverrides = {"top"};
+    options.attributes["activity_batch_mode"] = "strict_dispatch";
+    options.attributes["activity_batch_stats"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "strict activity batch dispatch should emit with valid metadata");
+    expect(!diags.hasError(), "strict activity batch dispatch should not emit diagnostics");
+
+    const std::string source = readFile(dir / "activity_batch_strict_top.cpp");
+    const std::string manifest = readFile(dir / "activity_batch_strict_top.manifest");
+    std::string allGenerated = source;
+    std::istringstream lines(manifest);
+    std::string rel;
+    while (std::getline(lines, rel)) {
+        if (rel.ends_with(".cpp") && rel != "activity_batch_strict_top.cpp") {
+            allGenerated += readFile(dir / rel);
+        }
+    }
+    expect(contains(source, "active_batch_word_queue_"),
+           "strict dispatch should use batch queue storage");
+    expect(!contains(allGenerated, "if (!active_word_queue_.empty())"),
+           "strict dispatch should not emit settle-time shard suffix fallback");
+    expect(!contains(allGenerated, "++activity_batch_suffix_fallbacks_step_"),
+           "strict dispatch should not count shard suffix fallback in strict path");
+    expect(!contains(allGenerated, "activate_all_shards()"),
+           "strict dispatch generated activity paths should not call activate_all_shards");
+    compileGeneratedSources(dir, "activity_batch_strict_top");
+}
+
+
+void testActivityBatchCountIndependentFromShardBytes()
+{
+    auto emitWithBytes = [](const std::string &name, const std::string &bytes) {
+        Design design = buildMediumShardedDesign();
+        runGsim(design, "top");
+        const auto dir = artifactRoot() / name;
+        cleanDir(dir);
+        EmitDiagnostics diags;
+        EmitGsimCpp emitter(&diags);
+        EmitOptions options;
+        options.outputDir = dir.string();
+        options.outputFilename = name;
+        options.topOverrides = {"top"};
+        options.attributes["activity_batch_mode"] = "dispatch";
+        options.attributes["behavior_shard_max_bytes"] = bytes;
+        const EmitResult result = emitter.emit(design, options);
+        expect(result.success, "activity batch shard-size fixture should emit");
+        expect(!diags.hasError(), "activity batch shard-size fixture should not emit diagnostics");
+        const std::string source = readFile(dir / (name + ".cpp"));
+        const std::size_t shardFiles = static_cast<std::size_t>(std::distance(
+            std::filesystem::directory_iterator(dir), std::filesystem::directory_iterator{}));
+        const auto batchPos = source.find("metadata.activity_batch_count = ");
+        expect(batchPos != std::string::npos, "activity batch count should be emitted");
+        const auto shardPos = source.find("metadata.activity_supernode_shard_count = ");
+        expect(shardPos != std::string::npos, "activity shard count should be emitted");
+        return std::make_tuple(source.substr(batchPos, source.find(';', batchPos) - batchPos),
+                               source.substr(shardPos, source.find(';', shardPos) - shardPos),
+                               shardFiles);
+    };
+    const auto [largeBatch, largeShardLine, largeFiles] = emitWithBytes("activity_batch_shard_large", "4096");
+    const auto [smallBatch, smallShardLine, smallFiles] = emitWithBytes("activity_batch_shard_small", "128");
+    expect(largeBatch == smallBatch,
+           "changing behavior_shard_max_bytes should not change transform-owned batch count");
+    expect(largeShardLine != smallShardLine || largeFiles != smallFiles,
+           "changing behavior_shard_max_bytes should still be able to change C++ shard shape");
 }
 
 void testActivityBatchMetadataToggleKeepsPublicMetadataLight()
@@ -10237,6 +10416,14 @@ int main()
                 testScalarTouchedPendingWriteRuntimeStatsEmission();
                 return 0;
             }
+            if (name == "activity-batch-bad-contract") {
+                testActivityBatchRejectsBadContract();
+                return 0;
+            }
+            if (name == "activity-batch-stale") {
+                testActivityBatchRejectsStaleGraphIdentity();
+                return 0;
+            }
             if (name == "activity-batch-stats-mode") {
                 testActivityBatchStatsModeEmitsStaticPlanFields();
                 return 0;
@@ -10251,11 +10438,18 @@ int main()
             }
             if (name == "activity-batch-metadata-toggle") {
                 testActivityBatchMetadataToggleKeepsPublicMetadataLight();
-        testActivityBatchDispatchEmitsParityQueue();
                 return 0;
             }
             if (name == "activity-batch-dispatch-parity") {
                 testActivityBatchDispatchEmitsParityQueue();
+                return 0;
+            }
+            if (name == "activity-batch-strict-dispatch") {
+                testActivityBatchStrictDispatchAvoidsShardFallback();
+                return 0;
+            }
+            if (name == "activity-batch-shard-size-independence") {
+                testActivityBatchCountIndependentFromShardBytes();
                 return 0;
             }
             if (name == "scalar-touched-duplicate-last-write") {
@@ -10327,9 +10521,14 @@ int main()
         testFailureOnNamespacePathMismatch();
         testFailureOnStaleMetadataAfterMutation();
         testFailureOnStaleMetadataAfterDestructiveMutation();
+        testActivityBatchRejectsBadContract();
+        testActivityBatchRejectsStaleGraphIdentity();
         testActivityBatchStatsModeEmitsStaticPlanFields();
         testActivityBatchDispatchRequiresMetadata();
         testActivityBatchRejectsPartialMetadata();
+        testActivityBatchDispatchEmitsParityQueue();
+        testActivityBatchStrictDispatchAvoidsShardFallback();
+        testActivityBatchCountIndependentFromShardBytes();
         testActivityBatchMetadataToggleKeepsPublicMetadataLight();
         testFailureOnUninlinedInstance();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
