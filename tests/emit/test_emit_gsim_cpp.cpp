@@ -3681,6 +3681,29 @@ void compileGeneratedSources(const std::filesystem::path &dir,
     expect(compiled > 0, "manifest should contain generated cpp sources");
 }
 
+std::string readManifestGeneratedText(const std::filesystem::path &dir,
+                                      const std::string &baseName,
+                                      bool includeHeaders)
+{
+    std::string text = readFile(dir / (baseName + ".cpp"));
+    if (includeHeaders) {
+        text += readFile(dir / (baseName + ".hpp"));
+    }
+    const auto manifestPath = dir / (baseName + ".manifest");
+    expect(std::filesystem::exists(manifestPath), "generated manifest should exist");
+    std::ifstream manifest(manifestPath);
+    std::string rel;
+    while (std::getline(manifest, rel)) {
+        if (rel == baseName + ".cpp" || (includeHeaders && rel == baseName + ".hpp")) {
+            continue;
+        }
+        if (rel.ends_with(".cpp") || (includeHeaders && rel.ends_with(".hpp"))) {
+            text += readFile(dir / rel);
+        }
+    }
+    return text;
+}
+
 
 
 
@@ -4132,24 +4155,77 @@ void testActivityBatchStrictDispatchAvoidsShardFallback()
     expect(!diags.hasError(), "strict activity batch dispatch should not emit diagnostics");
 
     const std::string source = readFile(dir / "activity_batch_strict_top.cpp");
-    const std::string manifest = readFile(dir / "activity_batch_strict_top.manifest");
-    std::string allGenerated = source;
-    std::istringstream lines(manifest);
-    std::string rel;
-    while (std::getline(lines, rel)) {
-        if (rel.ends_with(".cpp") && rel != "activity_batch_strict_top.cpp") {
-            allGenerated += readFile(dir / rel);
-        }
-    }
+    const std::string allGenerated = readManifestGeneratedText(dir, "activity_batch_strict_top", true);
     expect(contains(source, "active_batch_word_queue_"),
            "strict dispatch should use batch queue storage");
     expect(!contains(allGenerated, "if (!active_word_queue_.empty())"),
            "strict dispatch should not emit settle-time shard suffix fallback");
-    expect(!contains(allGenerated, "++activity_batch_suffix_fallbacks_step_"),
-           "strict dispatch should not count shard suffix fallback in strict path");
+    expect(!contains(allGenerated, "activity_batch_suffix_fallbacks_step_"),
+           "strict dispatch should not emit shard suffix fallback counters");
     expect(!contains(allGenerated, "activate_all_shards()"),
            "strict dispatch generated activity paths should not call activate_all_shards");
+    expect(!contains(allGenerated, "activate_shards("),
+           "strict dispatch generated activity paths should not call activate_shards");
+    expect(!contains(allGenerated, "activate_shard_mask("),
+           "strict dispatch generated activity paths should not call activate_shard_mask");
+    expect(!contains(allGenerated, "activate_shard_range("),
+           "strict dispatch generated activity paths should not call activate_shard_range");
+    expect(!contains(allGenerated, "active_word_queue_"),
+           "strict dispatch generated state should not expose the old shard activity queue");
     compileGeneratedSources(dir, "activity_batch_strict_top");
+}
+
+void testActivityBatchStrictDispatchDpicPreSettleUsesBatches()
+{
+    Design design = buildNoDiffDifftestDpicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "activity_batch_strict_dpic";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("activity_batch_strict_dpic_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+    options.attributes["activity_batch_mode"] = "strict_dispatch";
+    options.attributes["activity_batch_stats"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "strict activity batch DPIC pre-settle fixture should emit");
+    expect(!diags.hasError(), "strict activity batch DPIC pre-settle fixture should not emit diagnostics");
+
+    const std::string allGenerated = readManifestGeneratedText(dir, "activity_batch_strict_dpic_top", true);
+    expect(contains(allGenerated, "v_difftest_TestEvent"),
+           "strict DPIC fixture should contain the DPIC call");
+    expect(contains(allGenerated, "activate_all_batches()"),
+           "strict DPIC pre-settle should activate batch-owned work");
+    expect(!contains(allGenerated, "kDpicPreSettleShards"),
+           "strict DPIC pre-settle should not lower through shard pre-settle tables");
+    expect(!contains(allGenerated, "activate_shards("),
+           "strict DPIC pre-settle should not call activate_shards");
+    expect(!contains(allGenerated, "activate_shard_mask("),
+           "strict DPIC pre-settle should not call activate_shard_mask");
+    expect(!contains(allGenerated, "activate_shard_range("),
+           "strict DPIC pre-settle should not call activate_shard_range");
+    expect(!contains(allGenerated, "active_word_queue_"),
+           "strict DPIC pre-settle should not expose old shard activity queue storage");
+    expect(!contains(allGenerated, "activity_batch_suffix_fallbacks_step_"),
+           "strict DPIC pre-settle should not emit shard suffix fallback counters");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open()) {
+        throw std::runtime_error("failed to write DPIC strict dispatch stub");
+    }
+    stub << "#pragma once\n"
+            "#include <cstdint>\n"
+            "inline void v_difftest_TestEvent(std::uint8_t) {}\n";
+    stub.close();
+    compileGeneratedSources(dir, "activity_batch_strict_dpic_top",
+                            "-include " + (dir / "difftest-dpic.h").string());
 }
 
 
@@ -10448,6 +10524,10 @@ int main()
                 testActivityBatchStrictDispatchAvoidsShardFallback();
                 return 0;
             }
+            if (name == "activity-batch-strict-dpic") {
+                testActivityBatchStrictDispatchDpicPreSettleUsesBatches();
+                return 0;
+            }
             if (name == "activity-batch-shard-size-independence") {
                 testActivityBatchCountIndependentFromShardBytes();
                 return 0;
@@ -10528,6 +10608,7 @@ int main()
         testActivityBatchRejectsPartialMetadata();
         testActivityBatchDispatchEmitsParityQueue();
         testActivityBatchStrictDispatchAvoidsShardFallback();
+        testActivityBatchStrictDispatchDpicPreSettleUsesBatches();
         testActivityBatchCountIndependentFromShardBytes();
         testActivityBatchMetadataToggleKeepsPublicMetadataLight();
         testFailureOnUninlinedInstance();
