@@ -6260,25 +6260,27 @@ namespace wolvrix::lib::emit
             os << "    std::uint64_t log_end_ = 0;\n";
             os << "    SSimTopState* state_;\n";
             os << "    SSimTopEvalTemps* evalTemps_;\n";
+            auto emitScalarTouchedMembers = [&](std::string_view suffix, std::string_view type) {
+                os << "    void prepare_domain_next_state" << suffix << "(std::size_t capacity);\n";
+                os << "    bool stage_domain_next_state" << suffix << "(bool cond, std::size_t index, " << type
+                   << " nextValue, " << type << " mask);\n";
+                os << "    bool apply_domain_next_state" << suffix << "();\n";
+                os << "    std::vector<" << type << "> domain_next_state" << suffix << "_shadow_;\n";
+                os << "    std::vector<std::uint8_t> domain_next_state" << suffix << "_touched_;\n";
+                os << "    std::vector<std::uint8_t> domain_next_state" << suffix << "_pending_flags_;\n";
+                os << "    std::vector<std::size_t> domain_next_state" << suffix << "_pending_indices_;\n";
+            };
             if (state.stateU8Count > 0) {
-                os << "    void prepare_domain_next_stateU8(std::size_t capacity);\n";
-                os << "    void apply_domain_next_stateU8();\n";
-                os << "    std::vector<std::pair<std::size_t, std::uint8_t>> domain_next_stateU8_scratch_;\n";
+                emitScalarTouchedMembers("U8", "std::uint8_t");
             }
             if (state.stateU16Count > 0) {
-                os << "    void prepare_domain_next_stateU16(std::size_t capacity);\n";
-                os << "    void apply_domain_next_stateU16();\n";
-                os << "    std::vector<std::pair<std::size_t, std::uint16_t>> domain_next_stateU16_scratch_;\n";
+                emitScalarTouchedMembers("U16", "std::uint16_t");
             }
             if (state.stateU32Count > 0) {
-                os << "    void prepare_domain_next_stateU32(std::size_t capacity);\n";
-                os << "    void apply_domain_next_stateU32();\n";
-                os << "    std::vector<std::pair<std::size_t, std::uint32_t>> domain_next_stateU32_scratch_;\n";
+                emitScalarTouchedMembers("U32", "std::uint32_t");
             }
             if (state.stateU64Count > 0) {
-                os << "    void prepare_domain_next_stateU64(std::size_t capacity);\n";
-                os << "    void apply_domain_next_stateU64();\n";
-                os << "    std::vector<std::pair<std::size_t, std::uint64_t>> domain_next_stateU64_scratch_;\n";
+                emitScalarTouchedMembers("U64", "std::uint64_t");
             }
             if (!state.stateVecWidths.empty()) {
                 os << "    void prepare_domain_next_stateVec(std::size_t capacity);\n";
@@ -6590,38 +6592,91 @@ namespace wolvrix::lib::emit
             }
             os << " }\n\n";
 
-            if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()), ";
-                os << "active_shard_words_((" << state.shardCount() << "U + 63U) / 64U, UINT64_C(0)), ";
-                os << "active_word_queued_((" << state.shardCount() << "U + 63U) / 64U, 0), active_word_queue_() { reset(); }\n";
-            } else {
-                os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps()) { reset(); }\n";
+            os << "SSimTop::SSimTop() : state_(new SSimTopState()), evalTemps_(new SSimTopEvalTemps())";
+            auto appendCtorInit = [&](const std::string &text) {
+                os << ", " << text;
+            };
+            if (state.stateU8Count > 0) {
+                appendCtorInit("domain_next_stateU8_shadow_(" + std::to_string(state.stateU8Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU8_touched_(" + std::to_string(state.stateU8Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU8_pending_flags_(" + std::to_string(state.stateU8Count) + "U, 0)");
             }
+            if (state.stateU16Count > 0) {
+                appendCtorInit("domain_next_stateU16_shadow_(" + std::to_string(state.stateU16Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU16_touched_(" + std::to_string(state.stateU16Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU16_pending_flags_(" + std::to_string(state.stateU16Count) + "U, 0)");
+            }
+            if (state.stateU32Count > 0) {
+                appendCtorInit("domain_next_stateU32_shadow_(" + std::to_string(state.stateU32Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU32_touched_(" + std::to_string(state.stateU32Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU32_pending_flags_(" + std::to_string(state.stateU32Count) + "U, 0)");
+            }
+            if (state.stateU64Count > 0) {
+                appendCtorInit("domain_next_stateU64_shadow_(" + std::to_string(state.stateU64Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU64_touched_(" + std::to_string(state.stateU64Count) + "U, 0)");
+                appendCtorInit("domain_next_stateU64_pending_flags_(" + std::to_string(state.stateU64Count) + "U, 0)");
+            }
+            if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
+                appendCtorInit("active_shard_words_((" + std::to_string(state.shardCount()) + "U + 63U) / 64U, UINT64_C(0))");
+                appendCtorInit("active_word_queued_((" + std::to_string(state.shardCount()) + "U + 63U) / 64U, 0)");
+                appendCtorInit("active_word_queue_()");
+            }
+            os << " { reset(); }\n";
+
             os << "SSimTop::~SSimTop() { delete evalTemps_; delete state_; }\n\n";
-            auto emitDomainNextScalarHelpers = [&](std::string_view suffix, std::string_view statePool) {
+            auto emitDomainNextScalarHelpers = [&](std::string_view suffix,
+                                                       std::string_view statePool,
+                                                       std::string_view type,
+                                                       std::string_view maxConstant) {
                 os << "void SSimTop::prepare_domain_next_state" << suffix << "(std::size_t capacity) {\n";
-                os << "    domain_next_state" << suffix << "_scratch_.clear();\n";
-                os << "    if (domain_next_state" << suffix << "_scratch_.capacity() < capacity) {\n";
-                os << "        domain_next_state" << suffix << "_scratch_.reserve(capacity);\n";
+                os << "    for (const auto idx_ : domain_next_state" << suffix << "_pending_indices_) {\n";
+                os << "        domain_next_state" << suffix << "_touched_[idx_] = 0;\n";
+                os << "        domain_next_state" << suffix << "_pending_flags_[idx_] = 0;\n";
+                os << "    }\n";
+                os << "    domain_next_state" << suffix << "_pending_indices_.clear();\n";
+                os << "    if (domain_next_state" << suffix << "_pending_indices_.capacity() < capacity) {\n";
+                os << "        domain_next_state" << suffix << "_pending_indices_.reserve(capacity);\n";
                 os << "    }\n";
                 os << "}\n\n";
-                os << "void SSimTop::apply_domain_next_state" << suffix << "() {\n";
-                os << "    for (const auto& write_ : domain_next_state" << suffix << "_scratch_) {\n";
-                os << "        state_->" << statePool << "[write_.first] = write_.second;\n";
+                os << "bool SSimTop::stage_domain_next_state" << suffix << "(bool cond, std::size_t index, "
+                   << type << " nextValue, " << type << " mask) {\n";
+                os << "    if (!cond || mask == static_cast<" << type << ">(0)) {\n";
+                os << "        return false;\n";
                 os << "    }\n";
+                os << "    const auto base_ = domain_next_state" << suffix << "_touched_[index] ? domain_next_state"
+                   << suffix << "_shadow_[index] : state_->" << statePool << "[index];\n";
+                os << "    const auto merged_ = (mask == " << maxConstant << ") ? nextValue : static_cast<" << type
+                   << ">((base_ & static_cast<" << type << ">(~mask)) | (nextValue & mask));\n";
+                os << "    if (merged_ == base_) {\n";
+                os << "        return false;\n";
+                os << "    }\n";
+                os << "    domain_next_state" << suffix << "_shadow_[index] = merged_;\n";
+                os << "    domain_next_state" << suffix << "_touched_[index] = 1;\n";
+                os << "    if (!domain_next_state" << suffix << "_pending_flags_[index]) {\n";
+                os << "        domain_next_state" << suffix << "_pending_flags_[index] = 1;\n";
+                os << "        domain_next_state" << suffix << "_pending_indices_.push_back(index);\n";
+                os << "    }\n";
+                os << "    return true;\n";
+                os << "}\n\n";
+                os << "bool SSimTop::apply_domain_next_state" << suffix << "() {\n";
+                os << "    const bool applied_ = !domain_next_state" << suffix << "_pending_indices_.empty();\n";
+                os << "    for (const auto idx_ : domain_next_state" << suffix << "_pending_indices_) {\n";
+                os << "        state_->" << statePool << "[idx_] = domain_next_state" << suffix << "_shadow_[idx_];\n";
+                os << "    }\n";
+                os << "    return applied_;\n";
                 os << "}\n\n";
             };
             if (state.stateU8Count > 0) {
-                emitDomainNextScalarHelpers("U8", "stateU8");
+                emitDomainNextScalarHelpers("U8", "stateU8", "std::uint8_t", "UINT8_MAX");
             }
             if (state.stateU16Count > 0) {
-                emitDomainNextScalarHelpers("U16", "stateU16");
+                emitDomainNextScalarHelpers("U16", "stateU16", "std::uint16_t", "UINT16_MAX");
             }
             if (state.stateU32Count > 0) {
-                emitDomainNextScalarHelpers("U32", "stateU32");
+                emitDomainNextScalarHelpers("U32", "stateU32", "std::uint32_t", "UINT32_MAX");
             }
             if (state.stateU64Count > 0) {
-                emitDomainNextScalarHelpers("U64", "stateU64");
+                emitDomainNextScalarHelpers("U64", "stateU64", "std::uint64_t", "UINT64_MAX");
             }
             if (!state.stateVecWidths.empty()) {
                 os << "void SSimTop::prepare_domain_next_stateVec(std::size_t capacity) {\n";
@@ -7247,28 +7302,28 @@ namespace wolvrix::lib::emit
                                 if (pools.stateU8) {
                                     os << "        prepare_domain_next_stateU8(" << pools.stateU8 << "U);\n";
                                     commitLine += " apply_domain_next_stateU8();";
-                                    args.push_back("&domain_next_stateU8_scratch_");
+                                    args.push_back("nullptr");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateU16) {
                                     os << "        prepare_domain_next_stateU16(" << pools.stateU16 << "U);\n";
                                     commitLine += " apply_domain_next_stateU16();";
-                                    args.push_back("&domain_next_stateU16_scratch_");
+                                    args.push_back("nullptr");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateU32) {
                                     os << "        prepare_domain_next_stateU32(" << pools.stateU32 << "U);\n";
                                     commitLine += " apply_domain_next_stateU32();";
-                                    args.push_back("&domain_next_stateU32_scratch_");
+                                    args.push_back("nullptr");
                                 } else {
                                     args.push_back("nullptr");
                                 }
                                 if (pools.stateU64) {
                                     os << "        prepare_domain_next_stateU64(" << pools.stateU64 << "U);\n";
                                     commitLine += " apply_domain_next_stateU64();";
-                                    args.push_back("&domain_next_stateU64_scratch_");
+                                    args.push_back("nullptr");
                                 } else {
                                     args.push_back("nullptr");
                                 }
@@ -7730,22 +7785,28 @@ namespace wolvrix::lib::emit
                 std::string expr;
                 std::string pendingWrites;
                 std::string index;
+                std::string scalarStage;
+                std::string scalarMask;
             };
             auto targetStorage = [&](const std::string& regName) {
                 std::string expr = state.persistentStorageExpr(regName);
                 DomainNextTarget target{expr, "", ""};
                 if (writeRegsToDomainNextState) {
                     if (expr.rfind("state_->stateU8[", 0) == 0) {
-                        target.pendingWrites = "next_stateU8_";
+                        target.scalarStage = "stage_domain_next_stateU8";
+                        target.scalarMask = "UINT8_MAX";
                         target.index = expr.substr(std::string("state_->stateU8[").size());
                     } else if (expr.rfind("state_->stateU16[", 0) == 0) {
-                        target.pendingWrites = "next_stateU16_";
+                        target.scalarStage = "stage_domain_next_stateU16";
+                        target.scalarMask = "UINT16_MAX";
                         target.index = expr.substr(std::string("state_->stateU16[").size());
                     } else if (expr.rfind("state_->stateU32[", 0) == 0) {
-                        target.pendingWrites = "next_stateU32_";
+                        target.scalarStage = "stage_domain_next_stateU32";
+                        target.scalarMask = "UINT32_MAX";
                         target.index = expr.substr(std::string("state_->stateU32[").size());
                     } else if (expr.rfind("state_->stateU64[", 0) == 0) {
-                        target.pendingWrites = "next_stateU64_";
+                        target.scalarStage = "stage_domain_next_stateU64";
+                        target.scalarMask = "UINT64_MAX";
                         target.index = expr.substr(std::string("state_->stateU64[").size());
                     } else if (expr.rfind("state_->stateVec[", 0) == 0) {
                         target.pendingWrites = "next_stateVec_";
@@ -7759,6 +7820,10 @@ namespace wolvrix::lib::emit
             };
             auto domainNextWriteStmt = [&](const std::string& regName, const std::string& valueExpr, bool moveValue) {
                 const DomainNextTarget target = targetStorage(regName);
+                if (!target.scalarStage.empty()) {
+                    return target.scalarStage + "(true, static_cast<std::size_t>(" + target.index + "), " +
+                           (moveValue ? "std::move(" + valueExpr + ")" : valueExpr) + ", " + target.scalarMask + ")";
+                }
                 if (target.pendingWrites.empty()) {
                     return target.expr + " = " + (moveValue ? "std::move(" + valueExpr + ")" : valueExpr);
                 }
@@ -7971,8 +8036,8 @@ namespace wolvrix::lib::emit
                     delayedDirectWrites.emplace_back(
                         regName,
                         "if (" + parsed->condition + ") { const auto " + tempName + " = " + parsed->rhs +
-                        "; if (" + target.expr + " != " + tempName + ") { " +
-                        domainNextWriteStmt(regName, tempName, false) + "; committed_ = true; } }");
+                        "; if (" + domainNextWriteStmt(regName, tempName, false) +
+                        ") { committed_ = true; } }");
                     continue;
                 }
                 for (auto stmt : regStmtIt->second) {
@@ -8031,9 +8096,14 @@ namespace wolvrix::lib::emit
                     if (directWideWrite || directScalarWrite) {
                         continue;
                     }
+                    const DomainNextTarget target = targetStorage(regName);
                     if (wideReg) {
                         os << "        if (next_" << regName << "_updated_) { "
                            << domainNextWriteStmt(regName, "next_" + regName, true) << "; }\n";
+                    } else if (!target.scalarStage.empty()) {
+                        os << "        if (next_" << regName << "_updated_) { if ("
+                           << domainNextWriteStmt(regName, "next_" + regName, false)
+                           << ") { committed_ = true; } }\n";
                     } else {
                         os << "        if (next_" << regName << "_updated_) { "
                            << domainNextWriteStmt(regName, "next_" + regName, false) << "; }\n";

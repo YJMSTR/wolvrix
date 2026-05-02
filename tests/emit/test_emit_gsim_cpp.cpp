@@ -2986,6 +2986,133 @@ Design buildDirectEligibleRegisterWriteDesign()
     return design;
 }
 
+
+Design buildSparseGlobalSlotScalarPendingWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    const auto inD = makeValue(graph, "d", 8, false);
+    graph.bindInputPort("clk", clk);
+    graph.bindInputPort("d", inD);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    const auto padValue = makeConstant(graph, "pad_value", "pad_value_const", 8, "8'h11");
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+    makeRegisterWrite(graph, "q_write", one, inD, mask, clk, "q");
+
+    for (int i = 0; i < 600; ++i) {
+        const std::string sym = "m_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, mask, clk, sym);
+    }
+
+    (void)makeRegister(graph, "z_r_storage", "z_r_reg", 8, "z_r");
+    const auto rRead = makeRegisterRead(graph, "z_r_read", "z_r_read_op", 8, "z_r");
+    graph.bindOutputPort("r", rRead);
+    makeRegisterWrite(graph, "z_r_write", one, qRead, mask, clk, "z_r");
+
+    return design;
+}
+
+Design buildScalarNoopPendingWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto zero = makeConstant(graph, "zero", "zero_const", 8, "8'h00");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "q_write", one, zero, mask, clk, "q");
+
+    for (int i = 0; i < 520; ++i) {
+        const std::string sym = "noop_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, zero, mask, clk, sym);
+    }
+
+    return design;
+}
+
+
+Design buildDuplicateScalarTouchedPendingWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto first = makeConstant(graph, "first", "first_const", 8, "8'h11");
+    const auto second = makeConstant(graph, "second", "second_const", 8, "8'h22");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "q_first_write", one, first, mask, clk, "q");
+    makeRegisterWrite(graph, "q_second_write", one, second, mask, clk, "q");
+
+    const auto padValue = makeConstant(graph, "dup_pad_value", "dup_pad_value_const", 8, "8'h33");
+    for (int i = 0; i < 520; ++i) {
+        const std::string sym = "dup_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, mask, clk, sym);
+    }
+
+    return design;
+}
+
+Design buildOverlapMaskScalarTouchedPendingWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto lowFirst = makeConstant(graph, "low_first", "low_first_const", 8, "8'h05");
+    const auto high = makeConstant(graph, "high", "high_const", 8, "8'hb0");
+    const auto lowLast = makeConstant(graph, "low_last", "low_last_const", 8, "8'h0a");
+    const auto lowMask = makeConstant(graph, "low_mask", "low_mask_const", 8, "8'h0f");
+    const auto highMask = makeConstant(graph, "high_mask", "high_mask_const", 8, "8'hf0");
+    makeRegisterWrite(graph, "q_low_first_write", one, lowFirst, lowMask, clk, "q");
+    makeRegisterWrite(graph, "q_high_write", one, high, highMask, clk, "q");
+    makeRegisterWrite(graph, "q_low_last_write", one, lowLast, lowMask, clk, "q");
+
+    const auto padValue = makeConstant(graph, "overlap_pad_value", "overlap_pad_value_const", 8, "8'h44");
+    const auto padMask = makeConstant(graph, "overlap_pad_mask", "overlap_pad_mask_const", 8, "8'hff");
+    for (int i = 0; i < 520; ++i) {
+        const std::string sym = "overlap_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, padMask, clk, sym);
+    }
+
+    return design;
+}
+
 Design buildMultiChunkDirectEligibleRegisterWriteDesign()
 {
     Design design;
@@ -8665,6 +8792,242 @@ int main() {
     compileAndRunHarness(dir, "direct_commit_top", runner);
 }
 
+
+void testScalarPendingWriteUsesGlobalSlotStorageForSparseIndices()
+{
+    Design design = buildSparseGlobalSlotScalarPendingWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "scalar_sparse_global_slot";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("scalar_sparse_global_slot_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp sparse global-slot fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp sparse global-slot fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "prepare_domain_next_stateU8(602U)"),
+           "sparse global-slot fixture should reserve the current domain writes while the target slot remains sparse");
+    expect(contains(generatedSources, "static_cast<std::size_t>(601)"),
+           "sparse global-slot fixture should stage at an absolute U8 slot larger than the per-domain count");
+    expect(contains(generatedSources, "domain_next_stateU8_shadow_("),
+           "scalar touched helper storage should be initialized from the global U8 pool");
+    expect(contains(generatedSources, "stage_domain_next_stateU8("),
+           "scalar pending writes should stage through the touched helper");
+    expect(!contains(generatedSources, "next_stateU8_->emplace_back"),
+           "scalar pending writes should not append pair-vector entries after touched helper migration");
+
+    const std::string runner = R"CPP(
+#include "scalar_sparse_global_slot_top.hpp"
+#include <cstdint>
+
+static void tick(SSimTop& sim, std::uint8_t d) {
+    sim.set_d(d);
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    SSimTop sim;
+    tick(sim, 0x5a);
+    if (sim.get_q() != 0x5a || sim.get_r() != 0x00) {
+        return 1;
+    }
+    tick(sim, 0xa5);
+    if (sim.get_q() != 0xa5 || sim.get_r() != 0x5a) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "scalar_sparse_global_slot_top", runner);
+}
+
+void testScalarNoopPendingWriteDoesNotCommit()
+{
+    Design design = buildScalarNoopPendingWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "scalar_noop_no_commit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("scalar_noop_no_commit_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp scalar no-op fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp scalar no-op fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "if (stage_domain_next_stateU8("),
+           "scalar no-op staging should gate committed_ on the stage helper return");
+    expect(!contains(generatedSources, "next_stateU8_->emplace_back") &&
+               !contains(generatedSources, "emplace_back(static_cast<std::size_t>(0), delayed_direct_reg_q); committed_ = true"),
+           "scalar no-op staging should not use old append-plus-unconditional-commit code");
+
+    const std::string runner = R"CPP(
+#include "scalar_noop_no_commit_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0) {
+        return 1;
+    }
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "scalar_noop_no_commit_top", runner);
+}
+
+
+void testScalarTouchedDuplicateLastWrite()
+{
+    Design design = buildDuplicateScalarTouchedPendingWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "scalar_duplicate_last_write";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("scalar_duplicate_last_write_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp scalar duplicate fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp scalar duplicate fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "domain_next_stateU8_pending_flags_[index]") &&
+               contains(generatedSources, "domain_next_stateU8_pending_indices_.push_back(index)"),
+           "scalar touched helper should keep one unique pending slot even when a state is staged again");
+    expect(contains(generatedSources, "stage_domain_next_stateU8(true, static_cast<std::size_t>(0), next_reg_q"),
+           "scalar duplicate fixture should stage the final next value through touched scalar storage");
+    expect(!contains(generatedSources, "next_stateU8_->emplace_back"),
+           "scalar duplicate fixture should not use pair-vector scalar staging");
+
+    const std::string runner = R"CPP(
+#include "scalar_duplicate_last_write_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0x22) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "scalar_duplicate_last_write_top", runner);
+}
+
+void testScalarTouchedOverlapMaskMerge()
+{
+    Design design = buildOverlapMaskScalarTouchedPendingWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "scalar_overlap_mask_merge";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("scalar_overlap_mask_merge_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp scalar overlap-mask fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp scalar overlap-mask fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "next_reg_q_merged_ = ((next_reg_q)") &&
+               contains(generatedSources, "next_reg_q_updated_ = true"),
+           "overlapping masked scalar writes should compose through the local next-state value before one touched stage");
+    expect(countOccurrences(generatedSources, "stage_domain_next_stateU8(true, static_cast<std::size_t>(0), next_reg_q") == 1,
+           "overlapping masked scalar writes should stage one final touched value for q");
+    expect(!contains(generatedSources, "next_stateU8_->emplace_back"),
+           "overlapping masked scalar writes should not use pair-vector scalar staging");
+
+    const std::string runner = R"CPP(
+#include "scalar_overlap_mask_merge_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0xba) {
+        return 1;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "scalar_overlap_mask_merge_top", runner);
+}
+
 void testMultiChunkDirectEligibleWritesUseDomainNextStaging()
 {
     Design design = buildMultiChunkDirectEligibleRegisterWriteDesign();
@@ -8700,13 +9063,13 @@ void testMultiChunkDirectEligibleWritesUseDomainNextStaging()
     }
     expect(commitChunkCount > 1,
            "multi-chunk direct fixture should force more than one commit chunk in the same domain");
-    expect(contains(generatedSources, "domain_next_stateU8_scratch_.clear()") &&
-               contains(generatedSources, "&domain_next_stateU8_scratch_"),
-           "multi-chunk domains should stage scalar writes in a reusable domain-level next-state vector");
+    expect(contains(generatedSources, "domain_next_stateU8_pending_indices_.clear()") &&
+               contains(generatedSources, "stage_domain_next_stateU8("),
+           "multi-chunk domains should stage scalar writes through reusable touched pending storage");
     expect(contains(generatedSources, "const auto delayed_direct_reg_q0 = ((input_d_) & 255)"),
            "direct-eligible writes may skip per-register next locals only when the domain next-state vector exists");
-    expect(contains(generatedSources, "next_stateU8_->emplace_back"),
-           "direct-eligible multi-chunk writes should append to domain next-state rather than persistent state");
+    expect(contains(generatedSources, "if (stage_domain_next_stateU8(true"),
+           "direct-eligible multi-chunk writes should gate commit on touched scalar staging");
     expect(!contains(generatedSources, "auto next_reg_q0 = state_->stateU8["),
            "domain-next staged direct writes should avoid per-register next locals on the hot multi-chunk path");
 
@@ -8949,8 +9312,8 @@ void testMultiChunkMultiMaskedScalarRegisterWritesAppendOnce()
     expect(contains(generatedSources, "next_reg_q_merged_ = ((next_reg_q)") &&
                contains(generatedSources, "next_reg_q_updated_ = true"),
            "multi-chunk multi-masked scalar writes should still merge through a local next-state value");
-    expect(countOccurrences(generatedSources, "static_cast<std::size_t>(0), next_reg_q)") == 1,
-           "multi-chunk multi-masked scalar writes should append one sparse pending write per register per chunk");
+    expect(countOccurrences(generatedSources, "stage_domain_next_stateU8(true, static_cast<std::size_t>(0), next_reg_q") == 1,
+           "multi-chunk multi-masked scalar writes should stage one touched pending write per register per chunk");
     expect(countOccurrences(commitChunkSources, "if (chunk_updated_) { activate_shard_mask(") <= commitChunkCount,
            "multi-chunk register activity should be touched once per updated chunk rather than per write site");
     expect(countOccurrences(commitChunkSources, "chunk_updated_ = true; activate_shard_mask(") == 0,
@@ -9143,16 +9506,16 @@ void testMultiChunkRegisterWritesUseDomainNextState()
     }
     expect(contains(generatedSources, "prepare_domain_next_stateU8(") &&
                contains(generatedSources, "apply_domain_next_stateU8();"),
-           "multi-chunk register domains should prepare and apply sparse scalar next-state through helpers");
-    expect(contains(generatedSources, "void SSimTop::apply_domain_next_stateU8()") &&
-               contains(generatedSources, "state_->stateU8[write_.first] = write_.second"),
-           "scalar domain next-state helper should preserve sparse writeback semantics");
-    expect(contains(generatedSources, "next_stateU8_->emplace_back"),
-           "multi-chunk register chunk methods should append staged writes to the sparse domain next-state target");
-    expect(contains(generatedSources, "domain_next_stateU8_scratch_.reserve("),
-           "multi-chunk register domains should reserve reusable sparse pending storage by pool");
-    expect(contains(generatedSources, "next_stateU8_->emplace_back(static_cast<std::size_t>("),
-           "multi-chunk scalar register chunks should append touched scalar registers to the sparse domain target");
+           "multi-chunk register domains should prepare and apply touched scalar next-state through helpers");
+    expect(contains(generatedSources, "bool SSimTop::apply_domain_next_stateU8()") &&
+               contains(generatedSources, "state_->stateU8[idx_] = domain_next_stateU8_shadow_[idx_]"),
+           "scalar domain next-state helper should apply unique touched scalar slots");
+    expect(contains(generatedSources, "stage_domain_next_stateU8("),
+           "multi-chunk register chunk methods should stage scalar writes through the touched helper");
+    expect(contains(generatedSources, "domain_next_stateU8_pending_indices_.reserve("),
+           "multi-chunk register domains should reserve reusable touched pending storage by pool");
+    expect(contains(generatedSources, "stage_domain_next_stateU8(true, static_cast<std::size_t>("),
+           "multi-chunk scalar register chunks should stage touched scalar registers to the domain target");
 
     const std::string runner = R"CPP(
 #include "multi_chunk_reg_top.hpp"
@@ -9536,6 +9899,34 @@ int main()
             }
             if (name == "direct-eligible-commit-barrier") {
                 testDirectEligibleRegisterWriteUsesCommitBarrier();
+                return 0;
+            }
+            if (name == "scalar-touched-sparse-global-slot") {
+                testScalarPendingWriteUsesGlobalSlotStorageForSparseIndices();
+                return 0;
+            }
+            if (name == "scalar-touched-noop-does-not-commit") {
+                testScalarNoopPendingWriteDoesNotCommit();
+                return 0;
+            }
+            if (name == "scalar-touched-duplicate-last-write") {
+                testScalarTouchedDuplicateLastWrite();
+                return 0;
+            }
+            if (name == "scalar-touched-overlap-mask-merge") {
+                testScalarTouchedOverlapMaskMerge();
+                return 0;
+            }
+            if (name == "scalar-touched-direct-domain-next") {
+                testMultiChunkDirectEligibleWritesUseDomainNextStaging();
+                return 0;
+            }
+            if (name == "scalar-touched-derived-domain-next") {
+                testChainedDerivedClockEdgesReplayBetweenDerivedCommits();
+                return 0;
+            }
+            if (name == "scalar-touched-same-edge-old-value") {
+                testRegisterPipelineUsesNonBlockingSemantics();
                 return 0;
             }
             if (name == "multi-chunk-direct-domain-next") {
