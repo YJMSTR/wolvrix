@@ -5505,6 +5505,99 @@ int main() {
     compileAndRunHarness(dir, "dpic_cross_domain_top", runner);
 }
 
+void testGlobalPreNoDiffDpicDoesNotBlockRegisterCommit()
+{
+    Design design = buildDpicCrossDomainPreEdgeSnapshotDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "global_pre_no_diff_commit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("global_pre_no_diff_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "512";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp global-pre no-diff fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp global-pre no-diff fixture should not emit errors");
+
+    std::string generatedSources;
+    std::string globalPreChunk;
+    for (const auto &entry : std::filesystem::directory_iterator(dir))
+    {
+        if (!entry.is_regular_file() || entry.path().extension() != ".cpp")
+        {
+            continue;
+        }
+        const std::string source = readFile(entry.path());
+        generatedSources += source;
+        if (entry.path().filename().string().find("commit_chunk_global_pre_posedge_b_clk") != std::string::npos)
+        {
+            globalPreChunk += source;
+        }
+    }
+    expect(contains(generatedSources, "commit_chunk_global_pre_posedge_b_clk"),
+           "fixture should keep b-clock DPIC work in a global pre-edge chunk");
+    expect(contains(generatedSources, "commit_chunk_posedge_a_clk"),
+           "fixture should keep normal a-clock register commits in a register chunk");
+    expect(contains(globalPreChunk, "#ifndef CONFIG_NO_DIFFTEST") &&
+               contains(globalPreChunk, "v_difftest_TestEvent") &&
+               contains(globalPreChunk, "#endif"),
+           "global-pre DPIC chunk should compile out in no-diff builds");
+
+    std::ofstream stub(dir / "difftest-dpic.h");
+    if (!stub.is_open())
+    {
+        throw std::runtime_error("failed to write no-diff cross-domain dpic stub header");
+    }
+    stub << "#pragma once\n";
+    stub.close();
+
+    const std::string runner = R"CPP(
+#include "global_pre_no_diff_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_a_clk(0);
+    sim.set_b_clk(0);
+    sim.step();
+    if (sim.get_pc() != 0) {
+        return 1;
+    }
+
+    sim.set_a_clk(1);
+    sim.set_b_clk(1);
+    sim.step();
+    if (sim.get_pc() != 0x2a) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "global_pre_no_diff_top", runner, "-DCONFIG_NO_DIFFTEST");
+}
+
+void testRegisterPipelineUsesNonBlockingSemantics();
+void testDirectEligibleRegisterWriteUsesCommitBarrier();
+void testReplayOnlyEdgesBatchDirtyReplay();
+
+void runCommitStepSchedulerGuardTests()
+{
+    testSingleClockRuntimeCompileAndRun();
+    testDerivedClockEdgesSeePriorDomainCommits();
+    testRegisterPipelineUsesNonBlockingSemantics();
+    testDirectEligibleRegisterWriteUsesCommitBarrier();
+    testReplayOnlyEdgesBatchDirtyReplay();
+    testDpicUsesGlobalPreEdgeSnapshotAcrossDomains();
+    testGlobalPreNoDiffDpicDoesNotBlockRegisterCommit();
+}
+
 void testLatchReadNoOpCompileAndRun()
 {
     Design design = buildLatchReadNoOpDesign();
@@ -9298,6 +9391,34 @@ int main()
                 testGenericShardActivationPacksCrossWordRangesIndependently();
                 return 0;
             }
+            if (name == "single-clock-runtime") {
+                testSingleClockRuntimeCompileAndRun();
+                return 0;
+            }
+            if (name == "derived-clock-post-commit-replay") {
+                testDerivedClockEdgesSeePriorDomainCommits();
+                return 0;
+            }
+            if (name == "pipeline-nonblocking") {
+                testRegisterPipelineUsesNonBlockingSemantics();
+                return 0;
+            }
+            if (name == "replay-only-edge-batch") {
+                testReplayOnlyEdgesBatchDirtyReplay();
+                return 0;
+            }
+            if (name == "global-pre-dpic-ordering") {
+                testDpicUsesGlobalPreEdgeSnapshotAcrossDomains();
+                return 0;
+            }
+            if (name == "global-pre-no-diff-dpic") {
+                testGlobalPreNoDiffDpicDoesNotBlockRegisterCommit();
+                return 0;
+            }
+            if (name == "commit-step-scheduler-guards") {
+                runCommitStepSchedulerGuardTests();
+                return 0;
+            }
             if (name == "direct-eligible-commit-barrier") {
                 testDirectEligibleRegisterWriteUsesCommitBarrier();
                 return 0;
@@ -9378,6 +9499,7 @@ int main()
         testSettlePreservesDerivedClockInputEdges();
         testDpicSamplesPreEdgeSettledState();
         testDpicUsesGlobalPreEdgeSnapshotAcrossDomains();
+        testGlobalPreNoDiffDpicDoesNotBlockRegisterCommit();
         testLatchReadNoOpCompileAndRun();
         testLatchWriteCompileAndRun();
         testCoalescedLatchWritesCompileAndRun();
