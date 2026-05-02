@@ -541,6 +541,21 @@ void testGraphOnlyPathWritesMetadata()
     const auto *scheduleOrder = design.getScratchpad<std::vector<std::string>>("gsim.top.schedule.activity_order");
     const auto *scheduleMembers = design.getScratchpad<std::map<std::string, std::vector<int64_t>>>("gsim.top.schedule.activity_members");
     const auto *scheduleClasses = design.getScratchpad<std::map<std::string, std::string>>("gsim.top.schedule.activity_classes");
+    const auto *batchKind = design.getScratchpad<std::string>("gsim.top.schedule.batch.kind");
+    const auto *batchContract = design.getScratchpad<std::string>("gsim.top.schedule.batch.contract");
+    const auto *batchCount = design.getScratchpad<int64_t>("gsim.top.schedule.batch.count");
+    const auto *batchNames = design.getScratchpad<std::vector<std::string>>("gsim.top.schedule.batch.names");
+    const auto *batchClassIds = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.class_ids");
+    const auto *batchClassNames = design.getScratchpad<std::vector<std::string>>("gsim.top.schedule.batch.class_names");
+    const auto *batchFlags = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.flags");
+    const auto *batchTopoByPos = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.topo_batch_by_pos");
+    const auto *batchFirstTopoPos = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.first_topo_pos");
+    const auto *batchLastTopoPos = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.last_topo_pos");
+    const auto *batchOpCounts = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.op_counts");
+    const auto *batchSuccOffsets = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.succ_offsets");
+    const auto *batchSuccTargets = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.succ_targets");
+    const auto *batchEntryBatches = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.entry_batches");
+    const auto *batchEstimatedLines = design.getScratchpad<std::vector<int64_t>>("gsim.top.schedule.batch.estimated_lines");
     const auto *hyperKind = design.getScratchpad<std::string>("gsim.top.hypergraph.kind");
     const auto *hyperContract = design.getScratchpad<std::string>("gsim.top.hypergraph.contract");
     const auto *hyperNodes = design.getScratchpad<std::vector<std::string>>("gsim.top.hypergraph.node_names");
@@ -560,6 +575,48 @@ void testGraphOnlyPathWritesMetadata()
            "gsim should write schedule activity membership for stateful groups");
     expect(scheduleClasses != nullptr && scheduleClasses->at("activity.reg:clk") == "stateful",
            "gsim should classify register-driven activities as stateful");
+    expect(batchKind != nullptr && *batchKind == "activity-batch-v1",
+           "gsim should write concrete activity batch metadata kind");
+    expect(batchContract != nullptr && *batchContract == "gsim.activity.schedule_batch.v1",
+           "gsim should record the activity batch contract version");
+    expect(batchCount != nullptr && *batchCount == static_cast<int64_t>(scheduleOrder->size()),
+           "gsim should write one conservative batch per activity group initially");
+    expect(batchNames != nullptr && batchNames->size() == static_cast<std::size_t>(*batchCount),
+           "gsim should write stable batch names");
+    expect(batchClassIds != nullptr && batchClassIds->size() == batchNames->size(),
+           "gsim should write batch class ids");
+    expect(batchClassNames != nullptr && !batchClassNames->empty(),
+           "gsim should write batch class name dictionary");
+    expect(batchFlags != nullptr && batchFlags->size() == batchNames->size(),
+           "gsim should write batch flags");
+    expect(batchTopoByPos != nullptr && batchTopoByPos->size() == topo->size(),
+           "gsim should map every topo position to a batch ordinal");
+    expect(batchFirstTopoPos != nullptr && batchFirstTopoPos->size() == batchNames->size(),
+           "gsim should write first topo position per batch");
+    expect(batchLastTopoPos != nullptr && batchLastTopoPos->size() == batchNames->size(),
+           "gsim should write last topo position per batch");
+    expect(batchOpCounts != nullptr && batchOpCounts->size() == batchNames->size(),
+           "gsim should write op counts per batch");
+    expect(batchSuccOffsets != nullptr && batchSuccOffsets->size() == batchNames->size() + 1U,
+           "gsim should write CSR offsets for batch successors");
+    expect(batchSuccTargets != nullptr,
+           "gsim should write CSR targets for batch successors");
+    expect(batchEntryBatches != nullptr && !batchEntryBatches->empty(),
+           "gsim should write entry batches");
+    expect(batchEstimatedLines != nullptr && batchEstimatedLines->size() == batchNames->size(),
+           "gsim should write estimated lines per batch");
+    expect(std::all_of(batchTopoByPos->begin(), batchTopoByPos->end(), [&](int64_t batch) {
+               return batch >= 0 && batch < *batchCount;
+           }),
+           "gsim batch topo mapping should only reference valid batch ordinals");
+    expect(std::is_sorted(batchSuccOffsets->begin(), batchSuccOffsets->end()),
+           "gsim batch successor offsets should be sorted");
+    expect(batchSuccOffsets->back() == static_cast<int64_t>(batchSuccTargets->size()),
+           "gsim batch successor offsets should cover all targets");
+    expect(std::all_of(batchSuccTargets->begin(), batchSuccTargets->end(), [&](int64_t batch) {
+               return batch >= 0 && batch < *batchCount;
+           }),
+           "gsim batch successor targets should only reference valid batch ordinals");
     expect(hyperKind != nullptr && *hyperKind == "activity-connectivity-v1",
            "gsim should write concrete hypergraph metadata kind");
     expect(hyperContract != nullptr && *hyperContract == "gsim.activity.hypergraph.v1",

@@ -3897,6 +3897,153 @@ void testFailureOnStaleMetadataAfterDestructiveMutation()
     expectDiagnosticsContain(diags, "gsim scratchpad metadata is stale");
 }
 
+void testActivityBatchStatsModeEmitsStaticPlanFields()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "activity_batch_stats";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("activity_batch_stats_top");
+    options.topOverrides = {"top"};
+    options.attributes["activity_batch_mode"] = "stats";
+    options.attributes["activity_batch_stats"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "activity batch stats mode should emit with valid metadata");
+    expect(!diags.hasError(), "activity batch stats mode should not emit diagnostics");
+
+    const std::string header = readFile(dir / "activity_batch_stats_top.hpp");
+    const std::string source = readFile(dir / "activity_batch_stats_top.cpp");
+    expect(contains(header, "activity_batch_mode"), "metadata should expose activity batch mode");
+    expect(contains(header, "activity_batch_count"), "metadata should expose activity batch count");
+    expect(contains(header, "activity_supernode_body_count"), "metadata should expose activity supernode body count");
+    expect(contains(source, "metadata.activity_batch_mode = \"stats\";"), "source should record stats mode");
+    expect(contains(source, "metadata.activity_batch_metadata_present = true;"), "source should record batch metadata presence");
+    expect(contains(source, "metadata.activity_batch_fallback_reason = \"none\";"), "source should record no fallback");
+    expect(contains(source, "activity_batch_plan"), "source should emit activity batch plan stats line");
+    expect(contains(source, "activity_batch_stats"), "source should emit activity batch runtime stats line");
+}
+
+void testActivityBatchDispatchRequiresMetadata()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+    design.eraseScratchpadNamespace("gsim.top.schedule.batch.");
+
+    const auto dir = artifactRoot() / "activity_batch_missing_dispatch";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+    options.attributes["activity_batch_mode"] = "dispatch";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "activity batch dispatch mode should require batch metadata");
+    expect(diags.hasError(), "missing batch metadata should produce diagnostics");
+    expectDiagnosticsContain(diags, "missing required gsim activity batch metadata");
+}
+
+void testActivityBatchRejectsPartialMetadata()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+    design.eraseScratchpadNamespace("gsim.top.schedule.batch.");
+    design.setScratchpad(std::string("gsim.top.schedule.batch.kind"), std::string("activity-batch-v1"));
+
+    const auto dir = artifactRoot() / "activity_batch_partial";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(!result.success, "partial activity batch metadata should fail in every mode");
+    expect(diags.hasError(), "partial activity batch metadata should produce diagnostics");
+    expectDiagnosticsContain(diags, ".schedule.batch.version");
+}
+
+void testActivityBatchDispatchEmitsParityQueue()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "activity_batch_dispatch";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("activity_batch_dispatch_top");
+    options.topOverrides = {"top"};
+    options.attributes["activity_batch_mode"] = "dispatch";
+    options.attributes["activity_batch_stats"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "activity batch dispatch mode should emit with valid metadata");
+    expect(!diags.hasError(), "activity batch dispatch mode should not emit diagnostics");
+
+    const std::string header = readFile(dir / "activity_batch_dispatch_top.hpp");
+    const std::string source = readFile(dir / "activity_batch_dispatch_top.cpp");
+    expect(contains(header, "activate_batch_mask"),
+           "dispatch mode should expose a batch active-unit queue");
+    expect(contains(header, "run_active_batch_word_"),
+           "dispatch mode should declare batch word dispatch bodies");
+    expect(contains(source, "metadata.activity_batch_dispatch_enabled = true;"),
+           "dispatch mode should record dispatch-enabled static metadata");
+    expect(contains(source, "active_batch_word_queue_"),
+           "dispatch mode should use batch queue storage at runtime");
+    expect(contains(source, "run_active_batch_word_") && contains(source, "sched_"),
+           "parity batch bodies should project batches onto existing sched shard calls");
+    expect(contains(source, "activate_batch_mask(") && contains(source, "activity_batch_successor_edges_step_"),
+           "batch dispatch should activate successors from batch CSR and update runtime counters");
+}
+
+void testActivityBatchMetadataToggleKeepsPublicMetadataLight()
+{
+    Design design = buildSingleGraphDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "activity_batch_metadata_toggle";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("activity_batch_toggle_top");
+    options.topOverrides = {"top"};
+    options.attributes["emit_metadata"] = "0";
+    options.attributes["activity_batch_mode"] = "stats";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "activity batch metadata toggle fixture should succeed");
+    expect(!diags.hasError(), "activity batch metadata toggle fixture should not emit errors");
+
+    const std::string header = readFile(dir / "activity_batch_toggle_top.hpp");
+    const std::string source = readFile(dir / "activity_batch_toggle_top.cpp");
+    expect(contains(header, "activity_batch_count"),
+           "emit_metadata=0 should retain light activity batch stats fields");
+    expect(!contains(header, "schedule_batch_topo_batch_by_pos"),
+           "emit_metadata=0 should omit heavyweight batch arrays from the public metadata struct");
+    expect(contains(source, "metadata.activity_batch_count = "),
+           "emit_metadata=0 should still populate light activity batch stats fields");
+    expect(!contains(source, "metadata.schedule_batch_topo_batch_by_pos"),
+           "emit_metadata=0 should not populate heavyweight batch arrays");
+}
+
 void seedSingleCombGsimScratchpad(Design &design,
                                   const Graph &graph,
                                   OperationId op,
@@ -10090,6 +10237,27 @@ int main()
                 testScalarTouchedPendingWriteRuntimeStatsEmission();
                 return 0;
             }
+            if (name == "activity-batch-stats-mode") {
+                testActivityBatchStatsModeEmitsStaticPlanFields();
+                return 0;
+            }
+            if (name == "activity-batch-dispatch-requires-metadata") {
+                testActivityBatchDispatchRequiresMetadata();
+                return 0;
+            }
+            if (name == "activity-batch-partial-metadata") {
+                testActivityBatchRejectsPartialMetadata();
+                return 0;
+            }
+            if (name == "activity-batch-metadata-toggle") {
+                testActivityBatchMetadataToggleKeepsPublicMetadataLight();
+        testActivityBatchDispatchEmitsParityQueue();
+                return 0;
+            }
+            if (name == "activity-batch-dispatch-parity") {
+                testActivityBatchDispatchEmitsParityQueue();
+                return 0;
+            }
             if (name == "scalar-touched-duplicate-last-write") {
                 testScalarTouchedDuplicateLastWrite();
                 return 0;
@@ -10159,6 +10327,10 @@ int main()
         testFailureOnNamespacePathMismatch();
         testFailureOnStaleMetadataAfterMutation();
         testFailureOnStaleMetadataAfterDestructiveMutation();
+        testActivityBatchStatsModeEmitsStaticPlanFields();
+        testActivityBatchDispatchRequiresMetadata();
+        testActivityBatchRejectsPartialMetadata();
+        testActivityBatchMetadataToggleKeepsPublicMetadataLight();
         testFailureOnUninlinedInstance();
         testGraphOnlyAndMultiHopTargetSelectionConsistency();
         testCrossRootInstancePathsStayDistinct();

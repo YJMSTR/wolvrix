@@ -277,6 +277,25 @@ namespace wolvrix::lib::emit
             std::set<int> dpicPreSettleShards;
             int dpicGlobalWarmupSteps = 0;
             bool enablePendingWriteStats = false;
+            bool enableActivityBatchStats = false;
+            std::string activityBatchMode = "legacy";
+            std::string activityBatchFallbackReason = "none";
+            bool activityBatchMetadataPresent = false;
+            bool activityBatchMetadataValid = false;
+            bool activityBatchDispatchEnabled = false;
+            int64_t activityBatchCount = 0;
+            int64_t activityBatchAvgOps = 0;
+            int64_t activityBatchMaxOps = 0;
+            int64_t activityBatchAvgEstimatedLines = 0;
+            int64_t activityBatchMaxEstimatedLines = 0;
+            int64_t activityBatchMaxSuccessorFanout = 0;
+            int64_t activityBatchSuccessorEdges = 0;
+            int64_t activityBatchEntryCount = 0;
+            int64_t activitySupernodeActiveWords = 0;
+            int64_t activitySupernodeBodyCount = 0;
+            int64_t activitySupernodeShardCount = 0;
+            int64_t activityBatchToShardMinSpan = 0;
+            int64_t activityBatchToShardMaxSpan = 0;
 
             bool shouldTraceDpicTarget(std::string_view target) const
             {
@@ -336,6 +355,7 @@ namespace wolvrix::lib::emit
             std::vector<int> opProducerFirstShardByIndex;
             std::vector<int> opProducerLastShardByIndex;
             std::vector<std::int32_t> opActivityOrdinalByIndex;
+            std::vector<std::int32_t> opBatchOrdinalByIndex;
             std::vector<std::uint8_t> activityClassBitsByOrdinal;
             std::vector<std::int64_t> dirtyReplayProducerOpSeeds;
             std::vector<std::set<int>> shardSuccessors;
@@ -343,6 +363,7 @@ namespace wolvrix::lib::emit
             std::vector<std::string> currentOpDirectActivitySources;
             int currentOpActivityFirstShard = -1;
             int currentOpActivityOrdinal = -1;
+            int currentOpBatchOrdinal = -1;
             std::uint8_t currentOpActivityClassBit = 0;
             int currentOpFirstEmittedShard = -1;
             int lastEmittedShard = -1;
@@ -350,6 +371,8 @@ namespace wolvrix::lib::emit
             std::uint8_t currentShardActivityClassMask = 0;
             std::unordered_map<std::string, int> activitySourceFirstShard;
             std::unordered_map<std::string, std::set<int>> activitySourceHeadShards;
+            std::unordered_map<std::string, std::set<int>> activitySourceHeadBatches;
+            std::vector<std::pair<int64_t, int64_t>> activityBatchShardSpans;
             std::size_t changeFanoutTokenCount = 0;
 
             void resetCurrentShardActivityBoundaryState() {
@@ -409,7 +432,11 @@ namespace wolvrix::lib::emit
 
             void setCurrentOpActivity(std::uint32_t opIndex) {
                 currentOpActivityOrdinal = -1;
+                currentOpBatchOrdinal = -1;
                 currentOpActivityClassBit = 0;
+                if (opIndex < opBatchOrdinalByIndex.size()) {
+                    currentOpBatchOrdinal = opBatchOrdinalByIndex[opIndex];
+                }
                 if (opIndex >= opActivityOrdinalByIndex.size()) {
                     return;
                 }
@@ -519,6 +546,11 @@ namespace wolvrix::lib::emit
                             it->second = currentShard;
                         }
                         activitySourceHeadShards[source].insert(currentShard);
+                    }
+                }
+                if (activityBatchDispatchEnabled && currentOpBatchOrdinal >= 0) {
+                    for (const auto& source : currentOpDirectActivitySources) {
+                        activitySourceHeadBatches[source].insert(currentOpBatchOrdinal);
                     }
                 }
             }
@@ -2259,6 +2291,26 @@ namespace wolvrix::lib::emit
         // Forward declaration
         struct GsimScratchpadMetadata;
 
+        struct GsimScheduleBatchMetadata
+        {
+            std::string kind;
+            int64_t version = 0;
+            std::string contract;
+            int64_t count = 0;
+            std::vector<std::string> names;
+            std::vector<int64_t> classIds;
+            std::vector<std::string> classNames;
+            std::vector<int64_t> flags;
+            std::vector<int64_t> topoBatchByPos;
+            std::vector<int64_t> firstTopoPos;
+            std::vector<int64_t> lastTopoPos;
+            std::vector<int64_t> opCounts;
+            std::vector<int64_t> succOffsets;
+            std::vector<int64_t> succTargets;
+            std::vector<int64_t> entryBatches;
+            std::vector<int64_t> estimatedLines;
+        };
+
         // Lower a single operation to C++
         void lowerOperation(
             const wolvrix::lib::grh::Graph& graph,
@@ -2397,7 +2449,7 @@ namespace wolvrix::lib::emit
             state.currentOpFirstEmittedShard = -1;
             state.setCurrentOpActivity(opId.index);
             state.maybeCutShardForCurrentOpActivity();
-            if (state.enableActivityWatermark) {
+            if (state.enableActivityWatermark || state.activityBatchDispatchEnabled) {
                 state.setCurrentActivity(std::move(directActivitySources), opActivityFirstShard);
             } else {
                 state.setCurrentActivity({}, -1);
@@ -4609,6 +4661,7 @@ namespace wolvrix::lib::emit
             std::string graphSymbol;
             int64_t opCount = 0;
             int64_t graphRevision = 0;
+            std::optional<GsimScheduleBatchMetadata> scheduleBatch;
         };
 
         std::optional<std::string> attrValue(const EmitOptions &options, std::string_view key)
@@ -4927,6 +4980,246 @@ namespace wolvrix::lib::emit
                 }
             }
 
+            const std::vector<std::string_view> batchSuffixes = {
+                ".schedule.batch.kind",
+                ".schedule.batch.version",
+                ".schedule.batch.contract",
+                ".schedule.batch.count",
+                ".schedule.batch.names",
+                ".schedule.batch.class_ids",
+                ".schedule.batch.class_names",
+                ".schedule.batch.flags",
+                ".schedule.batch.topo_batch_by_pos",
+                ".schedule.batch.first_topo_pos",
+                ".schedule.batch.last_topo_pos",
+                ".schedule.batch.op_counts",
+                ".schedule.batch.succ_offsets",
+                ".schedule.batch.succ_targets",
+                ".schedule.batch.entry_batches",
+                ".schedule.batch.estimated_lines",
+            };
+            bool hasBatchMetadata = false;
+            for (const auto suffix : batchSuffixes)
+            {
+                if (design.hasScratchpad(scratchPrefix + std::string(suffix)))
+                {
+                    hasBatchMetadata = true;
+                    break;
+                }
+            }
+            if (hasBatchMetadata)
+            {
+                const auto *batchKind = design.getScratchpad<std::string>(scratchPrefix + ".schedule.batch.kind");
+                const auto *batchVersion = design.getScratchpad<int64_t>(scratchPrefix + ".schedule.batch.version");
+                const auto *batchContract = design.getScratchpad<std::string>(scratchPrefix + ".schedule.batch.contract");
+                const auto *batchCount = design.getScratchpad<int64_t>(scratchPrefix + ".schedule.batch.count");
+                const auto *batchNames = design.getScratchpad<std::vector<std::string>>(scratchPrefix + ".schedule.batch.names");
+                const auto *batchClassIds = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.class_ids");
+                const auto *batchClassNames = design.getScratchpad<std::vector<std::string>>(scratchPrefix + ".schedule.batch.class_names");
+                const auto *batchFlags = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.flags");
+                const auto *batchTopoByPos = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.topo_batch_by_pos");
+                const auto *batchFirstTopoPos = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.first_topo_pos");
+                const auto *batchLastTopoPos = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.last_topo_pos");
+                const auto *batchOpCounts = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.op_counts");
+                const auto *batchSuccOffsets = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.succ_offsets");
+                const auto *batchSuccTargets = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.succ_targets");
+                const auto *batchEntryBatches = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.entry_batches");
+                const auto *batchEstimatedLines = design.getScratchpad<std::vector<int64_t>>(scratchPrefix + ".schedule.batch.estimated_lines");
+
+                bool batchOk = true;
+                batchOk = require(batchKind, ".schedule.batch.kind", "string") && batchOk;
+                batchOk = require(batchVersion, ".schedule.batch.version", "int64_t") && batchOk;
+                batchOk = require(batchContract, ".schedule.batch.contract", "string") && batchOk;
+                batchOk = require(batchCount, ".schedule.batch.count", "int64_t") && batchOk;
+                batchOk = require(batchNames, ".schedule.batch.names", "vector<string>") && batchOk;
+                batchOk = require(batchClassIds, ".schedule.batch.class_ids", "vector<int64_t>") && batchOk;
+                batchOk = require(batchClassNames, ".schedule.batch.class_names", "vector<string>") && batchOk;
+                batchOk = require(batchFlags, ".schedule.batch.flags", "vector<int64_t>") && batchOk;
+                batchOk = require(batchTopoByPos, ".schedule.batch.topo_batch_by_pos", "vector<int64_t>") && batchOk;
+                batchOk = require(batchFirstTopoPos, ".schedule.batch.first_topo_pos", "vector<int64_t>") && batchOk;
+                batchOk = require(batchLastTopoPos, ".schedule.batch.last_topo_pos", "vector<int64_t>") && batchOk;
+                batchOk = require(batchOpCounts, ".schedule.batch.op_counts", "vector<int64_t>") && batchOk;
+                batchOk = require(batchSuccOffsets, ".schedule.batch.succ_offsets", "vector<int64_t>") && batchOk;
+                batchOk = require(batchSuccTargets, ".schedule.batch.succ_targets", "vector<int64_t>") && batchOk;
+                batchOk = require(batchEntryBatches, ".schedule.batch.entry_batches", "vector<int64_t>") && batchOk;
+                batchOk = require(batchEstimatedLines, ".schedule.batch.estimated_lines", "vector<int64_t>") && batchOk;
+                if (!batchOk)
+                {
+                    return std::nullopt;
+                }
+
+                GsimScheduleBatchMetadata batch{*batchKind,
+                                                 *batchVersion,
+                                                 *batchContract,
+                                                 *batchCount,
+                                                 *batchNames,
+                                                 *batchClassIds,
+                                                 *batchClassNames,
+                                                 *batchFlags,
+                                                 *batchTopoByPos,
+                                                 *batchFirstTopoPos,
+                                                 *batchLastTopoPos,
+                                                 *batchOpCounts,
+                                                 *batchSuccOffsets,
+                                                 *batchSuccTargets,
+                                                 *batchEntryBatches,
+                                                 *batchEstimatedLines};
+                if (batch.kind != "activity-batch-v1" || batch.contract != "gsim.activity.schedule_batch.v1" || batch.version <= 0)
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + " schedule batch metadata contract mismatch");
+                    return std::nullopt;
+                }
+                if (batch.count < 0)
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + ".schedule.batch.count must be non-negative");
+                    return std::nullopt;
+                }
+                const auto batchSize = static_cast<std::size_t>(batch.count);
+                auto requireBatchSize = [&](const auto &items, std::string_view suffix) -> bool
+                {
+                    if (items.size() == batchSize)
+                    {
+                        return true;
+                    }
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + std::string(suffix) + " size must match schedule.batch.count");
+                    return false;
+                };
+                if (!requireBatchSize(batch.names, ".schedule.batch.names") ||
+                    !requireBatchSize(batch.classIds, ".schedule.batch.class_ids") ||
+                    !requireBatchSize(batch.flags, ".schedule.batch.flags") ||
+                    !requireBatchSize(batch.firstTopoPos, ".schedule.batch.first_topo_pos") ||
+                    !requireBatchSize(batch.lastTopoPos, ".schedule.batch.last_topo_pos") ||
+                    !requireBatchSize(batch.opCounts, ".schedule.batch.op_counts") ||
+                    !requireBatchSize(batch.estimatedLines, ".schedule.batch.estimated_lines"))
+                {
+                    return std::nullopt;
+                }
+                if (batch.classNames.empty())
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + ".schedule.batch.class_names must not be empty");
+                    return std::nullopt;
+                }
+                if (batch.topoBatchByPos.size() != metadata.topoOrder.size() ||
+                    batch.topoBatchByPos.size() != static_cast<std::size_t>(metadata.opCount))
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + ".schedule.batch.topo_batch_by_pos must cover topology.order");
+                    return std::nullopt;
+                }
+                if (batch.succOffsets.size() != batchSize + 1U || batch.succOffsets.empty() || batch.succOffsets.front() != 0)
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + ".schedule.batch.succ_offsets must have count+1 entries starting at zero");
+                    return std::nullopt;
+                }
+                std::vector<int64_t> observedCounts(batchSize, 0);
+                for (std::size_t pos = 0; pos < batch.topoBatchByPos.size(); ++pos)
+                {
+                    const auto batchOrdinal = batch.topoBatchByPos[pos];
+                    if (batchOrdinal < 0 || static_cast<std::size_t>(batchOrdinal) >= batchSize)
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch.topo_batch_by_pos references invalid batch ordinal");
+                        return std::nullopt;
+                    }
+                    ++observedCounts[static_cast<std::size_t>(batchOrdinal)];
+                    const auto first = batch.firstTopoPos[static_cast<std::size_t>(batchOrdinal)];
+                    const auto last = batch.lastTopoPos[static_cast<std::size_t>(batchOrdinal)];
+                    if (first < 0 || last < first || static_cast<std::size_t>(first) > pos || pos > static_cast<std::size_t>(last))
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch first/last topo positions do not cover topo_batch_by_pos");
+                        return std::nullopt;
+                    }
+                }
+                for (std::size_t batchOrdinal = 0; batchOrdinal < batchSize; ++batchOrdinal)
+                {
+                    if (batch.opCounts[batchOrdinal] != observedCounts[batchOrdinal])
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch.op_counts must match topo_batch_by_pos");
+                        return std::nullopt;
+                    }
+                    if (batch.classIds[batchOrdinal] < 0 ||
+                        static_cast<std::size_t>(batch.classIds[batchOrdinal]) >= batch.classNames.size())
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch.class_ids references invalid class name");
+                        return std::nullopt;
+                    }
+                    if (batch.estimatedLines[batchOrdinal] < 0)
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch.estimated_lines must be non-negative");
+                        return std::nullopt;
+                    }
+                }
+                for (std::size_t i = 1; i < batch.succOffsets.size(); ++i)
+                {
+                    if (batch.succOffsets[i] < batch.succOffsets[i - 1])
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch.succ_offsets must be monotonic");
+                        return std::nullopt;
+                    }
+                }
+                if (batch.succOffsets.back() != static_cast<int64_t>(batch.succTargets.size()))
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + ".schedule.batch.succ_offsets must cover succ_targets");
+                    return std::nullopt;
+                }
+                for (std::size_t batchOrdinal = 0; batchOrdinal < batchSize; ++batchOrdinal)
+                {
+                    std::set<int64_t> seenTargets;
+                    const auto begin = batch.succOffsets[batchOrdinal];
+                    const auto end = batch.succOffsets[batchOrdinal + 1U];
+                    for (int64_t index = begin; index < end; ++index)
+                    {
+                        const auto target = batch.succTargets[static_cast<std::size_t>(index)];
+                        if (target < 0 || static_cast<std::size_t>(target) >= batchSize)
+                        {
+                            reportError("gsim scratchpad metadata is malformed",
+                                        scratchPrefix + ".schedule.batch.succ_targets references invalid batch ordinal");
+                            return std::nullopt;
+                        }
+                        if (target == static_cast<int64_t>(batchOrdinal))
+                        {
+                            reportError("gsim scratchpad metadata is malformed",
+                                        scratchPrefix + ".schedule.batch.succ_targets must not contain self edges");
+                            return std::nullopt;
+                        }
+                        if (!seenTargets.insert(target).second)
+                        {
+                            reportError("gsim scratchpad metadata is malformed",
+                                        scratchPrefix + ".schedule.batch.succ_targets must not contain duplicate targets");
+                            return std::nullopt;
+                        }
+                    }
+                }
+                if (!std::is_sorted(batch.entryBatches.begin(), batch.entryBatches.end()) ||
+                    std::adjacent_find(batch.entryBatches.begin(), batch.entryBatches.end()) != batch.entryBatches.end())
+                {
+                    reportError("gsim scratchpad metadata is malformed",
+                                scratchPrefix + ".schedule.batch.entry_batches must be sorted and unique");
+                    return std::nullopt;
+                }
+                for (const auto entry : batch.entryBatches)
+                {
+                    if (entry < 0 || static_cast<std::size_t>(entry) >= batchSize)
+                    {
+                        reportError("gsim scratchpad metadata is malformed",
+                                    scratchPrefix + ".schedule.batch.entry_batches references invalid batch ordinal");
+                        return std::nullopt;
+                    }
+                }
+                metadata.scheduleBatch = std::move(batch);
+            }
+
             return metadata;
         }
 
@@ -5012,6 +5305,24 @@ namespace wolvrix::lib::emit
                 return true;
             }
             return defaultValue;
+        }
+
+        std::string parseActivityBatchMode(const EmitOptions &options)
+        {
+            const auto value = attrValue(options, "activity_batch_mode");
+            if (!value)
+            {
+                return "legacy";
+            }
+            std::string lowered = *value;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
+            if (lowered == "legacy" || lowered == "stats" || lowered == "dispatch" || lowered == "strict_dispatch")
+            {
+                return lowered;
+            }
+            return "invalid";
         }
 
         int parsePositiveIntAttr(const EmitOptions &options, std::string_view key, int defaultValue)
@@ -6110,6 +6421,17 @@ namespace wolvrix::lib::emit
                 sequentialClockInputs.insert(resolveSequentialClockStateName(parsedDomain->second, state.inputPorts));
             }
             auto emitActivateSourceInline = [&](const std::string& sourceKey) {
+                if (state.activityBatchDispatchEnabled) {
+                    if (const auto headsIt = state.activitySourceHeadBatches.find(sourceKey);
+                        headsIt != state.activitySourceHeadBatches.end() && !headsIt->second.empty()) {
+                        for (const auto& [word, mask] : shardWordMasksFor(headsIt->second)) {
+                            os << " activate_batch_mask(" << word << "U, UINT64_C(" << mask << "));";
+                        }
+                    } else {
+                        os << " activate_all_batches();";
+                    }
+                    return;
+                }
                 if (!state.enableSharding || !state.enableActivityWatermark || state.shardCount() <= 0) {
                     return;
                 }
@@ -6213,6 +6535,15 @@ namespace wolvrix::lib::emit
                     if (!state.changedFanoutRanges.empty()) {
                         os << "    void activate_changed_fanout(std::uint32_t fanout);\n";
                     }
+                    if (state.activityBatchDispatchEnabled) {
+                        os << "    void activate_all_batches();\n";
+                        os << "    void activate_batch(std::uint32_t batch);\n";
+                        os << "    void activate_batch_mask(std::uint32_t word, std::uint64_t mask);\n";
+                        const int activeBatchWordCount = static_cast<int>((state.activityBatchCount + 63) / 64);
+                        for (int word = 0; word < activeBatchWordCount; ++word) {
+                            os << "    void run_active_batch_word_" << word << "(std::uint64_t& active_bits_);\n";
+                        }
+                    }
                     const int activeWordCount = (state.shardCount() + 63) / 64;
                     for (int word = 0; word < activeWordCount; ++word) {
                         os << "    void run_active_shard_word_" << word << "(std::uint64_t& active_bits_);\n";
@@ -6306,6 +6637,24 @@ namespace wolvrix::lib::emit
                 os << "    std::uint64_t vector_pending_apply_calls_ = 0;\n";
                 os << "    std::uint64_t vector_pending_apply_entries_ = 0;\n";
             }
+            if (state.enableActivityBatchStats) {
+                os << "    void init_activity_batch_stats();\n";
+                os << "    void report_activity_batch_stats();\n";
+                os << "    bool activity_batch_stats_enabled_ = false;\n";
+                os << "    std::uint64_t activity_batch_stats_interval_ = 50;\n";
+                os << "    std::uint64_t activity_batch_steps_ = 0;\n";
+                os << "    std::uint64_t activity_batch_activated_batches_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_executed_batches_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_executed_bodies_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_activated_words_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_queue_max_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_successor_edges_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_suffix_fallbacks_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_full_replays_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_class_comb_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_class_stateful_step_ = 0;\n";
+                os << "    std::uint64_t activity_batch_class_sidefx_step_ = 0;\n";
+            }
             if (!state.stateVecWidths.empty()) {
                 os << "    void prepare_domain_next_stateVec(std::size_t capacity);\n";
                 os << "    void apply_domain_next_stateVec();\n";
@@ -6320,6 +6669,11 @@ namespace wolvrix::lib::emit
                 os << "    std::vector<std::uint64_t> active_shard_words_;\n";
                 os << "    std::vector<std::uint8_t> active_word_queued_;\n";
                 os << "    std::vector<std::uint32_t> active_word_queue_;\n";
+            }
+            if (state.activityBatchDispatchEnabled) {
+                os << "    std::vector<std::uint64_t> active_batch_words_;\n";
+                os << "    std::vector<std::uint8_t> active_batch_word_queued_;\n";
+                os << "    std::vector<std::uint32_t> active_batch_word_queue_;\n";
             }
             for (const auto &chunk : sequentialChunks) {
                 os << "    void " << chunk.methodName
@@ -6351,6 +6705,24 @@ namespace wolvrix::lib::emit
             os << "    std::string scratchpad_namespace;\n";
             os << "    std::int64_t op_count = 0;\n";
             os << "    std::int64_t graph_revision = 0;\n";
+            os << "    std::string activity_batch_mode;\n";
+            os << "    bool activity_batch_metadata_present = false;\n";
+            os << "    bool activity_batch_metadata_valid = false;\n";
+            os << "    std::string activity_batch_fallback_reason;\n";
+            os << "    std::int64_t activity_batch_count = 0;\n";
+            os << "    std::int64_t activity_batch_avg_ops = 0;\n";
+            os << "    std::int64_t activity_batch_max_ops = 0;\n";
+            os << "    std::int64_t activity_batch_avg_estimated_lines = 0;\n";
+            os << "    std::int64_t activity_batch_max_estimated_lines = 0;\n";
+            os << "    std::int64_t activity_batch_max_successor_fanout = 0;\n";
+            os << "    std::int64_t activity_batch_successor_edges = 0;\n";
+            os << "    std::int64_t activity_batch_entry_count = 0;\n";
+            os << "    std::int64_t activity_supernode_active_words = 0;\n";
+            os << "    std::int64_t activity_supernode_body_count = 0;\n";
+            os << "    std::int64_t activity_supernode_shard_count = 0;\n";
+            os << "    std::int64_t activity_batch_to_shard_min_span = 0;\n";
+            os << "    std::int64_t activity_batch_to_shard_max_span = 0;\n";
+            os << "    bool activity_batch_dispatch_enabled = false;\n";
             if (emitMetadata)
             {
                 os << "    std::vector<std::int64_t> roots;\n";
@@ -6376,6 +6748,18 @@ namespace wolvrix::lib::emit
                 os << "    std::string hypergraph_kind;\n";
                 os << "    std::int64_t hypergraph_version = 0;\n";
                 os << "    std::string hypergraph_contract;\n";
+                os << "    std::vector<std::string> schedule_batch_names;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_class_ids;\n";
+                os << "    std::vector<std::string> schedule_batch_class_names;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_flags;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_topo_batch_by_pos;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_first_topo_pos;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_last_topo_pos;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_op_counts;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_succ_offsets;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_succ_targets;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_entry_batches;\n";
+                os << "    std::vector<std::int64_t> schedule_batch_estimated_lines;\n";
             }
             os << "};\n\n";
             os << structName << " make_" << sanitizeIdentifier(target.scratchGraphSymbol) << "_metadata();\n";
@@ -6479,7 +6863,7 @@ namespace wolvrix::lib::emit
             std::string internalHeader = std::filesystem::path(std::string(headerFilename)).stem().string() + "_internal.hpp";
             os << "#include \"" << internalHeader << "\"\n\n";
             os << "#include <algorithm>\n";
-            if (state.enablePendingWriteStats) {
+            if (state.enablePendingWriteStats || state.enableActivityBatchStats) {
                 os << "#include <cstdio>\n";
                 os << "#include <cstdlib>\n";
             }
@@ -6491,7 +6875,7 @@ namespace wolvrix::lib::emit
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "#include <set>\n\n";
-            if (state.enablePendingWriteStats) {
+            if (state.enablePendingWriteStats || state.enableActivityBatchStats) {
                 os << "namespace {\n";
                 os << "bool wolvrix_gsim_env_truthy(const char* value) {\n";
                 os << "    if (value == nullptr || *value == '\\0') { return false; }\n";
@@ -6664,8 +7048,20 @@ namespace wolvrix::lib::emit
                 appendCtorInit("active_word_queued_((" + std::to_string(state.shardCount()) + "U + 63U) / 64U, 0)");
                 appendCtorInit("active_word_queue_()");
             }
-            if (state.enablePendingWriteStats) {
-                os << " { init_pending_write_stats(); reset(); }\n";
+            if (state.activityBatchDispatchEnabled) {
+                appendCtorInit("active_batch_words_((" + std::to_string(state.activityBatchCount) + "U + 63U) / 64U, UINT64_C(0))");
+                appendCtorInit("active_batch_word_queued_((" + std::to_string(state.activityBatchCount) + "U + 63U) / 64U, 0)");
+                appendCtorInit("active_batch_word_queue_()");
+            }
+            if (state.enablePendingWriteStats || state.enableActivityBatchStats) {
+                os << " {";
+                if (state.enablePendingWriteStats) {
+                    os << " init_pending_write_stats();";
+                }
+                if (state.enableActivityBatchStats) {
+                    os << " init_activity_batch_stats();";
+                }
+                os << " reset(); }\n";
             } else {
                 os << " { reset(); }\n";
             }
@@ -6698,6 +7094,52 @@ namespace wolvrix::lib::emit
                 os << "                 static_cast<unsigned long long>(vector_pending_prepare_calls_),\n";
                 os << "                 static_cast<unsigned long long>(vector_pending_apply_calls_),\n";
                 os << "                 static_cast<unsigned long long>(vector_pending_apply_entries_));\n";
+                os << "}\n\n";
+            }
+            if (state.enableActivityBatchStats) {
+                os << "void SSimTop::init_activity_batch_stats() {\n";
+                os << "    activity_batch_stats_enabled_ = wolvrix_gsim_env_truthy(std::getenv(\"WOLVRIX_GSIM_ACTIVITY_BATCH_STATS\"));\n";
+                os << "    activity_batch_stats_interval_ = wolvrix_gsim_env_u64(std::getenv(\"WOLVRIX_GSIM_ACTIVITY_BATCH_STATS_INTERVAL\"), 50ULL);\n";
+                os << "    if (activity_batch_stats_enabled_) {\n";
+                os << "        std::fprintf(stderr, \"[gsim] activity_batch_plan batches=%llu active_words=%llu bodies=%llu avg_ops=%llu max_ops=%llu max_fanout=%llu fallback=%s\\n\",\n";
+                os << "                     static_cast<unsigned long long>(" << state.activityBatchCount << "ULL),\n";
+                os << "                     static_cast<unsigned long long>(" << state.activitySupernodeActiveWords << "ULL),\n";
+                os << "                     static_cast<unsigned long long>(" << state.activitySupernodeBodyCount << "ULL),\n";
+                os << "                     static_cast<unsigned long long>(" << state.activityBatchAvgOps << "ULL),\n";
+                os << "                     static_cast<unsigned long long>(" << state.activityBatchMaxOps << "ULL),\n";
+                os << "                     static_cast<unsigned long long>(" << state.activityBatchMaxSuccessorFanout << "ULL),\n";
+                os << "                     \"" << state.activityBatchFallbackReason << "\");\n";
+                os << "    }\n";
+                os << "}\n\n";
+                os << "void SSimTop::report_activity_batch_stats() {\n";
+                os << "    if (!activity_batch_stats_enabled_) { return; }\n";
+                os << "    ++activity_batch_steps_;\n";
+                os << "    if (activity_batch_stats_interval_ != 0ULL && (activity_batch_steps_ % activity_batch_stats_interval_) != 0ULL) { return; }\n";
+                os << "    std::fprintf(stderr, \"[gsim] activity_batch_stats step=%llu interval=%llu activated_batches=%llu executed_batches=%llu executed_bodies=%llu activated_words=%llu queue_max=%llu successor_edges=%llu suffix_fallbacks=%llu full_replays=%llu class_comb=%llu class_stateful=%llu class_sidefx=%llu\\n\",\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_steps_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_stats_interval_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_activated_batches_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_executed_batches_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_executed_bodies_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_activated_words_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_queue_max_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_successor_edges_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_suffix_fallbacks_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_full_replays_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_class_comb_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_class_stateful_step_),\n";
+                os << "                 static_cast<unsigned long long>(activity_batch_class_sidefx_step_));\n";
+                os << "    activity_batch_activated_batches_step_ = 0;\n";
+                os << "    activity_batch_executed_batches_step_ = 0;\n";
+                os << "    activity_batch_executed_bodies_step_ = 0;\n";
+                os << "    activity_batch_activated_words_step_ = 0;\n";
+                os << "    activity_batch_queue_max_step_ = 0;\n";
+                os << "    activity_batch_successor_edges_step_ = 0;\n";
+                os << "    activity_batch_suffix_fallbacks_step_ = 0;\n";
+                os << "    activity_batch_full_replays_step_ = 0;\n";
+                os << "    activity_batch_class_comb_step_ = 0;\n";
+                os << "    activity_batch_class_stateful_step_ = 0;\n";
+                os << "    activity_batch_class_sidefx_step_ = 0;\n";
                 os << "}\n\n";
             }
             auto emitDomainNextScalarHelpers = [&](std::string_view suffix,
@@ -6799,7 +7241,16 @@ namespace wolvrix::lib::emit
             if (hasInputPortNamed(state.inputPorts, "reset")) {
                 os << "void SSimTop::set_reset(unsigned reset) { const auto value = static_cast<std::uint8_t>(reset); ";
                 os << "if (!(input_reset_ == value)) { input_reset_ = value; non_clock_inputs_dirty_ = true;";
-                if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
+                if (state.activityBatchDispatchEnabled) {
+                    if (const auto headsIt = state.activitySourceHeadBatches.find("input_reset");
+                        headsIt != state.activitySourceHeadBatches.end() && !headsIt->second.empty()) {
+                        for (const auto& [word, mask] : shardWordMasksFor(headsIt->second)) {
+                            os << " activate_batch_mask(" << word << "U, UINT64_C(" << mask << "));";
+                        }
+                    } else {
+                        os << " activate_all_batches();";
+                    }
+                } else if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
                     if (const auto headsIt = state.activitySourceHeadShards.find("input_reset");
                         headsIt != state.activitySourceHeadShards.end() && !headsIt->second.empty()) {
                         emitShardWordMaskActivation(os, shardWordMasksFor(headsIt->second), " ", "");
@@ -6931,6 +7382,125 @@ namespace wolvrix::lib::emit
                     emitActiveShardWordDispatch(activeWord);
                 }
             }
+            if (state.activityBatchDispatchEnabled && metadata.scheduleBatch) {
+                const auto& batch = *metadata.scheduleBatch;
+                os << "void SSimTop::activate_all_batches() {\n";
+                os << "    active_batch_word_queue_.clear();\n";
+                if ((state.activityBatchCount % 64U) == 0U) {
+                    os << "    std::fill(active_batch_words_.begin(), active_batch_words_.end(), ~UINT64_C(0));\n";
+                } else {
+                    const std::uint64_t lastActiveBatchWordMask =
+                        (UINT64_C(1) << (state.activityBatchCount % 64U)) - UINT64_C(1);
+                    os << "    std::fill(active_batch_words_.begin(), active_batch_words_.end(), ~UINT64_C(0));\n";
+                    os << "    if (!active_batch_words_.empty()) { active_batch_words_.back() = UINT64_C("
+                       << lastActiveBatchWordMask << "); }\n";
+                }
+                os << "    std::fill(active_batch_word_queued_.begin(), active_batch_word_queued_.end(), 1);\n";
+                os << "    active_batch_word_queue_.reserve(active_batch_words_.size());\n";
+                os << "    for (std::uint32_t word = 0; word < active_batch_words_.size(); ++word) { active_batch_word_queue_.push_back(word); }\n";
+                os << "    if (activity_batch_stats_enabled_) {\n";
+                os << "        ++activity_batch_full_replays_step_;\n";
+                os << "        activity_batch_activated_batches_step_ += " << state.activityBatchCount << "ULL;\n";
+                os << "        activity_batch_activated_words_step_ += static_cast<std::uint64_t>(active_batch_word_queue_.size());\n";
+                os << "        if (active_batch_word_queue_.size() > activity_batch_queue_max_step_) { activity_batch_queue_max_step_ = static_cast<std::uint64_t>(active_batch_word_queue_.size()); }\n";
+                os << "    }\n";
+                os << "}\n\n";
+                os << "void SSimTop::activate_batch(std::uint32_t batch) {\n";
+                os << "    if (batch >= " << state.activityBatchCount << "U) { return; }\n";
+                os << "    const std::uint32_t word = batch / 64U;\n";
+                os << "    const std::uint64_t mask = (UINT64_C(1) << (batch % 64U));\n";
+                os << "    activate_batch_mask(word, mask);\n";
+                os << "}\n\n";
+                os << "void SSimTop::activate_batch_mask(std::uint32_t word, std::uint64_t mask) {\n";
+                os << "    if (word >= active_batch_words_.size() || mask == UINT64_C(0)) { return; }\n";
+                os << "    const std::uint64_t old_bits_ = active_batch_words_[word];\n";
+                os << "    const std::uint64_t new_bits_ = old_bits_ | mask;\n";
+                os << "    if (new_bits_ == old_bits_) { return; }\n";
+                os << "    active_batch_words_[word] = new_bits_;\n";
+                os << "    if (activity_batch_stats_enabled_) {\n";
+                os << "        activity_batch_activated_batches_step_ += static_cast<std::uint64_t>(__builtin_popcountll(new_bits_ & ~old_bits_));\n";
+                os << "        if (old_bits_ == UINT64_C(0)) { ++activity_batch_activated_words_step_; }\n";
+                os << "    }\n";
+                os << "    if (active_batch_word_queued_[word] == 0) { active_batch_word_queued_[word] = 1; active_batch_word_queue_.push_back(word); }\n";
+                os << "    if (activity_batch_stats_enabled_ && active_batch_word_queue_.size() > activity_batch_queue_max_step_) { activity_batch_queue_max_step_ = static_cast<std::uint64_t>(active_batch_word_queue_.size()); }\n";
+                os << "}\n\n";
+                const int activeBatchWordCount = static_cast<int>((state.activityBatchCount + 63) / 64);
+                for (int activeWord = 0; activeWord < activeBatchWordCount; ++activeWord) {
+                    os << "void SSimTop::run_active_batch_word_" << activeWord
+                       << "(std::uint64_t& active_bits_) {\n";
+                    os << "    while (active_bits_ != UINT64_C(0)) {\n";
+                    os << "        const std::uint32_t active_bit_ = static_cast<std::uint32_t>(__builtin_ctzll(active_bits_));\n";
+                    os << "        active_bits_ &= ~(UINT64_C(1) << active_bit_);\n";
+                    os << "        const std::uint32_t active_batch_ = " << (activeWord * 64) << "U + active_bit_;\n";
+                    os << "        switch (active_batch_) {\n";
+                    const int firstBatch = activeWord * 64;
+                    const int lastBatch = std::min(static_cast<int>(state.activityBatchCount), firstBatch + 64);
+                    for (int batchIndex = firstBatch; batchIndex < lastBatch; ++batchIndex) {
+                        os << "        case " << batchIndex << "U: {\n";
+                        os << "            if (activity_batch_stats_enabled_) {\n";
+                        os << "                ++activity_batch_executed_batches_step_;\n";
+                        os << "                ++activity_batch_executed_bodies_step_;\n";
+                        const auto flags = (batchIndex < static_cast<int>(batch.flags.size())) ? batch.flags[static_cast<std::size_t>(batchIndex)] : 0;
+                        if ((flags & 1) != 0) {
+                            os << "                ++activity_batch_class_comb_step_;\n";
+                        }
+                        if ((flags & 2) != 0) {
+                            os << "                ++activity_batch_class_stateful_step_;\n";
+                        }
+                        if ((flags & 4) != 0) {
+                            os << "                ++activity_batch_class_sidefx_step_;\n";
+                        }
+                        os << "            }\n";
+                        if (batchIndex < static_cast<int>(state.activityBatchShardSpans.size())) {
+                            const auto [firstShard, lastShard] = state.activityBatchShardSpans[static_cast<std::size_t>(batchIndex)];
+                            if (firstShard >= 0 && lastShard >= firstShard) {
+                                for (int64_t shard = firstShard; shard <= lastShard; ++shard) {
+                                    os << "            sched_" << shard << "();\n";
+                                }
+                            }
+                        }
+                        std::uint64_t localSuccessorMask = 0;
+                        std::map<int, std::uint64_t> crossWordMasks;
+                        if (batchIndex + 1 < static_cast<int>(batch.succOffsets.size())) {
+                            const auto start = batch.succOffsets[static_cast<std::size_t>(batchIndex)];
+                            const auto end = batch.succOffsets[static_cast<std::size_t>(batchIndex + 1)];
+                            for (int64_t cursor = start; cursor < end && cursor >= 0 &&
+                                                   static_cast<std::size_t>(cursor) < batch.succTargets.size(); ++cursor) {
+                                const auto successor = batch.succTargets[static_cast<std::size_t>(cursor)];
+                                if (successor < 0) {
+                                    continue;
+                                }
+                                const int word = static_cast<int>(successor / 64);
+                                const int bit = static_cast<int>(successor % 64);
+                                if (word == activeWord) {
+                                    localSuccessorMask |= (std::uint64_t{1} << bit);
+                                } else {
+                                    crossWordMasks[word] |= (std::uint64_t{1} << bit);
+                                }
+                            }
+                            os << "            if (activity_batch_stats_enabled_) { activity_batch_successor_edges_step_ += "
+                               << std::max<int64_t>(0, end - start) << "ULL; }\n";
+                        }
+                        if (localSuccessorMask != 0U) {
+                            os << "            active_bits_ |= UINT64_C(" << localSuccessorMask << ");\n";
+                        }
+                        for (const auto& [word, mask] : crossWordMasks) {
+                            os << "            activate_batch_mask(" << word << "U, UINT64_C(" << mask << "));\n";
+                        }
+                        os << "            break;\n";
+                        os << "        }\n";
+                    }
+                    os << "        default: break;\n";
+                    os << "        }\n";
+                    os << "        const std::uint64_t local_bits_ = active_batch_words_[" << activeWord << "U];\n";
+                    os << "        if (local_bits_ != UINT64_C(0)) {\n";
+                    os << "            active_bits_ |= local_bits_;\n";
+                    os << "            active_batch_words_[" << activeWord << "U] = UINT64_C(0);\n";
+                    os << "        }\n";
+                    os << "    }\n";
+                    os << "}\n\n";
+                }
+            }
             os << "void SSimTop::reset() {\n";
             os << "    reset_ = false;\n";
             os << "    *state_ = SSimTopState();\n";
@@ -6953,7 +7523,11 @@ namespace wolvrix::lib::emit
                 os << "    gsim_pre_dpic_steps_ = 0;\n";
             }
             if (state.enableSharding && state.enableActivityWatermark && state.shardCount() > 0) {
-                os << "    activate_all_shards();\n";
+                if (state.activityBatchDispatchEnabled) {
+                    os << "    activate_all_batches();\n";
+                } else {
+                    os << "    activate_all_shards();\n";
+                }
             }
                     {
                         std::set<std::string> resetClockNames;
@@ -6975,7 +7549,47 @@ namespace wolvrix::lib::emit
                 os << "        replay_dirty_mask_shards(UINT8_C(" << static_cast<unsigned>(kDirtyReplayClock) << "));\n";
                 os << "        clock_inputs_dirty_ = false;\n";
                 os << "    }\n";
-                if (state.enableActivityWatermark) {
+                if (state.activityBatchDispatchEnabled) {
+                    os << "    std::size_t active_batch_cursor_ = 0;\n";
+                    os << "    while (active_batch_cursor_ < active_batch_word_queue_.size()) {\n";
+                    os << "        const std::uint32_t active_word_ = active_batch_word_queue_[active_batch_cursor_++];\n";
+                    os << "        if (active_word_ >= active_batch_words_.size()) { continue; }\n";
+                    os << "        std::uint64_t active_bits_ = active_batch_words_[active_word_];\n";
+                    os << "        active_batch_words_[active_word_] = UINT64_C(0);\n";
+                    os << "        switch (active_word_) {\n";
+                    const int activeBatchWordCount = static_cast<int>((state.activityBatchCount + 63) / 64);
+                    for (int word = 0; word < activeBatchWordCount; ++word) {
+                        os << "        case " << word << "U: run_active_batch_word_" << word << "(active_bits_); break;\n";
+                    }
+                    os << "        default: break;\n";
+                    os << "        }\n";
+                    os << "        active_batch_word_queued_[active_word_] = 0;\n";
+                    os << "    }\n";
+                    os << "    active_batch_word_queue_.clear();\n";
+                    os << "    std::fill(active_batch_words_.begin(), active_batch_words_.end(), UINT64_C(0));\n";
+                    os << "    std::fill(active_batch_word_queued_.begin(), active_batch_word_queued_.end(), 0);\n";
+                    os << "    if (!active_word_queue_.empty()) {\n";
+                    os << "        if (activity_batch_stats_enabled_) { ++activity_batch_suffix_fallbacks_step_; }\n";
+                    os << "        std::size_t active_cursor_ = 0;\n";
+                    os << "        while (active_cursor_ < active_word_queue_.size()) {\n";
+                    os << "            const std::uint32_t active_word_ = active_word_queue_[active_cursor_++];\n";
+                    os << "            if (active_word_ >= active_shard_words_.size()) { continue; }\n";
+                    os << "            std::uint64_t active_bits_ = active_shard_words_[active_word_];\n";
+                    os << "            active_shard_words_[active_word_] = UINT64_C(0);\n";
+                    os << "            switch (active_word_) {\n";
+                    const int activeWordCount = (state.shardCount() + 63) / 64;
+                    for (int word = 0; word < activeWordCount; ++word) {
+                        os << "            case " << word << "U: run_active_shard_word_" << word << "(active_bits_); break;\n";
+                    }
+                    os << "            default: break;\n";
+                    os << "            }\n";
+                    os << "            active_word_queued_[active_word_] = 0;\n";
+                    os << "        }\n";
+                    os << "        active_word_queue_.clear();\n";
+                    os << "        std::fill(active_shard_words_.begin(), active_shard_words_.end(), UINT64_C(0));\n";
+                    os << "        std::fill(active_word_queued_.begin(), active_word_queued_.end(), 0);\n";
+                    os << "    }\n";
+                } else if (state.enableActivityWatermark) {
                     os << "    std::size_t active_cursor_ = 0;\n";
                     os << "    while (active_cursor_ < active_word_queue_.size()) {\n";
                     os << "        const std::uint32_t active_word_ = active_word_queue_[active_cursor_++];\n";
@@ -7654,6 +8268,9 @@ namespace wolvrix::lib::emit
             if (state.enablePendingWriteStats) {
                 os << "    report_pending_write_stats();\n";
             }
+            if (state.enableActivityBatchStats) {
+                os << "    report_activity_batch_stats();\n";
+            }
             os << "    difftest_exit_ = 0;\n";
             os << "}\n\n";
 
@@ -7675,6 +8292,24 @@ namespace wolvrix::lib::emit
             os << "    metadata.scratchpad_namespace = \"" << target.namespacePath << "\";\n";
             os << "    metadata.op_count = " << metadata.opCount << ";\n";
             os << "    metadata.graph_revision = " << metadata.graphRevision << ";\n";
+            os << "    metadata.activity_batch_mode = \"" << state.activityBatchMode << "\";\n";
+            os << "    metadata.activity_batch_metadata_present = " << (state.activityBatchMetadataPresent ? "true" : "false") << ";\n";
+            os << "    metadata.activity_batch_metadata_valid = " << (state.activityBatchMetadataValid ? "true" : "false") << ";\n";
+            os << "    metadata.activity_batch_fallback_reason = \"" << state.activityBatchFallbackReason << "\";\n";
+            os << "    metadata.activity_batch_count = " << state.activityBatchCount << ";\n";
+            os << "    metadata.activity_batch_avg_ops = " << state.activityBatchAvgOps << ";\n";
+            os << "    metadata.activity_batch_max_ops = " << state.activityBatchMaxOps << ";\n";
+            os << "    metadata.activity_batch_avg_estimated_lines = " << state.activityBatchAvgEstimatedLines << ";\n";
+            os << "    metadata.activity_batch_max_estimated_lines = " << state.activityBatchMaxEstimatedLines << ";\n";
+            os << "    metadata.activity_batch_max_successor_fanout = " << state.activityBatchMaxSuccessorFanout << ";\n";
+            os << "    metadata.activity_batch_successor_edges = " << state.activityBatchSuccessorEdges << ";\n";
+            os << "    metadata.activity_batch_entry_count = " << state.activityBatchEntryCount << ";\n";
+            os << "    metadata.activity_supernode_active_words = " << state.activitySupernodeActiveWords << ";\n";
+            os << "    metadata.activity_supernode_body_count = " << state.activitySupernodeBodyCount << ";\n";
+            os << "    metadata.activity_supernode_shard_count = " << state.activitySupernodeShardCount << ";\n";
+            os << "    metadata.activity_batch_to_shard_min_span = " << state.activityBatchToShardMinSpan << ";\n";
+            os << "    metadata.activity_batch_to_shard_max_span = " << state.activityBatchToShardMaxSpan << ";\n";
+            os << "    metadata.activity_batch_dispatch_enabled = " << (state.activityBatchDispatchEnabled ? "true" : "false") << ";\n";
             if (!emitMetadata)
             {
                 os << "    return metadata;\n";
@@ -7803,6 +8438,40 @@ namespace wolvrix::lib::emit
             os << "    metadata.hypergraph_kind = \"" << metadata.hypergraphKind << "\";\n";
             os << "    metadata.hypergraph_version = " << metadata.hypergraphVersion << ";\n";
             os << "    metadata.hypergraph_contract = \"" << metadata.hypergraphContract << "\";\n";
+            if (metadata.scheduleBatch)
+            {
+                const auto &batch = *metadata.scheduleBatch;
+                os << "    metadata.schedule_batch_names = {";
+                for (std::size_t i = 0; i < batch.names.size(); ++i)
+                {
+                    if (i != 0)
+                    {
+                        os << ", ";
+                    }
+                    os << '"' << batch.names[i] << '"';
+                }
+                os << "};\n";
+                os << "    metadata.schedule_batch_class_ids = {" << joinInts(batch.classIds, ", ") << "};\n";
+                os << "    metadata.schedule_batch_class_names = {";
+                for (std::size_t i = 0; i < batch.classNames.size(); ++i)
+                {
+                    if (i != 0)
+                    {
+                        os << ", ";
+                    }
+                    os << '"' << batch.classNames[i] << '"';
+                }
+                os << "};\n";
+                os << "    metadata.schedule_batch_flags = {" << joinInts(batch.flags, ", ") << "};\n";
+                os << "    metadata.schedule_batch_topo_batch_by_pos = {" << joinInts(batch.topoBatchByPos, ", ") << "};\n";
+                os << "    metadata.schedule_batch_first_topo_pos = {" << joinInts(batch.firstTopoPos, ", ") << "};\n";
+                os << "    metadata.schedule_batch_last_topo_pos = {" << joinInts(batch.lastTopoPos, ", ") << "};\n";
+                os << "    metadata.schedule_batch_op_counts = {" << joinInts(batch.opCounts, ", ") << "};\n";
+                os << "    metadata.schedule_batch_succ_offsets = {" << joinInts(batch.succOffsets, ", ") << "};\n";
+                os << "    metadata.schedule_batch_succ_targets = {" << joinInts(batch.succTargets, ", ") << "};\n";
+                os << "    metadata.schedule_batch_entry_batches = {" << joinInts(batch.entryBatches, ", ") << "};\n";
+                os << "    metadata.schedule_batch_estimated_lines = {" << joinInts(batch.estimatedLines, ", ") << "};\n";
+            }
             os << "    return metadata;\n";
             os << "}\n\n";
             os << "bool " << validateName << "(const " << structName << "& metadata) {\n";
@@ -8382,6 +9051,31 @@ namespace wolvrix::lib::emit
             state.enableDpicTrace && attrEnabled(options, "xs_zero_retire_trace", false);
         state.dpicGlobalWarmupSteps = parsePositiveIntAttr(options, "dpic_global_warmup_steps", 0);
         state.enablePendingWriteStats = attrEnabled(options, "pending_write_stats", false);
+        state.activityBatchMode = parseActivityBatchMode(options);
+        if (state.activityBatchMode == "invalid")
+        {
+            reportError("invalid gsim activity batch mode",
+                        "activity_batch_mode must be one of legacy, stats, dispatch, strict_dispatch");
+            result.success = false;
+            return result;
+        }
+        state.enableActivityBatchStats = attrEnabled(options, "activity_batch_stats", false) || state.activityBatchMode == "stats" ||
+                                         state.activityBatchMode == "dispatch" || state.activityBatchMode == "strict_dispatch";
+        state.activityBatchMetadataPresent = metadata->scheduleBatch.has_value();
+        state.activityBatchMetadataValid = metadata->scheduleBatch.has_value();
+        state.activityBatchDispatchEnabled = metadata->scheduleBatch.has_value() &&
+                                             (state.activityBatchMode == "dispatch" || state.activityBatchMode == "strict_dispatch");
+        if (state.activityBatchDispatchEnabled) {
+            state.enableActivityWatermark = true;
+        }
+        if (!metadata->scheduleBatch && (state.activityBatchMode == "dispatch" || state.activityBatchMode == "strict_dispatch"))
+        {
+            reportError("missing required gsim activity batch metadata",
+                        target->namespacePath + ".schedule.batch.* is required by activity_batch_mode=" + state.activityBatchMode);
+            result.success = false;
+            return result;
+        }
+        state.activityBatchFallbackReason = metadata->scheduleBatch ? "none" : "missing";
         if (auto targetsAttr = attrValue(options, "dpic_trace_targets"))
         {
             for (auto &targetName : splitCsv(*targetsAttr)) {
@@ -8404,7 +9098,7 @@ namespace wolvrix::lib::emit
         // expressions well below XiangShan scale, so keep the threshold low enough
         // to materialize those graphs into sched shards before C++ compile time or
         // emitted file size becomes pathological.
-        state.enableSharding = metadata->opCount > 128;
+        state.enableSharding = metadata->opCount > 128 || state.activityBatchDispatchEnabled;
         const std::size_t reserveOps = static_cast<std::size_t>(std::max<std::int64_t>(metadata->opCount, 0));
         state.valueVars.reserve(reserveOps);
         state.valueDirtyReplayMasks.reserve(reserveOps);
@@ -8506,7 +9200,7 @@ namespace wolvrix::lib::emit
                 : kDirtyReplayNonClock;
             state.dirtyReplayRootMasks[port.value] = replayMask;
             state.valueDirtyReplayMasks[port.value] = replayMask;
-            if (state.enableActivityWatermark) {
+            if (state.enableActivityWatermark || state.activityBatchDispatchEnabled) {
                 state.inputActivitySourceNames[port.value] = "input_" + sanitizeIdentifier(port.name);
             }
         }
@@ -8523,6 +9217,18 @@ namespace wolvrix::lib::emit
         if (state.enableSharding) {
             state.opProducerFirstShardByIndex.assign(opIdByIndex.size(), -1);
             state.opProducerLastShardByIndex.assign(opIdByIndex.size(), -1);
+        }
+        if (state.activityBatchDispatchEnabled && metadata->scheduleBatch) {
+            state.opBatchOrdinalByIndex.assign(opIdByIndex.size(), -1);
+            const auto& batchTopoByPos = metadata->scheduleBatch->topoBatchByPos;
+            for (std::size_t pos = 0; pos < metadata->topoOrder.size() && pos < batchTopoByPos.size(); ++pos) {
+                const auto opIndex = metadata->topoOrder[pos];
+                const auto batchOrdinal = batchTopoByPos[pos];
+                if (opIndex >= 0 && static_cast<std::size_t>(opIndex) < state.opBatchOrdinalByIndex.size() &&
+                    batchOrdinal >= 0) {
+                    state.opBatchOrdinalByIndex[static_cast<std::size_t>(opIndex)] = static_cast<std::int32_t>(batchOrdinal);
+                }
+            }
         }
         if (state.enableSharding && state.enableActivityWatermark &&
             state.activityBoundaryShardSoftBytes > 0) {
@@ -8634,6 +9340,83 @@ namespace wolvrix::lib::emit
         const auto sequentialChunks = buildSequentialChunkPlans(state);
         precomputeShardSuccessorActivationRanges(state);
         precomputeSequentialChunkActivityActivationRanges(state, sequentialChunks);
+        if (const auto &batch = metadata->scheduleBatch)
+        {
+            state.activityBatchCount = batch->count;
+            state.activityBatchEntryCount = static_cast<int64_t>(batch->entryBatches.size());
+            state.activitySupernodeActiveWords = (batch->count + 63) / 64;
+            state.activitySupernodeBodyCount = state.activityBatchDispatchEnabled ? batch->count : 0;
+            state.activitySupernodeShardCount = static_cast<int64_t>(state.shardCount());
+            state.activityBatchShardSpans.assign(static_cast<std::size_t>(batch->count), {-1, -1});
+            for (const auto count : batch->opCounts)
+            {
+                state.activityBatchAvgOps += count;
+                state.activityBatchMaxOps = std::max(state.activityBatchMaxOps, count);
+            }
+            if (batch->count > 0)
+            {
+                state.activityBatchAvgOps /= batch->count;
+            }
+            for (const auto estimatedLines : batch->estimatedLines)
+            {
+                state.activityBatchAvgEstimatedLines += estimatedLines;
+                state.activityBatchMaxEstimatedLines = std::max(state.activityBatchMaxEstimatedLines, estimatedLines);
+            }
+            if (batch->count > 0)
+            {
+                state.activityBatchAvgEstimatedLines /= batch->count;
+            }
+            state.activityBatchSuccessorEdges = static_cast<int64_t>(batch->succTargets.size());
+            for (std::size_t batchIndex = 0; batchIndex + 1U < batch->succOffsets.size(); ++batchIndex)
+            {
+                state.activityBatchMaxSuccessorFanout =
+                    std::max(state.activityBatchMaxSuccessorFanout,
+                             batch->succOffsets[batchIndex + 1U] - batch->succOffsets[batchIndex]);
+            }
+            if (state.enableSharding && !batch->topoBatchByPos.empty() && !state.opProducerFirstShardByIndex.empty())
+            {
+                std::vector<int64_t> firstShard(static_cast<std::size_t>(batch->count), std::numeric_limits<int64_t>::max());
+                std::vector<int64_t> lastShard(static_cast<std::size_t>(batch->count), -1);
+                for (std::size_t pos = 0; pos < metadata->topoOrder.size() && pos < batch->topoBatchByPos.size(); ++pos)
+                {
+                    const auto batchOrdinal = batch->topoBatchByPos[pos];
+                    const auto opIndex = metadata->topoOrder[pos];
+                    if (batchOrdinal < 0 || static_cast<std::size_t>(batchOrdinal) >= firstShard.size() ||
+                        opIndex < 0 || static_cast<std::size_t>(opIndex) >= state.opProducerFirstShardByIndex.size())
+                    {
+                        continue;
+                    }
+                    const auto opFirst = state.opProducerFirstShardByIndex[static_cast<std::size_t>(opIndex)];
+                    const auto opLast = state.opProducerLastShardByIndex[static_cast<std::size_t>(opIndex)];
+                    if (opFirst < 0 || opLast < opFirst)
+                    {
+                        continue;
+                    }
+                    auto index = static_cast<std::size_t>(batchOrdinal);
+                    firstShard[index] = std::min(firstShard[index], static_cast<int64_t>(opFirst));
+                    lastShard[index] = std::max(lastShard[index], static_cast<int64_t>(opLast));
+                }
+                state.activityBatchToShardMinSpan = std::numeric_limits<int64_t>::max();
+                state.activityBatchToShardMaxSpan = 0;
+                bool sawSpan = false;
+                for (std::size_t index = 0; index < firstShard.size(); ++index)
+                {
+                    if (firstShard[index] == std::numeric_limits<int64_t>::max() || lastShard[index] < firstShard[index])
+                    {
+                        continue;
+                    }
+                    const int64_t span = lastShard[index] - firstShard[index] + 1;
+                    state.activityBatchShardSpans[index] = {firstShard[index], lastShard[index]};
+                    state.activityBatchToShardMinSpan = std::min(state.activityBatchToShardMinSpan, span);
+                    state.activityBatchToShardMaxSpan = std::max(state.activityBatchToShardMaxSpan, span);
+                    sawSpan = true;
+                }
+                if (!sawSpan)
+                {
+                    state.activityBatchToShardMinSpan = 0;
+                }
+            }
+        }
 
         auto header = openOutputFile(headerPath);
         auto internalHeader = openOutputFile(internalHeaderPath);

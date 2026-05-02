@@ -4,9 +4,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <map>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -37,6 +39,19 @@ namespace wolvrix::lib::transform
             std::vector<std::string> scheduleActivityOrder;
             std::map<std::string, std::vector<int64_t>> scheduleActivityMembers;
             std::map<std::string, std::string> scheduleActivityClasses;
+            int64_t scheduleBatchCount = 0;
+            std::vector<std::string> scheduleBatchNames;
+            std::vector<int64_t> scheduleBatchClassIds;
+            std::vector<std::string> scheduleBatchClassNames;
+            std::vector<int64_t> scheduleBatchFlags;
+            std::vector<int64_t> scheduleBatchTopoByPos;
+            std::vector<int64_t> scheduleBatchFirstTopoPos;
+            std::vector<int64_t> scheduleBatchLastTopoPos;
+            std::vector<int64_t> scheduleBatchOpCounts;
+            std::vector<int64_t> scheduleBatchSuccOffsets;
+            std::vector<int64_t> scheduleBatchSuccTargets;
+            std::vector<int64_t> scheduleBatchEntryBatches;
+            std::vector<int64_t> scheduleBatchEstimatedLines;
             std::vector<std::string> hypergraphNodeNames;
             std::map<std::string, std::vector<int64_t>> hypergraphNodeMembers;
             std::vector<std::string> hypergraphEdgeNames;
@@ -99,6 +114,54 @@ namespace wolvrix::lib::transform
             default:
                 return "logic";
             }
+        }
+
+        int64_t batchClassIdForActivityClass(std::string_view activityClass)
+        {
+            if (activityClass == "stateful")
+            {
+                return 1;
+            }
+            if (activityClass == "side-effect")
+            {
+                return 2;
+            }
+            if (activityClass == "memory")
+            {
+                return 3;
+            }
+            if (activityClass == "clocked")
+            {
+                return 4;
+            }
+            return 0;
+        }
+
+        int64_t batchFlagsForActivityClass(std::string_view activityClass)
+        {
+            constexpr int64_t kCombinational = INT64_C(1) << 0;
+            constexpr int64_t kStateful = INT64_C(1) << 1;
+            constexpr int64_t kSideEffect = INT64_C(1) << 2;
+            constexpr int64_t kMemory = INT64_C(1) << 3;
+            constexpr int64_t kClocked = INT64_C(1) << 4;
+            constexpr int64_t kOrderBarrier = INT64_C(1) << 5;
+            if (activityClass == "stateful")
+            {
+                return kStateful | kClocked | kOrderBarrier;
+            }
+            if (activityClass == "side-effect")
+            {
+                return kSideEffect | kOrderBarrier;
+            }
+            if (activityClass == "memory")
+            {
+                return kMemory | kStateful | kOrderBarrier;
+            }
+            if (activityClass == "clocked")
+            {
+                return kClocked | kOrderBarrier;
+            }
+            return kCombinational;
         }
 
         std::string eventGroupKey(const wolvrix::lib::grh::Operation &op)
@@ -480,6 +543,102 @@ namespace wolvrix::lib::transform
                 }
             }
 
+            metadata.scheduleBatchClassNames = {"combinational", "stateful", "side-effect", "memory", "clocked"};
+            std::map<std::string, int64_t> batchByGroup;
+            for (const auto &[groupKey, ids] : metadata.groups)
+            {
+                const int64_t batchOrdinal = static_cast<int64_t>(metadata.scheduleBatchNames.size());
+                batchByGroup.emplace(groupKey, batchOrdinal);
+                metadata.scheduleBatchNames.push_back("batch." + groupKey);
+                const std::string activityName = "activity." + groupKey;
+                const auto classIt = metadata.scheduleActivityClasses.find(activityName);
+                const std::string activityClass =
+                    classIt != metadata.scheduleActivityClasses.end() ? classIt->second : std::string("combinational");
+                metadata.scheduleBatchClassIds.push_back(batchClassIdForActivityClass(activityClass));
+                metadata.scheduleBatchFlags.push_back(batchFlagsForActivityClass(activityClass));
+                metadata.scheduleBatchFirstTopoPos.push_back(-1);
+                metadata.scheduleBatchLastTopoPos.push_back(-1);
+                metadata.scheduleBatchOpCounts.push_back(static_cast<int64_t>(ids.size()));
+                metadata.scheduleBatchEstimatedLines.push_back(static_cast<int64_t>(ids.size()));
+            }
+            metadata.scheduleBatchCount = static_cast<int64_t>(metadata.scheduleBatchNames.size());
+
+            std::unordered_map<int64_t, int64_t> batchByOp;
+            batchByOp.reserve(records.size());
+            for (const auto &[groupKey, ids] : metadata.groups)
+            {
+                const auto batchIt = batchByGroup.find(groupKey);
+                if (batchIt == batchByGroup.end())
+                {
+                    continue;
+                }
+                for (const auto opIndex : ids)
+                {
+                    batchByOp[opIndex] = batchIt->second;
+                }
+            }
+
+            metadata.scheduleBatchTopoByPos.reserve(metadata.topo.size());
+            for (std::size_t pos = 0; pos < metadata.topo.size(); ++pos)
+            {
+                const auto opIndex = metadata.topo[pos];
+                const auto batchIt = batchByOp.find(opIndex);
+                const int64_t batchOrdinal = batchIt != batchByOp.end() ? batchIt->second : -1;
+                metadata.scheduleBatchTopoByPos.push_back(batchOrdinal);
+                if (batchOrdinal >= 0 && static_cast<std::size_t>(batchOrdinal) < metadata.scheduleBatchFirstTopoPos.size())
+                {
+                    auto &first = metadata.scheduleBatchFirstTopoPos[static_cast<std::size_t>(batchOrdinal)];
+                    auto &last = metadata.scheduleBatchLastTopoPos[static_cast<std::size_t>(batchOrdinal)];
+                    if (first < 0)
+                    {
+                        first = static_cast<int64_t>(pos);
+                    }
+                    last = static_cast<int64_t>(pos);
+                }
+            }
+
+            std::set<int64_t> entryBatches;
+            for (const auto root : metadata.roots)
+            {
+                if (const auto batchIt = batchByOp.find(root); batchIt != batchByOp.end())
+                {
+                    entryBatches.insert(batchIt->second);
+                }
+            }
+            metadata.scheduleBatchEntryBatches.assign(entryBatches.begin(), entryBatches.end());
+
+            std::vector<std::set<int64_t>> succSets(static_cast<std::size_t>(metadata.scheduleBatchCount));
+            for (const auto &[opIndex, succIds] : metadata.successors)
+            {
+                const auto sourceBatchIt = batchByOp.find(opIndex);
+                if (sourceBatchIt == batchByOp.end())
+                {
+                    continue;
+                }
+                const int64_t sourceBatch = sourceBatchIt->second;
+                if (sourceBatch < 0 || static_cast<std::size_t>(sourceBatch) >= succSets.size())
+                {
+                    continue;
+                }
+                auto &targets = succSets[static_cast<std::size_t>(sourceBatch)];
+                for (const auto succ : succIds)
+                {
+                    const auto targetBatchIt = batchByOp.find(succ);
+                    if (targetBatchIt == batchByOp.end() || targetBatchIt->second == sourceBatch)
+                    {
+                        continue;
+                    }
+                    targets.insert(targetBatchIt->second);
+                }
+            }
+            metadata.scheduleBatchSuccOffsets.reserve(succSets.size() + 1U);
+            metadata.scheduleBatchSuccOffsets.push_back(0);
+            for (const auto &targets : succSets)
+            {
+                metadata.scheduleBatchSuccTargets.insert(metadata.scheduleBatchSuccTargets.end(), targets.begin(), targets.end());
+                metadata.scheduleBatchSuccOffsets.push_back(static_cast<int64_t>(metadata.scheduleBatchSuccTargets.size()));
+            }
+
             return metadata;
         }
     } // namespace
@@ -508,6 +667,19 @@ namespace wolvrix::lib::transform
                                  std::vector<std::string> scheduleActivityOrder,
                                  std::map<std::string, std::vector<int64_t>> scheduleActivityMembers,
                                  std::map<std::string, std::string> scheduleActivityClasses,
+                                 int64_t scheduleBatchCount,
+                                 std::vector<std::string> scheduleBatchNames,
+                                 std::vector<int64_t> scheduleBatchClassIds,
+                                 std::vector<std::string> scheduleBatchClassNames,
+                                 std::vector<int64_t> scheduleBatchFlags,
+                                 std::vector<int64_t> scheduleBatchTopoByPos,
+                                 std::vector<int64_t> scheduleBatchFirstTopoPos,
+                                 std::vector<int64_t> scheduleBatchLastTopoPos,
+                                 std::vector<int64_t> scheduleBatchOpCounts,
+                                 std::vector<int64_t> scheduleBatchSuccOffsets,
+                                 std::vector<int64_t> scheduleBatchSuccTargets,
+                                 std::vector<int64_t> scheduleBatchEntryBatches,
+                                 std::vector<int64_t> scheduleBatchEstimatedLines,
                                  std::vector<std::string> hypergraphNodeNames,
                                  std::map<std::string, std::vector<int64_t>> hypergraphNodeMembers,
                                  std::vector<std::string> hypergraphEdgeNames,
@@ -533,6 +705,22 @@ namespace wolvrix::lib::transform
         setScratchpad(prefix + ".schedule.activity_order", std::move(scheduleActivityOrder));
         setScratchpad(prefix + ".schedule.activity_members", std::move(scheduleActivityMembers));
         setScratchpad(prefix + ".schedule.activity_classes", std::move(scheduleActivityClasses));
+        setScratchpad(prefix + ".schedule.batch.kind", std::string("activity-batch-v1"));
+        setScratchpad(prefix + ".schedule.batch.version", int64_t{1});
+        setScratchpad(prefix + ".schedule.batch.contract", std::string("gsim.activity.schedule_batch.v1"));
+        setScratchpad(prefix + ".schedule.batch.count", scheduleBatchCount);
+        setScratchpad(prefix + ".schedule.batch.names", std::move(scheduleBatchNames));
+        setScratchpad(prefix + ".schedule.batch.class_ids", std::move(scheduleBatchClassIds));
+        setScratchpad(prefix + ".schedule.batch.class_names", std::move(scheduleBatchClassNames));
+        setScratchpad(prefix + ".schedule.batch.flags", std::move(scheduleBatchFlags));
+        setScratchpad(prefix + ".schedule.batch.topo_batch_by_pos", std::move(scheduleBatchTopoByPos));
+        setScratchpad(prefix + ".schedule.batch.first_topo_pos", std::move(scheduleBatchFirstTopoPos));
+        setScratchpad(prefix + ".schedule.batch.last_topo_pos", std::move(scheduleBatchLastTopoPos));
+        setScratchpad(prefix + ".schedule.batch.op_counts", std::move(scheduleBatchOpCounts));
+        setScratchpad(prefix + ".schedule.batch.succ_offsets", std::move(scheduleBatchSuccOffsets));
+        setScratchpad(prefix + ".schedule.batch.succ_targets", std::move(scheduleBatchSuccTargets));
+        setScratchpad(prefix + ".schedule.batch.entry_batches", std::move(scheduleBatchEntryBatches));
+        setScratchpad(prefix + ".schedule.batch.estimated_lines", std::move(scheduleBatchEstimatedLines));
         setScratchpad(prefix + ".hypergraph.kind", std::string("activity-connectivity-v1"));
         setScratchpad(prefix + ".hypergraph.version", int64_t{1});
         setScratchpad(prefix + ".hypergraph.contract", std::string("gsim.activity.hypergraph.v1"));
@@ -674,6 +862,19 @@ namespace wolvrix::lib::transform
                           std::move(metadata.scheduleActivityOrder),
                           std::move(metadata.scheduleActivityMembers),
                           std::move(metadata.scheduleActivityClasses),
+                          metadata.scheduleBatchCount,
+                          std::move(metadata.scheduleBatchNames),
+                          std::move(metadata.scheduleBatchClassIds),
+                          std::move(metadata.scheduleBatchClassNames),
+                          std::move(metadata.scheduleBatchFlags),
+                          std::move(metadata.scheduleBatchTopoByPos),
+                          std::move(metadata.scheduleBatchFirstTopoPos),
+                          std::move(metadata.scheduleBatchLastTopoPos),
+                          std::move(metadata.scheduleBatchOpCounts),
+                          std::move(metadata.scheduleBatchSuccOffsets),
+                          std::move(metadata.scheduleBatchSuccTargets),
+                          std::move(metadata.scheduleBatchEntryBatches),
+                          std::move(metadata.scheduleBatchEstimatedLines),
                           std::move(metadata.hypergraphNodeNames),
                           std::move(metadata.hypergraphNodeMembers),
                           std::move(metadata.hypergraphEdgeNames),

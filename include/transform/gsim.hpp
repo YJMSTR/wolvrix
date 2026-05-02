@@ -3,7 +3,11 @@
 
 #include "core/transform.hpp"
 
+#include <cstdint>
+#include <map>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace wolvrix::lib::transform
 {
@@ -31,6 +35,19 @@ namespace wolvrix::lib::transform
                            std::vector<std::string> scheduleActivityOrder,
                            std::map<std::string, std::vector<int64_t>> scheduleActivityMembers,
                            std::map<std::string, std::string> scheduleActivityClasses,
+                           int64_t scheduleBatchCount,
+                           std::vector<std::string> scheduleBatchNames,
+                           std::vector<int64_t> scheduleBatchClassIds,
+                           std::vector<std::string> scheduleBatchClassNames,
+                           std::vector<int64_t> scheduleBatchFlags,
+                           std::vector<int64_t> scheduleBatchTopoByPos,
+                           std::vector<int64_t> scheduleBatchFirstTopoPos,
+                           std::vector<int64_t> scheduleBatchLastTopoPos,
+                           std::vector<int64_t> scheduleBatchOpCounts,
+                           std::vector<int64_t> scheduleBatchSuccOffsets,
+                           std::vector<int64_t> scheduleBatchSuccTargets,
+                           std::vector<int64_t> scheduleBatchEntryBatches,
+                           std::vector<int64_t> scheduleBatchEstimatedLines,
                            std::vector<std::string> hypergraphNodeNames,
                            std::map<std::string, std::vector<int64_t>> hypergraphNodeMembers,
                            std::vector<std::string> hypergraphEdgeNames,
