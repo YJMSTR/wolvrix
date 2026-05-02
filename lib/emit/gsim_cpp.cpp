@@ -7177,7 +7177,24 @@ namespace wolvrix::lib::emit
                         emitReplayOnlyEdgeBatch(replayOnlyRegEdgeBatch);
                         replayOnlyRegEdgeBatch.clear();
                     };
-                    bool emittedDerivedRegReplayBarrier = false;
+                    const bool hasDerivedRegReplayBarrier =
+                        state.enableSharding && state.shardCount() > 0 &&
+                        std::any_of(sequentialDomains.begin(), sequentialDomains.end(),
+                                    [&](const std::string &domainKey) {
+                                        return isDerivedSequentialDomain(domainKey);
+                                    });
+                    if (hasDerivedRegReplayBarrier) {
+                        os << "    auto replay_derived_reg_if_dirty_ = [&]() {\n";
+                        os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                        if (!state.latchStmts.empty()) {
+                            os << "            settle();\n";
+                            emitPendingReplay("            ", false, true, true);
+                        } else {
+                            emitPendingReplay("            ", false, true, true);
+                        }
+                        os << "        }\n";
+                        os << "    };\n";
+                    }
                     for (const auto &domainKey : sequentialDomains) {
                         const auto [edgeExpr, clockNeedsPreEdgeReplay] = commitStepEdgeExpr(domainKey);
                         const bool domainIsDerived = isDerivedSequentialDomain(domainKey);
@@ -7191,17 +7208,8 @@ namespace wolvrix::lib::emit
                             continue;
                         }
                         flushReplayOnlyRegEdgeBatch();
-                        if (state.enableSharding && state.shardCount() > 0 &&
-                            domainIsDerived && !emittedDerivedRegReplayBarrier) {
-                            os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
-                            if (!state.latchStmts.empty()) {
-                                os << "        settle();\n";
-                                emitPendingReplay("        ", false, true, true);
-                            } else {
-                                emitPendingReplay("        ", false, true, true);
-                            }
-                            os << "    }\n";
-                            emittedDerivedRegReplayBarrier = true;
+                        if (state.enableSharding && state.shardCount() > 0 && domainIsDerived) {
+                            os << "    replay_derived_reg_if_dirty_();\n";
                         } else if (state.enableSharding && state.shardCount() > 0 &&
                                    clockNeedsPreEdgeReplay && !domainIsDerived) {
                             os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
@@ -7341,7 +7349,24 @@ namespace wolvrix::lib::emit
                         emitReplayOnlyEdgeBatch(replayOnlyStmtEdgeBatch);
                         replayOnlyStmtEdgeBatch.clear();
                     };
-                    bool emittedDerivedStmtReplayBarrier = false;
+                    const bool hasDerivedStmtReplayBarrier =
+                        state.enableSharding && state.shardCount() > 0 &&
+                        std::any_of(sequentialDomains.begin(), sequentialDomains.end(),
+                                    [&](const std::string &domainKey) {
+                                        return isDerivedSequentialDomain(domainKey);
+                                    });
+                    if (hasDerivedStmtReplayBarrier) {
+                        os << "    auto replay_derived_stmt_if_dirty_ = [&]() {\n";
+                        os << "        if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
+                        if (!state.latchStmts.empty()) {
+                            os << "            settle();\n";
+                            emitPendingReplay("            ", false, true, true);
+                        } else {
+                            emitPendingReplay("            ", false, true, true);
+                        }
+                        os << "        }\n";
+                        os << "    };\n";
+                    }
                     for (const auto &domainKey : sequentialDomains) {
                         const auto [edgeExpr, clockNeedsPreEdgeReplay] = commitStepEdgeExpr(domainKey);
                         (void)clockNeedsPreEdgeReplay;
@@ -7355,17 +7380,8 @@ namespace wolvrix::lib::emit
                             continue;
                         }
                         flushReplayOnlyStmtEdgeBatch();
-                        if (state.enableSharding && state.shardCount() > 0 &&
-                            domainIsDerived && !emittedDerivedStmtReplayBarrier) {
-                            os << "    if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n";
-                            if (!state.latchStmts.empty()) {
-                                os << "        settle();\n";
-                                emitPendingReplay("        ", false, true, true);
-                            } else {
-                                emitPendingReplay("        ", false, true, true);
-                            }
-                            os << "    }\n";
-                            emittedDerivedStmtReplayBarrier = true;
+                        if (state.enableSharding && state.shardCount() > 0 && domainIsDerived) {
+                            os << "    replay_derived_stmt_if_dirty_();\n";
                         }
                         os << "    if (" << edgeExpr << ") {\n";
                         if (state.enableSharding && state.shardCount() > 0 && !domainIsDerived) {

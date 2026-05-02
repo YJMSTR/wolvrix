@@ -1199,6 +1199,62 @@ Design buildReverseOrderedDerivedClockPostCommitReplayDesign()
     return design;
 }
 
+Design buildChainedDerivedClockPostCommitReplayDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "gate1_storage", "gate1_reg", 1, "gate1");
+    const auto gate1Read = makeRegisterRead(graph, "gate1_read", "gate1_read_op", 1, "gate1");
+    (void)makeRegister(graph, "gate2_storage", "gate2_reg", 1, "gate2");
+    const auto gate2Read = makeRegisterRead(graph, "gate2_read", "gate2_read_op", 1, "gate2");
+    (void)makeRegister(graph, "data_storage", "data_reg", 8, "data");
+    const auto dataRead = makeRegisterRead(graph, "data_read", "data_read_op", 8, "data");
+    graph.bindOutputPort("data", dataRead);
+
+    const auto one = makeConstant(graph, "one", "chain_one_const", 1, "1'b1");
+    const auto mask1 = makeConstant(graph, "mask1", "chain_mask1_const", 1, "1'b1");
+    const auto dataValue = makeConstant(graph, "data_value", "chain_data_value_const", 8, "8'h5a");
+    const auto mask8 = makeConstant(graph, "mask8", "chain_mask8_const", 8, "8'hff");
+
+    makeRegisterWrite(graph, "gate1_write", one, one, mask1, clk, "gate1");
+
+    const auto aGatedClk = makeValue(graph, "a_gated_clk", 1, false);
+    const auto aAndOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("a_gated_clk_and"));
+    graph.addOperand(aAndOp, clk);
+    graph.addOperand(aAndOp, gate1Read);
+    graph.addResult(aAndOp, aGatedClk);
+
+    const auto gate2Write = makeRegisterWrite(graph, "gate2_write", one, one, mask1, aGatedClk, "gate2");
+    graph.setAttr(gate2Write, "clockSymbol", std::string("a_gated_clk"));
+
+    const auto zPartialClk = makeValue(graph, "z_partial_clk", 1, false);
+    const auto zPartialAndOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("z_partial_clk_and"));
+    graph.addOperand(zPartialAndOp, clk);
+    graph.addOperand(zPartialAndOp, gate1Read);
+    graph.addResult(zPartialAndOp, zPartialClk);
+
+    const auto zGatedClk = makeValue(graph, "z_gated_clk", 1, false);
+    const auto zAndOp = graph.createOperation(OperationKind::kLogicAnd, graph.internSymbol("z_gated_clk_and"));
+    graph.addOperand(zAndOp, zPartialClk);
+    graph.addOperand(zAndOp, gate2Read);
+    graph.addResult(zAndOp, zGatedClk);
+
+    const auto dataWrite = makeRegisterWrite(graph, "data_write", one, dataValue, mask8, zGatedClk, "data");
+    graph.setAttr(dataWrite, "clockSymbol", std::string("z_gated_clk"));
+
+    for (int i = 0; i < 140; ++i) {
+        (void)makeConstant(graph, "chained_derived_padding_const_" + std::to_string(i),
+                           "chained_derived_padding_const_op_" + std::to_string(i), 1, "1'b0");
+    }
+
+    return design;
+}
+
 Design buildSettledDerivedInputClockDesign()
 {
     Design design;
@@ -5186,12 +5242,14 @@ void testDerivedClockEdgesSeePriorDomainCommits()
     const std::string source = readFile(dir / "derived_clock_top.cpp");
     expect(contains(source, "dirty_replayed_ = false;"),
            "committed register domains should invalidate dirty replay before later derived-clock edge checks");
-    expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n        replay_pending_for_commit(dirty_replayed_, false, true);"),
-           "derived-clock edge checks should replay dirty shards before evaluating the edge expression");
-    expect(countOccurrences(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_)") == 3,
-           "derived-clock edge checks should avoid emitting duplicate inner replay guards after pre-edge and replay-only batching");
+    expect(countOccurrences(source, "auto replay_derived_reg_if_dirty_ = [&]()") == 1,
+           "derived-clock edge checks should share exactly one compact register replay helper");
+    expect(countOccurrences(source, "auto replay_derived_stmt_if_dirty_ = [&]()") == 1,
+           "derived-clock statement checks should share exactly one compact statement replay helper");
+    expect(contains(source, "if ((non_clock_inputs_dirty_ || committed_state_dirty_) && !dirty_replayed_) {\n            replay_pending_for_commit(dirty_replayed_, false, true);"),
+           "derived-clock helper should replay dirty shards before evaluating derived edge expressions");
     expect(contains(source, "if (committed_state_dirty_) { dirty_replayed_ = true; settle(); }\n}\n\nvoid SSimTop::commit_step()") &&
-               contains(source, "replay_pending_for_commit(dirty_replayed_, false, true);\n    }\n    if ((!prev_gated_clk_"),
+               contains(source, "replay_derived_reg_if_dirty_();\n    if ((!prev_gated_clk_"),
            "derived-clock edge checks should drain touched committed-state shards before evaluating the edge expression");
 
     const std::string runner = R"CPP(
@@ -5261,6 +5319,58 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "reverse_ordered_derived_clock_top", runner);
+}
+
+void testChainedDerivedClockEdgesReplayBetweenDerivedCommits()
+{
+    Design design = buildChainedDerivedClockPostCommitReplayDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "chained_derived_clock_post_commit_replay";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("chained_derived_clock_top");
+    options.topOverrides = {"top"};
+    options.attributes["behavior_shard_max_bytes"] = "4096";
+    options.attributes["activity_shard_watermark"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp chained derived-clock fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp chained derived-clock fixture should not emit errors");
+
+    const std::string source = readFile(dir / "chained_derived_clock_top.cpp");
+    expect(countOccurrences(source, "auto replay_derived_reg_if_dirty_ = [&]()") == 1,
+           "chained derived domains should share exactly one compact register replay helper");
+    expect(countOccurrences(source, "replay_derived_reg_if_dirty_();") == 2,
+           "chained derived domains need a runtime replay-pending guard before each derived edge check");
+    expect(contains(source, "replay_derived_reg_if_dirty_();\n    if ((!prev_a_gated_clk_") &&
+               contains(source, "replay_derived_reg_if_dirty_();\n    if ((!prev_z_gated_clk_"),
+           "chained derived domains should replay after earlier derived commits before later derived edge expressions");
+
+    const std::string runner = R"CPP(
+#include "chained_derived_clock_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    if (sim.get_data() != 0) {
+        return 1;
+    }
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_data() != 0x5a) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "chained_derived_clock_top", runner);
 }
 
 void testSettlePreservesDerivedClockInputEdges()
@@ -5591,6 +5701,7 @@ void runCommitStepSchedulerGuardTests()
 {
     testSingleClockRuntimeCompileAndRun();
     testDerivedClockEdgesSeePriorDomainCommits();
+    testChainedDerivedClockEdgesReplayBetweenDerivedCommits();
     testRegisterPipelineUsesNonBlockingSemantics();
     testDirectEligibleRegisterWriteUsesCommitBarrier();
     testReplayOnlyEdgesBatchDirtyReplay();
@@ -9397,6 +9508,10 @@ int main()
             }
             if (name == "derived-clock-post-commit-replay") {
                 testDerivedClockEdgesSeePriorDomainCommits();
+                return 0;
+            }
+            if (name == "chained-derived-clock-post-commit-replay") {
+                testChainedDerivedClockEdgesReplayBetweenDerivedCommits();
                 return 0;
             }
             if (name == "pipeline-nonblocking") {
