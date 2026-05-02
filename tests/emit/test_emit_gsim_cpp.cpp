@@ -3049,6 +3049,37 @@ Design buildScalarNoopPendingWriteDesign()
 }
 
 
+Design buildScalarLocalNoopPendingWriteDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto clk = makeValue(graph, "clk", 1, false);
+    graph.bindInputPort("clk", clk);
+
+    (void)makeRegister(graph, "q_storage", "q_reg", 8, "q");
+    const auto qRead = makeRegisterRead(graph, "q_read", "q_read_op", 8, "q");
+    graph.bindOutputPort("q", qRead);
+
+    const auto one = makeConstant(graph, "one", "one_const", 1, "1'b1");
+    const auto first = makeConstant(graph, "first", "first_const", 8, "8'h01");
+    const auto final = makeConstant(graph, "final", "final_const", 8, "8'h00");
+    const auto mask = makeConstant(graph, "mask", "mask_const", 8, "8'hff");
+    makeRegisterWrite(graph, "q_first_write", one, first, mask, clk, "q");
+    makeRegisterWrite(graph, "q_final_write", one, final, mask, clk, "q");
+
+    const auto padValue = makeConstant(graph, "local_noop_pad_value", "local_noop_pad_value_const", 8, "8'h00");
+    for (int i = 0; i < 520; ++i) {
+        const std::string sym = "local_noop_pad_" + std::to_string(i);
+        (void)makeRegister(graph, sym + "_storage", sym + "_reg", 8, sym);
+        makeRegisterWrite(graph, sym + "_write", one, padValue, mask, clk, sym);
+    }
+
+    return design;
+}
+
+
 Design buildDuplicateScalarTouchedPendingWriteDesign()
 {
     Design design;
@@ -8918,6 +8949,64 @@ int main() {
 }
 
 
+void testScalarTouchedLocalNoopDoesNotCommit()
+{
+    Design design = buildScalarLocalNoopPendingWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "scalar_local_noop_no_commit";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("scalar_local_noop_no_commit_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp scalar local no-op fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp scalar local no-op fixture should not emit errors");
+
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "next_reg_q_updated_ = true"),
+           "scalar local no-op fixture should still accumulate local next-state updates before final staging");
+    expect(!contains(generatedSources, "next_reg_q_updated_ = true; chunk_updated_ = true; committed_ = true;"),
+           "scalar local next-state updates must not commit before stage_domain_next_stateU8 returns true");
+    expect(contains(generatedSources, "if (stage_domain_next_stateU8(true, static_cast<std::size_t>(0), next_reg_q, UINT8_MAX)) { chunk_updated_ = true; committed_ = true; }"),
+           "scalar local no-op fixture should set commit flags only inside the final touched stage gate");
+
+    const std::string runner = R"CPP(
+#include "scalar_local_noop_no_commit_top.hpp"
+
+int main() {
+    SSimTop sim;
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+    if (sim.get_q() != 0) {
+        return 1;
+    }
+    if (sim.get_difftest__DOT__step() != 0) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "scalar_local_noop_no_commit_top", runner);
+}
+
+
 void testScalarTouchedDuplicateLastWrite()
 {
     Design design = buildDuplicateScalarTouchedPendingWriteDesign();
@@ -9907,6 +9996,10 @@ int main()
             }
             if (name == "scalar-touched-noop-does-not-commit") {
                 testScalarNoopPendingWriteDoesNotCommit();
+                return 0;
+            }
+            if (name == "scalar-touched-local-noop-does-not-commit") {
+                testScalarTouchedLocalNoopDoesNotCommit();
                 return 0;
             }
             if (name == "scalar-touched-duplicate-last-write") {
