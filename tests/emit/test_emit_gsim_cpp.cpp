@@ -9007,6 +9007,90 @@ int main() {
 }
 
 
+
+void testScalarTouchedPendingWriteRuntimeStatsEmission()
+{
+    Design design = buildDuplicateScalarTouchedPendingWriteDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "scalar_pending_stats";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("scalar_pending_stats_top");
+    options.topOverrides = {"top"};
+    options.attributes["commit_shard_max_bytes"] = "32768";
+    options.attributes["pending_write_stats"] = "1";
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp scalar pending stats fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp scalar pending stats fixture should not emit errors");
+
+    const std::string header = readFile(dir / "scalar_pending_stats_top.hpp");
+    std::string generatedSources;
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().extension() == ".cpp")
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(header, "scalar_pending_stage_calls_total_"),
+           "pending stats should add aggregate stage-call counters to the generated runtime");
+    expect(contains(header, "scalar_pending_duplicate_writes_total_"),
+           "pending stats should add aggregate duplicate-write counters to the generated runtime");
+    expect(contains(header, "vector_pending_apply_entries_"),
+           "pending stats should include aggregate vector counters for deferral evidence");
+    expect(contains(generatedSources, "#include <cstdio>") && contains(generatedSources, "#include <cstdlib>"),
+           "pending stats should include only small C runtime headers for opt-in reporting");
+    expect(contains(generatedSources, "WOLVRIX_GSIM_PENDING_WRITE_STATS"),
+           "pending stats should be runtime env-gated");
+    expect(contains(generatedSources, "WOLVRIX_XS_GSIM_PENDING_WRITE_STATS"),
+           "pending stats should also honor the XiangShan generation env at runtime");
+    expect(contains(generatedSources, "++scalar_pending_stage_calls_total_"),
+           "pending stats should count helper-level stage calls");
+    expect(contains(generatedSources, "++scalar_pending_duplicate_writes_total_"),
+           "pending stats should count duplicate touched writes without per-state logs");
+    expect(contains(generatedSources, "scalar_pending_apply_slots_total_ += static_cast<std::uint64_t>(domain_next_stateU8_pending_indices_.size())"),
+           "pending stats should count unique touched apply slots at helper level");
+    expect(contains(generatedSources, "vector_entries=%llu"),
+           "pending stats report should include vector aggregate fields");
+    expect(contains(generatedSources, "[gsim] scalar_pending_writes"),
+           "pending stats should report a compact aggregate line");
+
+    const std::string runner = R"CPP(
+#include "scalar_pending_stats_top.hpp"
+#include <cstdint>
+#include <cstdlib>
+
+static void tick(SSimTop& sim) {
+    sim.set_clk(0);
+    sim.step();
+    sim.set_clk(1);
+    sim.step();
+}
+
+int main() {
+    setenv("WOLVRIX_XS_GSIM_PENDING_WRITE_STATS", "1", 1);
+    setenv("WOLVRIX_GSIM_PENDING_WRITE_STATS_INTERVAL", "1", 1);
+    SSimTop sim;
+    tick(sim);
+    if (sim.get_q() != 0x22) {
+        return 1;
+    }
+    if (sim.get_difftest__DOT__step() != 1) {
+        return 2;
+    }
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "scalar_pending_stats_top", runner);
+}
+
 void testScalarTouchedDuplicateLastWrite()
 {
     Design design = buildDuplicateScalarTouchedPendingWriteDesign();
@@ -10002,6 +10086,10 @@ int main()
                 testScalarTouchedLocalNoopDoesNotCommit();
                 return 0;
             }
+            if (name == "scalar-touched-pending-write-runtime-stats") {
+                testScalarTouchedPendingWriteRuntimeStatsEmission();
+                return 0;
+            }
             if (name == "scalar-touched-duplicate-last-write") {
                 testScalarTouchedDuplicateLastWrite();
                 return 0;
@@ -10158,6 +10246,7 @@ int main()
         testWideZeroMaskRegisterWriteDoesNotCommit();
         testMultiChunkRegisterWritesUseDomainNextState();
         testMultiChunkWideRegisterWritesUseDomainNextStateHelpers();
+        testScalarTouchedPendingWriteRuntimeStatsEmission();
         testKeyBitClockCarrierDoesNotEmitMissingInputClockAlias();
         testClockFallbackUsesConsistentPrevClockName();
         testEmitMetadataToggleSkipsLargeMetadataPayload();

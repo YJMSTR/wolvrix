@@ -276,6 +276,7 @@ namespace wolvrix::lib::emit
             std::size_t dpicMaterializedCallSite = 0;
             std::set<int> dpicPreSettleShards;
             int dpicGlobalWarmupSteps = 0;
+            bool enablePendingWriteStats = false;
 
             bool shouldTraceDpicTarget(std::string_view target) const
             {
@@ -6282,6 +6283,29 @@ namespace wolvrix::lib::emit
             if (state.stateU64Count > 0) {
                 emitScalarTouchedMembers("U64", "std::uint64_t");
             }
+            if (state.enablePendingWriteStats) {
+                os << "    void init_pending_write_stats();\n";
+                os << "    void report_pending_write_stats();\n";
+                os << "    bool scalar_pending_stats_enabled_ = false;\n";
+                os << "    std::uint64_t scalar_pending_stats_interval_ = 50;\n";
+                os << "    std::uint64_t scalar_pending_steps_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_stage_calls_total_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_stage_calls_u8_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_stage_calls_u16_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_stage_calls_u32_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_stage_calls_u64_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_accepted_total_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_noop_elided_total_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_duplicate_writes_total_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_apply_calls_total_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_apply_slots_total_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_unique_touched_last_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_unique_touched_max_ = 0;\n";
+                os << "    std::uint64_t scalar_pending_unique_touched_step_ = 0;\n";
+                os << "    std::uint64_t vector_pending_prepare_calls_ = 0;\n";
+                os << "    std::uint64_t vector_pending_apply_calls_ = 0;\n";
+                os << "    std::uint64_t vector_pending_apply_entries_ = 0;\n";
+            }
             if (!state.stateVecWidths.empty()) {
                 os << "    void prepare_domain_next_stateVec(std::size_t capacity);\n";
                 os << "    void apply_domain_next_stateVec();\n";
@@ -6455,6 +6479,10 @@ namespace wolvrix::lib::emit
             std::string internalHeader = std::filesystem::path(std::string(headerFilename)).stem().string() + "_internal.hpp";
             os << "#include \"" << internalHeader << "\"\n\n";
             os << "#include <algorithm>\n";
+            if (state.enablePendingWriteStats) {
+                os << "#include <cstdio>\n";
+                os << "#include <cstdlib>\n";
+            }
             if (state.emitsDpicCalls) {
                 os << "#include <cstring>\n";
                 if (state.enableDpicTrace) {
@@ -6463,6 +6491,21 @@ namespace wolvrix::lib::emit
                 os << "#include \"difftest-dpic.h\"\n";
             }
             os << "#include <set>\n\n";
+            if (state.enablePendingWriteStats) {
+                os << "namespace {\n";
+                os << "bool wolvrix_gsim_env_truthy(const char* value) {\n";
+                os << "    if (value == nullptr || *value == '\\0') { return false; }\n";
+                os << "    if ((value[0] == '0' || value[0] == 'n' || value[0] == 'N') && value[1] == '\\0') { return false; }\n";
+                os << "    return true;\n";
+                os << "}\n";
+                os << "std::uint64_t wolvrix_gsim_env_u64(const char* value, std::uint64_t fallback) {\n";
+                os << "    if (value == nullptr || *value == '\\0') { return fallback; }\n";
+                os << "    char* end = nullptr;\n";
+                os << "    const auto parsed = std::strtoull(value, &end, 10);\n";
+                os << "    return end != value && parsed > 0ULL ? static_cast<std::uint64_t>(parsed) : fallback;\n";
+                os << "}\n";
+                os << "} // namespace\n\n";
+            }
             if (state.enableSharding && state.enableActivityWatermark &&
                 (!state.changedFanoutRanges.empty() || !state.shardActivationRanges.empty())) {
                 os << "namespace {\n";
@@ -6621,13 +6664,47 @@ namespace wolvrix::lib::emit
                 appendCtorInit("active_word_queued_((" + std::to_string(state.shardCount()) + "U + 63U) / 64U, 0)");
                 appendCtorInit("active_word_queue_()");
             }
-            os << " { reset(); }\n";
+            if (state.enablePendingWriteStats) {
+                os << " { init_pending_write_stats(); reset(); }\n";
+            } else {
+                os << " { reset(); }\n";
+            }
 
             os << "SSimTop::~SSimTop() { delete evalTemps_; delete state_; }\n\n";
+            if (state.enablePendingWriteStats) {
+                os << "void SSimTop::init_pending_write_stats() {\n";
+                os << "    scalar_pending_stats_enabled_ = wolvrix_gsim_env_truthy(std::getenv(\"WOLVRIX_GSIM_PENDING_WRITE_STATS\")) || wolvrix_gsim_env_truthy(std::getenv(\"WOLVRIX_XS_GSIM_PENDING_WRITE_STATS\"));\n";
+                os << "    scalar_pending_stats_interval_ = wolvrix_gsim_env_u64(std::getenv(\"WOLVRIX_GSIM_PENDING_WRITE_STATS_INTERVAL\"), 50ULL);\n";
+                os << "}\n\n";
+                os << "void SSimTop::report_pending_write_stats() {\n";
+                os << "    if (!scalar_pending_stats_enabled_) { return; }\n";
+                os << "    scalar_pending_unique_touched_last_ = scalar_pending_unique_touched_step_;\n";
+                os << "    if (scalar_pending_unique_touched_last_ > scalar_pending_unique_touched_max_) { scalar_pending_unique_touched_max_ = scalar_pending_unique_touched_last_; }\n";
+                os << "    if (scalar_pending_stats_interval_ != 0ULL && (scalar_pending_steps_ % scalar_pending_stats_interval_) != 0ULL) { return; }\n";
+                os << "    std::fprintf(stderr, \"[gsim] scalar_pending_writes step=%llu stage_calls=%llu stage_u8=%llu stage_u16=%llu stage_u32=%llu stage_u64=%llu accepted=%llu unique_last=%llu unique_max=%llu apply_calls=%llu apply_slots=%llu duplicates=%llu noops=%llu vector_prepare=%llu vector_apply=%llu vector_entries=%llu\\n\",\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_steps_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_stage_calls_total_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_stage_calls_u8_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_stage_calls_u16_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_stage_calls_u32_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_stage_calls_u64_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_accepted_total_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_unique_touched_last_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_unique_touched_max_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_apply_calls_total_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_apply_slots_total_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_duplicate_writes_total_),\n";
+                os << "                 static_cast<unsigned long long>(scalar_pending_noop_elided_total_),\n";
+                os << "                 static_cast<unsigned long long>(vector_pending_prepare_calls_),\n";
+                os << "                 static_cast<unsigned long long>(vector_pending_apply_calls_),\n";
+                os << "                 static_cast<unsigned long long>(vector_pending_apply_entries_));\n";
+                os << "}\n\n";
+            }
             auto emitDomainNextScalarHelpers = [&](std::string_view suffix,
                                                        std::string_view statePool,
                                                        std::string_view type,
                                                        std::string_view maxConstant) {
+                const std::string suffixLower(suffix == "U8" ? "u8" : suffix == "U16" ? "u16" : suffix == "U32" ? "u32" : "u64");
                 os << "void SSimTop::prepare_domain_next_state" << suffix << "(std::size_t capacity) {\n";
                 os << "    for (const auto idx_ : domain_next_state" << suffix << "_pending_indices_) {\n";
                 os << "        domain_next_state" << suffix << "_touched_[idx_] = 0;\n";
@@ -6640,7 +6717,14 @@ namespace wolvrix::lib::emit
                 os << "}\n\n";
                 os << "bool SSimTop::stage_domain_next_state" << suffix << "(bool cond, std::size_t index, "
                    << type << " nextValue, " << type << " mask) {\n";
+                if (state.enablePendingWriteStats) {
+                    os << "    ++scalar_pending_stage_calls_total_;\n";
+                    os << "    ++scalar_pending_stage_calls_" << suffixLower << "_;\n";
+                }
                 os << "    if (!cond || mask == static_cast<" << type << ">(0)) {\n";
+                if (state.enablePendingWriteStats) {
+                    os << "        ++scalar_pending_noop_elided_total_;\n";
+                }
                 os << "        return false;\n";
                 os << "    }\n";
                 os << "    const auto base_ = domain_next_state" << suffix << "_touched_[index] ? domain_next_state"
@@ -6648,18 +6732,32 @@ namespace wolvrix::lib::emit
                 os << "    const auto merged_ = (mask == " << maxConstant << ") ? nextValue : static_cast<" << type
                    << ">((base_ & static_cast<" << type << ">(~mask)) | (nextValue & mask));\n";
                 os << "    if (merged_ == base_) {\n";
+                if (state.enablePendingWriteStats) {
+                    os << "        ++scalar_pending_noop_elided_total_;\n";
+                }
                 os << "        return false;\n";
                 os << "    }\n";
+                if (state.enablePendingWriteStats) {
+                    os << "    if (domain_next_state" << suffix << "_pending_flags_[index]) { ++scalar_pending_duplicate_writes_total_; }\n";
+                }
                 os << "    domain_next_state" << suffix << "_shadow_[index] = merged_;\n";
                 os << "    domain_next_state" << suffix << "_touched_[index] = 1;\n";
                 os << "    if (!domain_next_state" << suffix << "_pending_flags_[index]) {\n";
                 os << "        domain_next_state" << suffix << "_pending_flags_[index] = 1;\n";
                 os << "        domain_next_state" << suffix << "_pending_indices_.push_back(index);\n";
                 os << "    }\n";
+                if (state.enablePendingWriteStats) {
+                    os << "    ++scalar_pending_accepted_total_;\n";
+                }
                 os << "    return true;\n";
                 os << "}\n\n";
                 os << "bool SSimTop::apply_domain_next_state" << suffix << "() {\n";
                 os << "    const bool applied_ = !domain_next_state" << suffix << "_pending_indices_.empty();\n";
+                if (state.enablePendingWriteStats) {
+                    os << "    ++scalar_pending_apply_calls_total_;\n";
+                    os << "    scalar_pending_apply_slots_total_ += static_cast<std::uint64_t>(domain_next_state" << suffix << "_pending_indices_.size());\n";
+                    os << "    scalar_pending_unique_touched_step_ += static_cast<std::uint64_t>(domain_next_state" << suffix << "_pending_indices_.size());\n";
+                }
                 os << "    for (const auto idx_ : domain_next_state" << suffix << "_pending_indices_) {\n";
                 os << "        state_->" << statePool << "[idx_] = domain_next_state" << suffix << "_shadow_[idx_];\n";
                 os << "    }\n";
@@ -6680,12 +6778,19 @@ namespace wolvrix::lib::emit
             }
             if (!state.stateVecWidths.empty()) {
                 os << "void SSimTop::prepare_domain_next_stateVec(std::size_t capacity) {\n";
+                if (state.enablePendingWriteStats) {
+                    os << "    ++vector_pending_prepare_calls_;\n";
+                }
                 os << "    domain_next_stateVec_scratch_.clear();\n";
                 os << "    if (domain_next_stateVec_scratch_.capacity() < capacity) {\n";
                 os << "        domain_next_stateVec_scratch_.reserve(capacity);\n";
                 os << "    }\n";
                 os << "}\n\n";
                 os << "void SSimTop::apply_domain_next_stateVec() {\n";
+                if (state.enablePendingWriteStats) {
+                    os << "    ++vector_pending_apply_calls_;\n";
+                    os << "    vector_pending_apply_entries_ += static_cast<std::uint64_t>(domain_next_stateVec_scratch_.size());\n";
+                }
                 os << "    for (auto& write_ : domain_next_stateVec_scratch_) {\n";
                 os << "        state_->stateVec[write_.first] = std::move(write_.second);\n";
                 os << "    }\n";
@@ -7018,6 +7123,10 @@ namespace wolvrix::lib::emit
             };
 
             os << "void SSimTop::commit_step() {\n";
+            if (state.enablePendingWriteStats) {
+                os << "    ++scalar_pending_steps_;\n";
+                os << "    scalar_pending_unique_touched_step_ = 0;\n";
+            }
             os << "    bool committed_ = false;\n";
             if (state.enableSharding && state.shardCount() > 0) {
                 os << "    bool dirty_replayed_ = false;\n";
@@ -7542,6 +7651,9 @@ namespace wolvrix::lib::emit
                 os << "    if (committed_) { ++gsim_pre_dpic_steps_; }\n";
             }
             os << "    if (committed_) { ++difftest_step_; }\n";
+            if (state.enablePendingWriteStats) {
+                os << "    report_pending_write_stats();\n";
+            }
             os << "    difftest_exit_ = 0;\n";
             os << "}\n\n";
 
@@ -8269,6 +8381,7 @@ namespace wolvrix::lib::emit
         state.enableXsZeroRetireTrace =
             state.enableDpicTrace && attrEnabled(options, "xs_zero_retire_trace", false);
         state.dpicGlobalWarmupSteps = parsePositiveIntAttr(options, "dpic_global_warmup_steps", 0);
+        state.enablePendingWriteStats = attrEnabled(options, "pending_write_stats", false);
         if (auto targetsAttr = attrValue(options, "dpic_trace_targets"))
         {
             for (auto &targetName : splitCsv(*targetsAttr)) {
