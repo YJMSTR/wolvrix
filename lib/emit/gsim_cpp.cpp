@@ -3317,16 +3317,22 @@ namespace wolvrix::lib::emit
                     }
 
                     if (operandWidth > 64 && *sliceWidth == 1) {
+                        const char* helper = operandWidth <= 128
+                            ? "wolvrix_gsim_slice_dynamic_bit_to_u64_u128"
+                            : "wolvrix_gsim_slice_dynamic_bit_to_u64";
                         const std::string slicedExpr =
-                            "wolvrix_gsim_slice_dynamic_bit_to_u64(" + getOperandExpr(0) + ", " + indexExpr + ", " +
+                            std::string(helper) + "(" + getOperandExpr(0) + ", " + indexExpr + ", " +
                             std::to_string(operandWidth) + ")";
                         setResultExpr(0, slicedExpr);
                         break;
                     }
 
                     if (operandWidth > 64) {
+                        const char* helper = operandWidth <= 128
+                            ? "wolvrix_gsim_slice_dynamic_to_u64_u128"
+                            : "wolvrix_gsim_slice_dynamic_to_u64";
                         const std::string slicedExpr =
-                            "wolvrix_gsim_slice_dynamic_to_u64(" + getOperandExpr(0) + ", " + indexExpr + ", " +
+                            std::string(helper) + "(" + getOperandExpr(0) + ", " + indexExpr + ", " +
                             std::to_string(*sliceWidth) + ", " + std::to_string(operandWidth) + ")";
                         setResultExpr(0, maskExprForWidth(slicedExpr, static_cast<int32_t>(*sliceWidth)));
                         break;
@@ -5672,6 +5678,20 @@ namespace wolvrix::lib::emit
             os << "    std::uint32_t operandWidth) {\n";
             os << "    return bitIndex < operandWidth ? (wolvrix_gsim_load_shifted_word(value, bitIndex) & 1ULL) : 0ULL;\n";
             os << "}\n";
+            os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_bit_to_u64_u128(\n";
+            os << "    const std::vector<std::uint64_t>& value,\n";
+            os << "    std::uint64_t bitIndex,\n";
+            os << "    std::uint32_t operandWidth) {\n";
+            os << "    if (bitIndex >= operandWidth) {\n";
+            os << "        return 0ULL;\n";
+            os << "    }\n";
+            os << "    const auto wordIndex = static_cast<std::size_t>(bitIndex >> 6U);\n";
+            os << "    const auto bitOffset = static_cast<std::uint32_t>(bitIndex & 63ULL);\n";
+            os << "    const std::uint64_t word = wordIndex == 0U\n";
+            os << "        ? (value.empty() ? 0ULL : value[0U])\n";
+            os << "        : (value.size() > 1U ? value[1U] : 0ULL);\n";
+            os << "    return (word >> bitOffset) & 1ULL;\n";
+            os << "}\n";
             os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_to_u64(\n";
             os << "    const std::vector<std::uint64_t>& value,\n";
             os << "    std::uint64_t bitIndex,\n";
@@ -5682,6 +5702,27 @@ namespace wolvrix::lib::emit
             os << "    }\n";
             os << "    const auto availableBits = static_cast<std::uint32_t>(std::min<std::uint64_t>(sliceWidth, operandWidth - bitIndex));\n";
             os << "    return wolvrix_gsim_load_shifted_word(value, bitIndex) & wolvrix_gsim_low_mask(availableBits);\n";
+            os << "}\n\n";
+            os << "inline std::uint64_t wolvrix_gsim_slice_dynamic_to_u64_u128(\n";
+            os << "    const std::vector<std::uint64_t>& value,\n";
+            os << "    std::uint64_t bitIndex,\n";
+            os << "    std::uint32_t sliceWidth,\n";
+            os << "    std::uint32_t operandWidth) {\n";
+            os << "    if (sliceWidth == 0 || sliceWidth > 64 || bitIndex >= operandWidth) {\n";
+            os << "        return 0ULL;\n";
+            os << "    }\n";
+            os << "    const auto availableBits = static_cast<std::uint32_t>(std::min<std::uint64_t>(sliceWidth, operandWidth - bitIndex));\n";
+            os << "    const auto wordIndex = static_cast<std::size_t>(bitIndex >> 6U);\n";
+            os << "    const auto bitOffset = static_cast<std::uint32_t>(bitIndex & 63ULL);\n";
+            os << "    const std::uint64_t low = wordIndex == 0U\n";
+            os << "        ? (value.empty() ? 0ULL : value[0U])\n";
+            os << "        : (value.size() > 1U ? value[1U] : 0ULL);\n";
+            os << "    std::uint64_t result = low >> bitOffset;\n";
+            os << "    if (bitOffset != 0U && wordIndex == 0U) {\n";
+            os << "        const std::uint64_t high = value.size() > 1U ? value[1U] : 0ULL;\n";
+            os << "        result |= high << (64U - bitOffset);\n";
+            os << "    }\n";
+            os << "    return result & wolvrix_gsim_low_mask(availableBits);\n";
             os << "}\n\n";
             os << "inline std::vector<std::uint64_t> wolvrix_gsim_slice_dynamic_to_bits(\n";
             os << "    const std::vector<std::uint64_t>& value,\n";

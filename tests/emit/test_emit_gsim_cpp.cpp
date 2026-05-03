@@ -1840,6 +1840,52 @@ Design buildWideNibbleSliceDynamicDesign()
     return design;
 }
 
+Design buildU128BitSliceDynamicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 128, false);
+    const auto index = makeValue(graph, "index", 8, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("index", index);
+
+    const auto out = makeValue(graph, "out", 1, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("u128_bit_slice"));
+    graph.addOperand(slice, in);
+    graph.addOperand(slice, index);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(1));
+
+    return design;
+}
+
+Design buildU128NibbleSliceDynamicDesign()
+{
+    Design design;
+    auto &graph = design.createGraph("top");
+    design.markAsTop("top");
+
+    const auto in = makeValue(graph, "in", 128, false);
+    const auto index = makeValue(graph, "index", 8, false);
+    graph.bindInputPort("in", in);
+    graph.bindInputPort("index", index);
+
+    const auto out = makeValue(graph, "out", 4, false);
+    graph.bindOutputPort("out", out);
+
+    const auto slice = graph.createOperation(OperationKind::kSliceDynamic, graph.internSymbol("u128_nibble_slice"));
+    graph.addOperand(slice, in);
+    graph.addOperand(slice, index);
+    graph.addResult(slice, out);
+    graph.setAttr(slice, "sliceWidth", static_cast<int64_t>(4));
+
+    return design;
+}
+
 Design buildWideVectorSliceDynamicDesign()
 {
     Design design;
@@ -7219,6 +7265,8 @@ void testWideBitDynamicSliceCompileAndRun()
            "wide 1-bit dynamic slice should emit the bit-specialized helper");
     expect(contains(generatedSources, "wolvrix_gsim_slice_dynamic_bit_to_u64(input_in_"),
            "wide 1-bit dynamic slice should call the bit-specialized helper for the input vector");
+    expect(!contains(generatedSources, "wolvrix_gsim_slice_dynamic_bit_to_u64_u128(input_in_"),
+           ">128-bit 1-bit dynamic slice should keep the generic vector-backed helper call");
 
     const std::string runner = R"CPP(
 #include "wide_bit_slice_dynamic_top.hpp"
@@ -7292,7 +7340,17 @@ void testWideNibbleDynamicSliceCompileAndRun()
     expect(!diags.hasError(), "EmitGsimCpp wide-nibble slice-dynamic fixture should not emit errors");
 
     const std::string header = readFile(dir / "wide_nibble_slice_dynamic_top.hpp");
-    const std::string source = readFile(dir / "wide_nibble_slice_dynamic_top.cpp");
+    std::string generatedSources = header + readFile(dir / "wide_nibble_slice_dynamic_top_internal.hpp") +
+                                   readFile(dir / "wide_nibble_slice_dynamic_top.cpp");
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().filename().string().find("_sched_") != std::string::npos)
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(!contains(generatedSources, "wolvrix_gsim_slice_dynamic_to_u64_u128(input_in_"),
+           ">128-bit scalar dynamic slice should keep the generic vector-backed helper call");
 
     const std::string runner = R"CPP(
 #include "wide_nibble_slice_dynamic_top.hpp"
@@ -7344,6 +7402,162 @@ int main() {
 )CPP";
 
     compileAndRunHarness(dir, "wide_nibble_slice_dynamic_top", runner);
+}
+
+void testU128BitDynamicSliceFastPathCompileAndRun()
+{
+    Design design = buildU128BitSliceDynamicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "u128_bit_slice_dynamic_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("u128_bit_slice_dynamic_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp u128-bit slice-dynamic fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp u128-bit slice-dynamic fixture should not emit errors");
+
+    std::string generatedSources = readFile(dir / "u128_bit_slice_dynamic_top.hpp") +
+                                   readFile(dir / "u128_bit_slice_dynamic_top_internal.hpp") +
+                                   readFile(dir / "u128_bit_slice_dynamic_top.cpp");
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().filename().string().find("_sched_") != std::string::npos)
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "wolvrix_gsim_slice_dynamic_bit_to_u64_u128(input_in_"),
+           "65..128-bit 1-bit dynamic slice should call the u128 fast helper for the input vector");
+
+    const std::string runner = R"CPP(
+#include "u128_bit_slice_dynamic_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x8000000000000001ULL, 0x8000000000000005ULL});
+
+    sim.set_index(0);
+    sim.step();
+    if (sim.get_out() != 1) { return 1; }
+
+    sim.set_index(63);
+    sim.step();
+    if (sim.get_out() != 1) { return 2; }
+
+    sim.set_index(64);
+    sim.step();
+    if (sim.get_out() != 1) { return 3; }
+
+    sim.set_index(65);
+    sim.step();
+    if (sim.get_out() != 0) { return 4; }
+
+    sim.set_index(66);
+    sim.step();
+    if (sim.get_out() != 1) { return 5; }
+
+    sim.set_index(127);
+    sim.step();
+    if (sim.get_out() != 1) { return 6; }
+
+    sim.set_index(128);
+    sim.step();
+    if (sim.get_out() != 0) { return 7; }
+
+    sim.set_index(130);
+    sim.step();
+    if (sim.get_out() != 0) { return 8; }
+
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "u128_bit_slice_dynamic_top", runner);
+}
+
+void testU128NibbleDynamicSliceFastPathCompileAndRun()
+{
+    Design design = buildU128NibbleSliceDynamicDesign();
+    runGsim(design, "top");
+
+    const auto dir = artifactRoot() / "u128_nibble_slice_dynamic_compile_run";
+    cleanDir(dir);
+
+    EmitDiagnostics diags;
+    EmitGsimCpp emitter(&diags);
+    EmitOptions options;
+    options.outputDir = dir.string();
+    options.outputFilename = std::string("u128_nibble_slice_dynamic_top");
+    options.topOverrides = {"top"};
+
+    const EmitResult result = emitter.emit(design, options);
+    expect(result.success, "EmitGsimCpp u128-nibble slice-dynamic fixture should succeed");
+    expect(!diags.hasError(), "EmitGsimCpp u128-nibble slice-dynamic fixture should not emit errors");
+
+    std::string generatedSources = readFile(dir / "u128_nibble_slice_dynamic_top.hpp") +
+                                   readFile(dir / "u128_nibble_slice_dynamic_top_internal.hpp") +
+                                   readFile(dir / "u128_nibble_slice_dynamic_top.cpp");
+    for (const auto& entry : std::filesystem::directory_iterator(dir))
+    {
+        if (entry.path().filename().string().find("_sched_") != std::string::npos)
+        {
+            generatedSources += readFile(entry.path());
+        }
+    }
+    expect(contains(generatedSources, "wolvrix_gsim_slice_dynamic_to_u64_u128(input_in_"),
+           "65..128-bit scalar dynamic slice should call the u128 fast helper for the input vector");
+
+    const std::string runner = R"CPP(
+#include "u128_nibble_slice_dynamic_top.hpp"
+#include <cstdint>
+#include <vector>
+
+int main() {
+    SSimTop sim;
+    sim.set_in(std::vector<std::uint64_t>{0x8000000000000001ULL, 0x8000000000000005ULL});
+
+    sim.set_index(0);
+    sim.step();
+    if (sim.get_out() != 0x1) { return 1; }
+
+    sim.set_index(63);
+    sim.step();
+    if (sim.get_out() != 0xB) { return 2; }
+
+    sim.set_index(64);
+    sim.step();
+    if (sim.get_out() != 0x5) { return 3; }
+
+    sim.set_index(65);
+    sim.step();
+    if (sim.get_out() != 0x2) { return 4; }
+
+    sim.set_index(125);
+    sim.step();
+    if (sim.get_out() != 0x4) { return 5; }
+
+    sim.set_index(127);
+    sim.step();
+    if (sim.get_out() != 0x1) { return 6; }
+
+    sim.set_index(128);
+    sim.step();
+    if (sim.get_out() != 0x0) { return 7; }
+
+    return 0;
+}
+)CPP";
+
+    compileAndRunHarness(dir, "u128_nibble_slice_dynamic_top", runner);
 }
 
 void testWideVectorDynamicSliceCompileAndRun()
@@ -10572,6 +10786,22 @@ int main()
                 testCoalescedLatchWritesCompileAndRun();
                 return 0;
             }
+            if (name == "u128-bit-slice-dynamic") {
+                testU128BitDynamicSliceFastPathCompileAndRun();
+                return 0;
+            }
+            if (name == "u128-nibble-slice-dynamic") {
+                testU128NibbleDynamicSliceFastPathCompileAndRun();
+                return 0;
+            }
+            if (name == "wide-bit-slice-dynamic") {
+                testWideBitDynamicSliceCompileAndRun();
+                return 0;
+            }
+            if (name == "wide-nibble-slice-dynamic") {
+                testWideNibbleDynamicSliceCompileAndRun();
+                return 0;
+            }
             if (name == "eq") {
                 testEqCompileAndRun();
                 return 0;
@@ -10660,6 +10890,8 @@ int main()
         testDynamicSliceCompileAndRun();
         testWideBitDynamicSliceCompileAndRun();
         testWideNibbleDynamicSliceCompileAndRun();
+        testU128BitDynamicSliceFastPathCompileAndRun();
+        testU128NibbleDynamicSliceFastPathCompileAndRun();
         testWideVectorDynamicSliceCompileAndRun();
         testActivityMultiShardConcatSliceReplayCompileAndRun();
         testWideStaticSliceCompileAndRun();
